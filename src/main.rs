@@ -28,6 +28,12 @@ fn main() {
             KeyBinding::new("cmd-q", Quit, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
         cx.activate(true);
 
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
