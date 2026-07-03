@@ -62,9 +62,7 @@ impl TableDelegate for ResultsDelegate {
 
         match value {
             Some(v) => div().child(v),
-            None => div()
-                .text_color(cx.theme().muted_foreground)
-                .child("NULL"),
+            None => div().text_color(cx.theme().muted_foreground).child("NULL"),
         }
     }
 }

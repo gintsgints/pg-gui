@@ -12,12 +12,13 @@ useful PostgreSQL. Do not repeat text that is already before the cursor. \
 No markdown fences, no commentary, no explanation — output raw SQL text only.";
 
 pub fn api_key() -> Option<String> {
-    std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty())
+    std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
 }
 
 pub fn complete(api_key: &str, before: &str, after: &str) -> Result<String, String> {
-    let model =
-        std::env::var("PG_GUI_AI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let model = std::env::var("PG_GUI_AI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
 
     let user_message = format!(
         "<sql_before_cursor>{before}</sql_before_cursor>\n<sql_after_cursor>{after}</sql_after_cursor>\n\

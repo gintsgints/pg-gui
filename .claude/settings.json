@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in *.rs|*Cargo.toml) if ! out=$(cargo fmt --check 2>&1); then echo \"cargo fmt --check failed:\" >&2; echo \"$out\" >&2; exit 2; fi; if ! out=$(cargo clippy --all-targets --quiet -- -D warnings 2>&1); then echo \"cargo clippy (pedantic) failed:\" >&2; echo \"$out\" | tail -50 >&2; exit 2; fi ;; esac",
+            "timeout": 240,
+            "statusMessage": "cargo fmt + clippy pedantic"
+          }
+        ]
+      }
+    ]
+  }
+}

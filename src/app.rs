@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
+use gpui::Subscription;
 use gpui::{
     App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Window, div, px,
 };
-use gpui::Subscription;
 use gpui_component::{
     ActiveTheme as _, Disableable as _,
     button::{Button, ButtonVariants as _},
@@ -71,8 +71,7 @@ impl PgGuiApp {
 
         editor.update(cx, |state, cx| state.focus(window, cx));
 
-        let subscriptions =
-            vec![cx.subscribe_in(&conn_input, window, Self::on_conn_input_event)];
+        let subscriptions = vec![cx.subscribe_in(&conn_input, window, Self::on_conn_input_event)];
 
         Self {
             conn_input,
@@ -86,6 +85,8 @@ impl PgGuiApp {
         }
     }
 
+    // &mut self is imposed by the subscribe_in listener signature.
+    #[allow(clippy::unused_self)]
     fn on_conn_input_event(
         &mut self,
         state: &Entity<InputState>,
@@ -138,8 +139,7 @@ impl PgGuiApp {
                         });
                         this.set_status(
                             format!(
-                                "{statements} statement(s) executed in {:.0?} — showing {row_count} row(s)",
-                                elapsed
+                                "{statements} statement(s) executed in {elapsed:.0?} — showing {row_count} row(s)"
                             ),
                             cx,
                         );
@@ -163,7 +163,10 @@ impl PgGuiApp {
             return;
         }
         let Some(key) = ai::api_key() else {
-            self.set_status("AI completion needs ANTHROPIC_API_KEY set in the environment", cx);
+            self.set_status(
+                "AI completion needs ANTHROPIC_API_KEY set in the environment",
+                cx,
+            );
             return;
         };
 
@@ -203,6 +206,8 @@ impl PgGuiApp {
         .detach();
     }
 
+    // &mut self is imposed by the action listener signature.
+    #[allow(clippy::unused_self)]
     pub fn open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -212,8 +217,12 @@ impl PgGuiApp {
         });
 
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = rx.await else { return };
-            let Some(path) = paths.into_iter().next() else { return };
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
             let content = std::fs::read_to_string(&path);
 
             this.update_in(cx, |this, window, cx| match content {
@@ -288,23 +297,27 @@ impl Render for PgGuiApp {
                             .label(if self.running { "Running…" } else { "Run" })
                             .disabled(self.running)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.run_query(&RunQuery, window, cx)
+                                this.run_query(&RunQuery, window, cx);
                             })),
                     )
                     .child(
                         Button::new("ai")
-                            .label(if self.ai_running { "AI…" } else { "AI Complete" })
+                            .label(if self.ai_running {
+                                "AI…"
+                            } else {
+                                "AI Complete"
+                            })
                             .disabled(self.ai_running || !ai_available)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.ai_complete(&AiComplete, window, cx)
+                                this.ai_complete(&AiComplete, window, cx);
                             })),
                     )
-                    .child(Button::new("open").label("Open").on_click(cx.listener(
-                        |this, _, window, cx| this.open_file(&OpenFile, window, cx),
-                    )))
-                    .child(Button::new("save").label("Save").on_click(cx.listener(
-                        |this, _, window, cx| this.save_file(&SaveFile, window, cx),
-                    ))),
+                    .child(Button::new("open").label("Open").on_click(
+                        cx.listener(|this, _, window, cx| this.open_file(&OpenFile, window, cx)),
+                    ))
+                    .child(Button::new("save").label("Save").on_click(
+                        cx.listener(|this, _, window, cx| this.save_file(&SaveFile, window, cx)),
+                    )),
             )
             .child(
                 // SQL editor

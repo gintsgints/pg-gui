@@ -10,8 +10,8 @@ pub struct QueryOutcome {
 /// Execute a SQL script (one or more statements) using the simple query protocol,
 /// which returns every value as text and supports multi-statement scripts.
 pub fn run_script(conn_str: &str, sql: &str) -> Result<QueryOutcome, String> {
-    let mut client = Client::connect(conn_str, NoTls)
-        .map_err(|e| format!("connection failed: {e}"))?;
+    let mut client =
+        Client::connect(conn_str, NoTls).map_err(|e| format!("connection failed: {e}"))?;
 
     let results = client.simple_query(sql).map_err(|e| format!("{e}"))?;
 
@@ -32,15 +32,11 @@ pub fn run_script(conn_str: &str, sql: &str) -> Result<QueryOutcome, String> {
             }
             SimpleQueryMessage::Row(row) => {
                 if current_cols.is_empty() {
-                    current_cols = row
-                        .columns()
-                        .iter()
-                        .map(|c| c.name().to_string())
-                        .collect();
+                    current_cols = row.columns().iter().map(|c| c.name().to_string()).collect();
                 }
                 current_rows.push(
                     (0..row.len())
-                        .map(|i| row.get(i).map(|s| s.to_string()))
+                        .map(|i| row.get(i).map(std::string::ToString::to_string))
                         .collect(),
                 );
             }

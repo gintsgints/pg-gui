@@ -28,10 +28,12 @@ pub fn save(config: &Config) {
     let Some(path) = config_path() else { return };
     let result = path
         .parent()
-        .map(std::fs::create_dir_all)
-        .unwrap_or(Ok(()))
-        .and_then(|_| {
-            std::fs::write(&path, serde_json::to_string_pretty(config).unwrap_or_default())
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| {
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(config).unwrap_or_default(),
+            )
         });
     if let Err(err) = result {
         eprintln!("pg-gui: failed to save config to {}: {err}", path.display());
