@@ -1,0 +1,20 @@
+[package]
+name = "pg-gui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+gpui = "0.2.2"
+gpui-component = { version = "0.5.1", features = ["tree-sitter-languages"] }
+postgres = "0.19"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+# gpui and tree-sitter are unusably slow without optimized dependencies
+opt-level = 3

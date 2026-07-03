@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: pg-gui-test
+    environment:
+      POSTGRES_USER: pgui
+      POSTGRES_PASSWORD: pgui
+      POSTGRES_DB: pgui_test
+    # 5433 on the host to avoid clashing with the locally running Postgres on 5432
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./docker/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pgui -d pgui_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
