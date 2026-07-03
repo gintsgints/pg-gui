@@ -1,5 +1,6 @@
 mod ai;
 mod app;
+mod config;
 mod db;
 mod results;
 

@@ -4,17 +4,18 @@ use gpui::{
     App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Window, div, px,
 };
+use gpui::Subscription;
 use gpui_component::{
     ActiveTheme as _, Disableable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputState, TabSize},
+    input::{Input, InputEvent, InputState, TabSize},
     table::{Table, TableState},
     v_flex,
 };
 
 use crate::results::ResultsDelegate;
-use crate::{AiComplete, OpenFile, RunQuery, SaveFile, ai, db};
+use crate::{AiComplete, OpenFile, RunQuery, SaveFile, ai, config, db};
 
 fn default_conn() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
@@ -29,6 +30,7 @@ pub struct PgGuiApp {
     running: bool,
     ai_running: bool,
     file_path: Option<PathBuf>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl PgGuiApp {
@@ -37,7 +39,16 @@ impl PgGuiApp {
     }
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let conn_str = std::env::var("DATABASE_URL").unwrap_or_else(|_| default_conn());
+        // DATABASE_URL (explicit at launch) wins over the saved config, which
+        // holds whatever was last typed into the connection field.
+        let conn_str = std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let saved = config::load().connection_string;
+                (!saved.is_empty()).then_some(saved)
+            })
+            .unwrap_or_else(default_conn);
         let conn_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("postgres://user:password@host:5432/database")
@@ -60,6 +71,9 @@ impl PgGuiApp {
 
         editor.update(cx, |state, cx| state.focus(window, cx));
 
+        let subscriptions =
+            vec![cx.subscribe_in(&conn_input, window, Self::on_conn_input_event)];
+
         Self {
             conn_input,
             editor,
@@ -68,6 +82,21 @@ impl PgGuiApp {
             running: false,
             ai_running: false,
             file_path: None,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    fn on_conn_input_event(
+        &mut self,
+        state: &Entity<InputState>,
+        event: &InputEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(event, InputEvent::Change) {
+            config::save(&config::Config {
+                connection_string: state.read(cx).value().to_string(),
+            });
         }
     }
 

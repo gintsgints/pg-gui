@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+dirs = "6"
 gpui = "0.2.2"
 gpui-component = { version = "0.5.1", features = ["tree-sitter-languages"] }
 postgres = "0.19"
