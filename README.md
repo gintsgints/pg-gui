@@ -20,12 +20,15 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
 cargo run
 ```
 
-The connection string is remembered between launches: whatever you type in the
-connection field is saved to `~/Library/Application Support/pg-gui/config.json`
-(the platform config directory) and restored on the next start. A `DATABASE_URL`
-environment variable, if set, overrides the saved value for that launch; with
-neither present the field defaults to `postgres://$USER@localhost:5432/postgres`.
-TLS connections are not supported yet (the client connects with `NoTls`).
+The connection string and the SQL editor buffer are remembered between launches:
+both are saved to `~/Library/Application Support/pg-gui/config.json` (the platform
+config directory) as you type — the script with a short debounce — and restored on
+the next start, unsaved edits included. The path of the last opened/saved `.sql`
+file is remembered too, so `cmd-s` keeps writing to the same file after a restart.
+A `DATABASE_URL` environment variable, if set, overrides the saved connection
+string for that launch; with neither present the field defaults to
+`postgres://$USER@localhost:5432/postgres`. TLS connections are not supported yet
+(the client connects with `NoTls`).
 
 ## Test database
 

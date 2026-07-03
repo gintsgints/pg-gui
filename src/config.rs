@@ -4,10 +4,16 @@ use serde::{Deserialize, Serialize};
 
 /// Persisted app settings, stored as JSON in the platform config directory
 /// (`~/Library/Application Support/pg-gui/config.json` on macOS).
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub connection_string: String,
+    /// The editor buffer, restored on the next launch (unsaved edits included).
+    #[serde(default)]
+    pub script: String,
+    /// The file the script was last opened from or saved to, if any.
+    #[serde(default)]
+    pub script_path: Option<PathBuf>,
 }
 
 fn config_path() -> Option<PathBuf> {

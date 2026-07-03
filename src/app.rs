@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use gpui::Subscription;
 use gpui::{
@@ -29,7 +30,8 @@ pub struct PgGuiApp {
     status: SharedString,
     running: bool,
     ai_running: bool,
-    file_path: Option<PathBuf>,
+    config: config::Config,
+    save_generation: usize,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -39,20 +41,19 @@ impl PgGuiApp {
     }
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut config = config::load();
         // DATABASE_URL (explicit at launch) wins over the saved config, which
         // holds whatever was last typed into the connection field.
-        let conn_str = std::env::var("DATABASE_URL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                let saved = config::load().connection_string;
-                (!saved.is_empty()).then_some(saved)
-            })
-            .unwrap_or_else(default_conn);
+        if let Some(url) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) {
+            config.connection_string = url;
+        } else if config.connection_string.is_empty() {
+            config.connection_string = default_conn();
+        }
+
         let conn_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("postgres://user:password@host:5432/database")
-                .default_value(conn_str)
+                .default_value(config.connection_string.clone())
         });
 
         let editor = cx.new(|cx| {
@@ -65,13 +66,22 @@ impl PgGuiApp {
                     ..Default::default()
                 })
                 .placeholder("-- Write PostgreSQL here, then press cmd-enter to run")
+                .default_value(config.script.clone())
         });
 
         let results = cx.new(|cx| TableState::new(ResultsDelegate::new(), window, cx));
 
         editor.update(cx, |state, cx| state.focus(window, cx));
 
-        let subscriptions = vec![cx.subscribe_in(&conn_input, window, Self::on_conn_input_event)];
+        let subscriptions = vec![
+            cx.subscribe_in(&conn_input, window, Self::on_conn_input_event),
+            cx.subscribe_in(&editor, window, Self::on_editor_event),
+            // Flush any debounced (not yet written) changes on quit.
+            cx.on_app_quit(|this, _| {
+                config::save(&this.config);
+                async {}
+            }),
+        ];
 
         Self {
             conn_input,
@@ -80,13 +90,12 @@ impl PgGuiApp {
             status: "Ready".into(),
             running: false,
             ai_running: false,
-            file_path: None,
+            config,
+            save_generation: 0,
             _subscriptions: subscriptions,
         }
     }
 
-    // &mut self is imposed by the subscribe_in listener signature.
-    #[allow(clippy::unused_self)]
     fn on_conn_input_event(
         &mut self,
         state: &Entity<InputState>,
@@ -95,10 +104,41 @@ impl PgGuiApp {
         cx: &mut Context<Self>,
     ) {
         if matches!(event, InputEvent::Change) {
-            config::save(&config::Config {
-                connection_string: state.read(cx).value().to_string(),
-            });
+            self.config.connection_string = state.read(cx).value().to_string();
+            self.schedule_save(cx);
         }
+    }
+
+    fn on_editor_event(
+        &mut self,
+        state: &Entity<InputState>,
+        event: &InputEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(event, InputEvent::Change) {
+            self.config.script = state.read(cx).value().to_string();
+            self.schedule_save(cx);
+        }
+    }
+
+    /// Persist the config after a short debounce, so typing in the editor
+    /// doesn't hit the disk on every keystroke.
+    fn schedule_save(&mut self, cx: &mut Context<Self>) {
+        self.save_generation = self.save_generation.wrapping_add(1);
+        let generation = self.save_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            this.update(cx, |this, _| {
+                if this.save_generation == generation {
+                    config::save(&this.config);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn set_status(&mut self, status: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -228,10 +268,12 @@ impl PgGuiApp {
             this.update_in(cx, |this, window, cx| match content {
                 Ok(content) => {
                     this.editor.update(cx, |state, cx| {
-                        state.set_value(content, window, cx);
+                        state.set_value(content.clone(), window, cx);
                     });
                     this.set_status(format!("Opened {}", path.display()), cx);
-                    this.file_path = Some(path);
+                    this.config.script = content;
+                    this.config.script_path = Some(path);
+                    config::save(&this.config);
                 }
                 Err(err) => this.set_status(format!("Open failed: {err}"), cx),
             })
@@ -243,7 +285,7 @@ impl PgGuiApp {
     pub fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
         let content = self.editor.read(cx).value().to_string();
 
-        if let Some(path) = self.file_path.clone() {
+        if let Some(path) = self.config.script_path.clone() {
             match std::fs::write(&path, &content) {
                 Ok(()) => self.set_status(format!("Saved {}", path.display()), cx),
                 Err(err) => self.set_status(format!("Save failed: {err}"), cx),
@@ -261,7 +303,8 @@ impl PgGuiApp {
             this.update(cx, |this, cx| match result {
                 Ok(()) => {
                     this.set_status(format!("Saved {}", path.display()), cx);
-                    this.file_path = Some(path);
+                    this.config.script_path = Some(path);
+                    config::save(&this.config);
                 }
                 Err(err) => this.set_status(format!("Save failed: {err}"), cx),
             })
