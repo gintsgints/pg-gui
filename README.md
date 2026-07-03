@@ -8,8 +8,9 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
 
 - **SQL editor** with tree-sitter syntax highlighting, line numbers, and a monospace theme
 - **Execute scripts** against any PostgreSQL server (`cmd-enter` or the Run button);
-  multi-statement scripts are supported via the simple query protocol, and the last
-  result set is shown in a virtualized table (handles large result sets)
+  if text is selected in the editor, only the selection runs, otherwise the whole
+  script. Multi-statement scripts are supported via the simple query protocol, and
+  the last result set is shown in a virtualized table (handles large result sets)
 - **Open / save** `.sql` files with native file dialogs (`cmd-o` / `cmd-s`)
 - **AI completion** (optional): completes the SQL at the cursor using the Claude API
   (`cmd-i` or `ctrl-space`)

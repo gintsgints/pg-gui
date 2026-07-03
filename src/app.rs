@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use gpui::Subscription;
 use gpui::{
-    App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Window, div, px,
+    App, AppContext as _, Context, Entity, EntityInputHandler as _, InteractiveElement as _,
+    IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Window,
+    div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _,
@@ -151,14 +152,32 @@ impl PgGuiApp {
             return;
         }
         let conn = self.conn_input.read(cx).value().to_string();
-        let sql = self.editor.read(cx).value().to_string();
+
+        // Run only the selected block when there is a selection,
+        // otherwise the whole script.
+        let selection = self.editor.update(cx, |state, cx| {
+            state
+                .selected_text_range(false, window, cx)
+                .filter(|sel| !sel.range.is_empty())
+                .and_then(|sel| state.text_for_range(sel.range, &mut None, window, cx))
+                .filter(|text| !text.trim().is_empty())
+        });
+        let running_selection = selection.is_some();
+        let sql = selection.unwrap_or_else(|| self.editor.read(cx).value().to_string());
         if sql.trim().is_empty() {
             self.set_status("Nothing to run", cx);
             return;
         }
 
         self.running = true;
-        self.set_status("Running…", cx);
+        self.set_status(
+            if running_selection {
+                "Running selection…"
+            } else {
+                "Running…"
+            },
+            cx,
+        );
 
         cx.spawn_in(window, async move |this, cx| {
             let started = std::time::Instant::now();
@@ -177,9 +196,10 @@ impl PgGuiApp {
                             table.delegate_mut().set_data(outcome.columns, outcome.rows);
                             table.refresh(cx);
                         });
+                        let scope = if running_selection { "selection: " } else { "" };
                         this.set_status(
                             format!(
-                                "{statements} statement(s) executed in {elapsed:.0?} — showing {row_count} row(s)"
+                                "{scope}{statements} statement(s) executed in {elapsed:.0?} — showing {row_count} row(s)"
                             ),
                             cx,
                         );
