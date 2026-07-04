@@ -30,7 +30,9 @@ const ZOOM_STEP: f32 = 0.1;
 const ZOOM_MIN: f32 = 0.5;
 const ZOOM_MAX: f32 = 2.0;
 
-/// Every command with its keybinding(s), shown in the help dialog (cmd-?).
+/// Every command with its keybinding(s), shown in the help dialog
+/// (cmd-h on macOS, F1 elsewhere). Must mirror the bindings in main.rs.
+#[cfg(target_os = "macos")]
 const COMMANDS: &[(&str, &str)] = &[
     (
         "cmd-enter / ctrl-enter",
@@ -47,6 +49,24 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cmd-0", "Reset zoom"),
     ("cmd-h", "Show this help"),
     ("cmd-q", "Quit"),
+];
+#[cfg(not(target_os = "macos"))]
+const COMMANDS: &[(&str, &str)] = &[
+    (
+        "ctrl-enter",
+        "Run the selection or the statement at the cursor",
+    ),
+    ("ctrl-i / ctrl-space", "AI-complete SQL at the cursor"),
+    ("ctrl-shift-f", "Format the script"),
+    ("ctrl-p", "Insert a snippet"),
+    ("ctrl-o", "Open a SQL script"),
+    ("ctrl-s", "Save the script"),
+    ("ctrl-b", "Show or hide the toolbar"),
+    ("ctrl-,", "Open config.json in the system editor"),
+    ("ctrl-= / ctrl--", "Zoom in / out"),
+    ("ctrl-0", "Reset zoom"),
+    ("f1", "Show this help"),
+    ("ctrl-q", "Quit"),
 ];
 
 fn default_conn() -> String {
@@ -832,7 +852,8 @@ impl PgGuiApp {
         );
     }
 
-    /// Open a dialog listing every command and its keybinding (cmd-?).
+    /// Open a dialog listing every command and its keybinding
+    /// (cmd-h on macOS, F1 elsewhere).
     // &mut self is imposed by the action listener signature.
     #[allow(clippy::unused_self)]
     pub fn show_help(&mut self, _: &ShowHelp, window: &mut Window, cx: &mut Context<Self>) {

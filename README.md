@@ -67,7 +67,8 @@ text before and after the cursor and inserts the completion at the cursor.
 
 ## Keybindings
 
-Press `cmd-h` in the app to see this list in a dialog.
+Press `cmd-h` (macOS) or `F1` (Linux) in the app to see this list in a dialog.
+On Linux, `cmd` is `ctrl` throughout.
 
 | Key | Action |
 | --- | --- |
@@ -81,7 +82,7 @@ Press `cmd-h` in the app to see this list in a dialog.
 | `cmd-,` | Open `config.json` in the system editor |
 | `cmd-=` / `cmd--` | Zoom in / out |
 | `cmd-0` | Reset zoom |
-| `cmd-h` | Show the command help dialog |
+| `cmd-h` / `F1` | Show the command help dialog |
 | `cmd-q` | Quit |
 
 ## Code layout

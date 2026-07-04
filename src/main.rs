@@ -38,23 +38,31 @@ fn main() {
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
 
+        // `secondary` is cmd on macOS and ctrl elsewhere. cmd-h is taken by
+        // "hide app" conventions outside macOS (and ctrl-h by backspace in
+        // some Linux toolkits), so help lives on F1 there.
+        let help_key = if cfg!(target_os = "macos") {
+            "cmd-h"
+        } else {
+            "f1"
+        };
         cx.bind_keys([
-            KeyBinding::new("cmd-enter", RunQuery, None),
+            KeyBinding::new("secondary-enter", RunQuery, None),
             KeyBinding::new("ctrl-enter", RunQuery, None),
-            KeyBinding::new("cmd-i", AiComplete, None),
+            KeyBinding::new("secondary-i", AiComplete, None),
             KeyBinding::new("ctrl-space", AiComplete, None),
-            KeyBinding::new("cmd-o", OpenFile, None),
-            KeyBinding::new("cmd-s", SaveFile, None),
-            KeyBinding::new("cmd-p", OpenSnippets, None),
-            KeyBinding::new("cmd-,", OpenConfig, None),
-            KeyBinding::new("cmd-b", ToggleToolbar, None),
-            KeyBinding::new("cmd-shift-f", FormatScript, None),
-            KeyBinding::new("cmd-=", ZoomIn, None),
-            KeyBinding::new("cmd-shift-=", ZoomIn, None),
-            KeyBinding::new("cmd--", ZoomOut, None),
-            KeyBinding::new("cmd-0", ZoomReset, None),
-            KeyBinding::new("cmd-h", ShowHelp, None),
-            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("secondary-o", OpenFile, None),
+            KeyBinding::new("secondary-s", SaveFile, None),
+            KeyBinding::new("secondary-p", OpenSnippets, None),
+            KeyBinding::new("secondary-,", OpenConfig, None),
+            KeyBinding::new("secondary-b", ToggleToolbar, None),
+            KeyBinding::new("secondary-shift-f", FormatScript, None),
+            KeyBinding::new("secondary-=", ZoomIn, None),
+            KeyBinding::new("secondary-shift-=", ZoomIn, None),
+            KeyBinding::new("secondary--", ZoomOut, None),
+            KeyBinding::new("secondary-0", ZoomReset, None),
+            KeyBinding::new(help_key, ShowHelp, None),
+            KeyBinding::new("secondary-q", Quit, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_window_closed(|cx| {
