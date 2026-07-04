@@ -29,6 +29,23 @@ pub struct Config {
     /// before writing it to disk. Needs postgrestools ≥ 0.22.
     #[serde(default)]
     pub format_on_save: bool,
+    /// Casing the formatter applies to keywords (SELECT, FROM, WHERE).
+    #[serde(default)]
+    pub keyword_case: CaseStyle,
+    /// Casing the formatter applies to constants (NULL, TRUE, FALSE).
+    #[serde(default)]
+    pub constant_case: CaseStyle,
+}
+
+/// Casing style used by the language-server formatter; stored in
+/// config.json as `"lower"` or `"upper"`.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaseStyle {
+    /// The server's default.
+    #[default]
+    Lower,
+    Upper,
 }
 
 impl Default for Config {
@@ -41,6 +58,8 @@ impl Default for Config {
             page_size: default_page_size(),
             ai_api_key: String::new(),
             format_on_save: false,
+            keyword_case: CaseStyle::default(),
+            constant_case: CaseStyle::default(),
         }
     }
 }

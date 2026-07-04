@@ -30,6 +30,8 @@ use lsp_types::{
 };
 use serde_json::{Value, json};
 
+use crate::config::CaseStyle;
+
 const BINARY: &str = "postgrestools";
 
 /// Diagnostics published by the server for the editor document.
@@ -44,6 +46,8 @@ pub struct Client {
 
 struct Inner {
     connection_string: String,
+    keyword_case: CaseStyle,
+    constant_case: CaseStyle,
     uri: Uri,
     stdin: Mutex<ChildStdin>,
     child: Mutex<Child>,
@@ -70,10 +74,15 @@ impl Client {
     ///
     /// Fails when the binary is not installed, the workspace directory
     /// cannot be prepared, or the server misbehaves during the handshake.
-    pub fn start(connection_string: &str, text: &str) -> Result<(Self, DiagnosticsReceiver)> {
+    pub fn start(
+        connection_string: &str,
+        text: &str,
+        keyword_case: CaseStyle,
+        constant_case: CaseStyle,
+    ) -> Result<(Self, DiagnosticsReceiver)> {
         let workspace = workspace_dir()?;
         std::fs::create_dir_all(&workspace)?;
-        write_server_config(&workspace, connection_string)?;
+        write_server_config(&workspace, connection_string, keyword_case, constant_case)?;
         let scratch = workspace.join("scratch.sql");
         std::fs::write(&scratch, text)?;
 
@@ -99,6 +108,8 @@ impl Client {
 
         let inner = Arc::new(Inner {
             connection_string: connection_string.to_string(),
+            keyword_case,
+            constant_case,
             uri: file_uri(&scratch)?,
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
@@ -158,6 +169,13 @@ impl Client {
     #[must_use]
     pub fn connection_string(&self) -> &str {
         &self.inner.connection_string
+    }
+
+    /// The formatter casing options the server was configured with at
+    /// startup, as `(keyword_case, constant_case)`.
+    #[must_use]
+    pub fn case_options(&self) -> (CaseStyle, CaseStyle) {
+        (self.inner.keyword_case, self.inner.constant_case)
     }
 
     /// Tell the server the editor buffer changed (full-text sync).
@@ -509,7 +527,12 @@ fn workspace_dir() -> Result<PathBuf> {
 /// Write the server configuration next to the scratch document. The server
 /// picks up the `db` credentials from here; without them it still parses
 /// and lints, but completions are no longer schema-aware.
-fn write_server_config(workspace: &Path, connection_string: &str) -> Result<()> {
+fn write_server_config(
+    workspace: &Path,
+    connection_string: &str,
+    keyword_case: CaseStyle,
+    constant_case: CaseStyle,
+) -> Result<()> {
     let db = connection_string.parse::<postgres::Config>().ok();
     let db = db.as_ref();
     let host = db.and_then(|db| db.get_hosts().first()).map_or_else(
@@ -546,7 +569,11 @@ fn write_server_config(workspace: &Path, connection_string: &str) -> Result<()> 
             "disableConnection": db.is_none(),
         },
         "linter": { "enabled": true },
-        "format": { "enabled": true },
+        "format": {
+            "enabled": true,
+            "keywordCase": keyword_case,
+            "constantCase": constant_case,
+        },
     });
     std::fs::write(
         workspace.join("postgres-language-server.jsonc"),

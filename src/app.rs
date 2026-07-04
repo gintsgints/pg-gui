@@ -218,6 +218,14 @@ impl PgGuiApp {
 
         if self.config.connection_string != old.connection_string {
             self.sync_conn_input(mask_credentials(&self.config.connection_string), window, cx);
+        }
+
+        // The language server reads all of these from its generated
+        // workspace config at startup, so a change means a restart.
+        if self.config.connection_string != old.connection_string
+            || self.config.keyword_case != old.keyword_case
+            || self.config.constant_case != old.constant_case
+        {
             self.restart_lsp(cx);
         }
 
@@ -238,9 +246,12 @@ impl PgGuiApp {
     fn start_lsp(&mut self, cx: &mut Context<Self>) {
         let conn = self.config.connection_string.clone();
         let text = self.editor.read(cx).value().to_string();
+        let (keyword_case, constant_case) = (self.config.keyword_case, self.config.constant_case);
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { lsp::Client::start(&conn, &text) })
+                .background_spawn(async move {
+                    lsp::Client::start(&conn, &text, keyword_case, constant_case)
+                })
                 .await;
             this.update(cx, |this, cx| match result {
                 Ok((client, diagnostics)) => this.attach_lsp(client, diagnostics, cx),
@@ -257,9 +268,11 @@ impl PgGuiApp {
         mut diagnostics: lsp::DiagnosticsReceiver,
         cx: &mut Context<Self>,
     ) {
-        // The connection string changed while the server was starting up;
-        // reconnect with the current one instead.
-        if client.connection_string() != self.config.connection_string {
+        // The settings the server reads at startup changed while it was
+        // starting up; reconnect with the current ones instead.
+        if client.connection_string() != self.config.connection_string
+            || client.case_options() != (self.config.keyword_case, self.config.constant_case)
+        {
             client.shutdown();
             self.start_lsp(cx);
             return;
