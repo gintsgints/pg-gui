@@ -22,13 +22,32 @@ use gpui_component::{
 
 use crate::results::ResultsDelegate;
 use crate::{
-    AiComplete, FormatScript, OpenConfig, OpenFile, OpenSnippets, RunQuery, SaveFile,
+    AiComplete, FormatScript, OpenConfig, OpenFile, OpenSnippets, RunQuery, SaveFile, ShowHelp,
     ToggleToolbar, ZoomIn, ZoomOut, ZoomReset, ai, config, db, lsp, snippets, statement,
 };
 
 const ZOOM_STEP: f32 = 0.1;
 const ZOOM_MIN: f32 = 0.5;
 const ZOOM_MAX: f32 = 2.0;
+
+/// Every command with its keybinding(s), shown in the help dialog (cmd-?).
+const COMMANDS: &[(&str, &str)] = &[
+    (
+        "cmd-enter / ctrl-enter",
+        "Run the selection or the statement at the cursor",
+    ),
+    ("cmd-i / ctrl-space", "AI-complete SQL at the cursor"),
+    ("cmd-shift-f", "Format the script"),
+    ("cmd-p", "Insert a snippet"),
+    ("cmd-o", "Open a SQL script"),
+    ("cmd-s", "Save the script"),
+    ("cmd-b", "Show or hide the toolbar"),
+    ("cmd-,", "Open config.json in the system editor"),
+    ("cmd-= / cmd--", "Zoom in / out"),
+    ("cmd-0", "Reset zoom"),
+    ("cmd-?", "Show this help"),
+    ("cmd-q", "Quit"),
+];
 
 fn default_conn() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
@@ -789,6 +808,43 @@ impl PgGuiApp {
         );
     }
 
+    /// Open a dialog listing every command and its keybinding (cmd-?).
+    // &mut self is imposed by the action listener signature.
+    #[allow(clippy::unused_self)]
+    pub fn show_help(&mut self, _: &ShowHelp, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+
+        window.open_dialog(cx, |dialog, _, cx| {
+            dialog
+                .title("Commands")
+                .w(px(520.))
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .pb_2()
+                        .text_sm()
+                        .children(COMMANDS.iter().map(|(keys, description)| {
+                            h_flex()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .w(px(190.))
+                                        .flex_none()
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .child(*keys),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(*description),
+                                )
+                        })),
+                )
+        });
+    }
+
     pub fn toggle_toolbar(&mut self, _: &ToggleToolbar, _: &mut Window, cx: &mut Context<Self>) {
         self.config.toolbar_visible = !self.config.toolbar_visible;
         self.schedule_save(cx);
@@ -955,6 +1011,7 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::show_help))
             .children(
                 self.config
                     .toolbar_visible
@@ -967,14 +1024,12 @@ impl Render for PgGuiApp {
                 div().flex_1().min_h(px(0.)).child(
                     v_resizable("editor-results")
                         .with_state(&self.resizable_state)
-                        .on_resize(cx.listener(
-                            |this, state: &Entity<ResizableState>, _, cx| {
-                                if let Some(height) = state.read(cx).sizes().first() {
-                                    this.config.editor_height = Some(f32::from(*height));
-                                    this.schedule_save(cx);
-                                }
-                            },
-                        ))
+                        .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _, cx| {
+                            if let Some(height) = state.read(cx).sizes().first() {
+                                this.config.editor_height = Some(f32::from(*height));
+                                this.schedule_save(cx);
+                            }
+                        }))
                         .child({
                             // SQL editor
                             let mut panel = resizable_panel().child(
@@ -1019,11 +1074,19 @@ impl Render for PgGuiApp {
                     .text_color(cx.theme().muted_foreground)
                     .child(self.status.clone())
                     .child(div().flex_1())
-                    .child(if ai_available {
-                        "cmd-enter run · cmd-p snippets · cmd-i AI complete · cmd-o open · cmd-s save · cmd-b toolbar · cmd-, config"
-                    } else {
-                        "cmd-enter run · cmd-p snippets · cmd-o open · cmd-s save · cmd-b toolbar · cmd-, config (set ai_api_key there or ANTHROPIC_API_KEY for AI)"
-                    }),
+                    .child(format!(
+                        "{} · {} · cmd-? help",
+                        if ai_available {
+                            "AI ready"
+                        } else {
+                            "AI off — set ai_api_key or ANTHROPIC_API_KEY"
+                        },
+                        if self.lsp.is_some() {
+                            "SQL LSP connected"
+                        } else {
+                            "SQL LSP offline"
+                        },
+                    )),
             )
             // Dialogs (e.g. the snippet picker) are drawn by the app's root
             // element; gpui-component's Root only stores them.

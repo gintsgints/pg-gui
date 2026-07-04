@@ -27,6 +27,7 @@ actions!(
         ZoomIn,
         ZoomOut,
         ZoomReset,
+        ShowHelp,
         Quit
     ]
 );
@@ -52,6 +53,8 @@ fn main() {
             KeyBinding::new("cmd-shift-=", ZoomIn, None),
             KeyBinding::new("cmd--", ZoomOut, None),
             KeyBinding::new("cmd-0", ZoomReset, None),
+            KeyBinding::new("cmd-?", ShowHelp, None),
+            KeyBinding::new("cmd-shift-/", ShowHelp, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
