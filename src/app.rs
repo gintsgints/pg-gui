@@ -10,16 +10,20 @@ use gpui::{
     div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _,
+    ActiveTheme as _, Disableable as _, Root, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputEvent, InputState, TabSize},
+    input::{Input, InputEvent, InputState, RopeExt as _, TabSize},
+    list::{List, ListEvent, ListState},
     table::{Table, TableState},
     v_flex,
 };
 
 use crate::results::ResultsDelegate;
-use crate::{AiComplete, OpenFile, RunQuery, SaveFile, ai, config, db, lsp, statement};
+use crate::{
+    AiComplete, OpenFile, OpenSnippets, RunQuery, SaveFile, ai, config, db, lsp, snippets,
+    statement,
+};
 
 fn default_conn() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
@@ -76,6 +80,7 @@ impl PgGuiApp {
     }
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        snippets::ensure_dir();
         let mut config = config::load();
         // DATABASE_URL (explicit at launch) wins over the saved config, which
         // holds whatever was last typed into the connection field.
@@ -297,6 +302,87 @@ impl PgGuiApp {
         cx.notify();
     }
 
+    /// Open the searchable snippet picker; the confirmed snippet is
+    /// inserted into the editor at the cursor.
+    // &mut self is imposed by the action listener signature.
+    #[allow(clippy::unused_self)]
+    pub fn open_snippet_picker(
+        &mut self,
+        _: &OpenSnippets,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+
+        let app = cx.weak_entity();
+        let list = cx.new(|cx| {
+            let delegate =
+                snippets::PickerDelegate::new(snippets::load(), move |snippet, window, cx| {
+                    window.close_dialog(cx);
+                    app.update(cx, |this, cx| this.insert_snippet(snippet, window, cx))
+                        .ok();
+                });
+            ListState::new(delegate, window, cx).searchable(true)
+        });
+        cx.subscribe_in(&list, window, |_, _, event, window, cx| {
+            if matches!(event, ListEvent::Cancel) {
+                window.close_dialog(cx);
+            }
+        })
+        .detach();
+
+        let list_in_dialog = list.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title("Insert snippet").w(px(560.)).child(
+                div()
+                    .h(px(400.))
+                    .child(List::new(&list_in_dialog).search_placeholder("Search snippets…")),
+            )
+        });
+        list.update(cx, |state, cx| state.focus(window, cx));
+    }
+
+    /// Insert a snippet at the cursor as its own statement. When the
+    /// snippet contains a `%%` filter placeholder, the caret is placed
+    /// between the two `%` so typing narrows the filter.
+    fn insert_snippet(
+        &mut self,
+        snippet: &snippets::Snippet,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.update(cx, |state, cx| {
+            let sql = snippet.sql.trim();
+            let text = state.value();
+            let mut cursor = state.cursor().min(text.len());
+            while cursor > 0 && !text.is_char_boundary(cursor) {
+                cursor -= 1;
+            }
+
+            let mut inserted = String::new();
+            if !text[..cursor].is_empty() && !text[..cursor].ends_with('\n') {
+                inserted.push('\n');
+            }
+            inserted.push_str(sql);
+            if !text[cursor..].starts_with('\n') {
+                inserted.push('\n');
+            }
+
+            let placeholder = inserted.find("%%");
+            state.insert(inserted.clone(), window, cx);
+            if let Some(pos) = placeholder {
+                let target = state.cursor() - inserted.len() + pos + 1;
+                let position = state.text().offset_to_position(target);
+                state.set_cursor_position(position, window, cx);
+            } else {
+                state.focus(window, cx);
+            }
+        });
+        self.set_status(format!("Inserted “{}”", snippet.name), cx);
+    }
+
     pub fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
         if self.running {
             return;
@@ -488,17 +574,19 @@ impl PgGuiApp {
 }
 
 impl Render for PgGuiApp {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ai_available = ai::api_key().is_some();
 
         v_flex()
             .size_full()
+            .relative()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::ai_complete))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::save_file))
+            .on_action(cx.listener(Self::open_snippet_picker))
             .child(
                 // Toolbar: connection string + actions
                 h_flex()
@@ -528,6 +616,11 @@ impl Render for PgGuiApp {
                                 this.ai_complete(&AiComplete, window, cx);
                             })),
                     )
+                    .child(Button::new("snippets").label("Snippets").on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.open_snippet_picker(&OpenSnippets, window, cx);
+                        }),
+                    ))
                     .child(Button::new("open").label("Open").on_click(
                         cx.listener(|this, _, window, cx| this.open_file(&OpenFile, window, cx)),
                     ))
@@ -566,11 +659,14 @@ impl Render for PgGuiApp {
                     .child(self.status.clone())
                     .child(div().flex_1())
                     .child(if ai_available {
-                        "cmd-enter run · cmd-i AI complete · cmd-o open · cmd-s save"
+                        "cmd-enter run · cmd-p snippets · cmd-i AI complete · cmd-o open · cmd-s save"
                     } else {
-                        "cmd-enter run · cmd-o open · cmd-s save (set ANTHROPIC_API_KEY for AI)"
+                        "cmd-enter run · cmd-p snippets · cmd-o open · cmd-s save (set ANTHROPIC_API_KEY for AI)"
                     }),
             )
+            // Dialogs (e.g. the snippet picker) are drawn by the app's root
+            // element; gpui-component's Root only stores them.
+            .children(Root::render_dialog_layer(window, cx))
     }
 }
 

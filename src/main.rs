@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod lsp;
 mod results;
+mod snippets;
 mod statement;
 
 use gpui::{
@@ -12,7 +13,10 @@ use gpui::{
 };
 use gpui_component::Root;
 
-actions!(pg_gui, [RunQuery, AiComplete, OpenFile, SaveFile, Quit]);
+actions!(
+    pg_gui,
+    [RunQuery, AiComplete, OpenFile, SaveFile, OpenSnippets, Quit]
+);
 
 fn main() {
     let app = Application::new();
@@ -27,6 +31,7 @@ fn main() {
             KeyBinding::new("ctrl-space", AiComplete, None),
             KeyBinding::new("cmd-o", OpenFile, None),
             KeyBinding::new("cmd-s", SaveFile, None),
+            KeyBinding::new("cmd-p", OpenSnippets, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
