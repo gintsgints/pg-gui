@@ -15,6 +15,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState, RopeExt as _, TabSize},
     list::{List, ListEvent, ListState},
+    resizable::{resizable_panel, v_resizable},
     table::{Table, TableState},
     v_flex,
 };
@@ -629,23 +630,28 @@ impl Render for PgGuiApp {
                     )),
             )
             .child(
-                // SQL editor
-                div().flex_1().min_h(px(120.)).p_2().child(
-                    Input::new(&self.editor)
-                        .h_full()
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .text_size(cx.theme().mono_font_size),
+                // Editor over results, split by a draggable divider. The
+                // group's state is keyed by its id, so the split position
+                // survives re-renders.
+                div().flex_1().min_h(px(0.)).child(
+                    v_resizable("editor-results")
+                        .child(
+                            // SQL editor
+                            resizable_panel().child(
+                                div().size_full().p_2().child(
+                                    Input::new(&self.editor)
+                                        .h_full()
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_size(cx.theme().mono_font_size),
+                                ),
+                            ),
+                        )
+                        .child(
+                            // Results table
+                            resizable_panel()
+                                .child(div().size_full().p_2().child(Table::new(&self.results))),
+                        ),
                 ),
-            )
-            .child(
-                // Results table
-                div()
-                    .flex_1()
-                    .min_h(px(120.))
-                    .p_2()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .child(Table::new(&self.results)),
             )
             .child(
                 // Status bar
