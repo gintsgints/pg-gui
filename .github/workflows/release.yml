@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: macOS bundle (universal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --locked
+
+      - name: Build both architectures
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: Bundle pg-gui.app
+        run: cargo bundle --release --target aarch64-apple-darwin
+
+      - name: Make the app binary universal
+        run: |
+          app="target/aarch64-apple-darwin/release/bundle/osx/pg-gui.app"
+          lipo -create \
+            target/aarch64-apple-darwin/release/pg-gui \
+            target/x86_64-apple-darwin/release/pg-gui \
+            -output "$app/Contents/MacOS/pg-gui"
+          lipo -info "$app/Contents/MacOS/pg-gui"
+
+      - name: Zip the app
+        run: |
+          ditto -c -k --keepParent \
+            "target/aarch64-apple-darwin/release/bundle/osx/pg-gui.app" \
+            "pg-gui-${GITHUB_REF_NAME}-macos-universal.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-bundle
+          path: pg-gui-*.zip
+          if-no-files-found: error
+
+  linux:
+    name: Linux bundle (x86_64)
+    # 22.04 keeps the glibc requirement low for older distros
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libx11-xcb-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libasound2-dev \
+            libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package tarball
+        run: |
+          dir="pg-gui-${GITHUB_REF_NAME}-x86_64-linux"
+          mkdir "$dir"
+          cp target/release/pg-gui "$dir/"
+          cp README.md assets/icon.png "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-bundle
+          path: pg-gui-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: [macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            pg-gui-*.zip
+            pg-gui-*.tar.gz
+          generate_release_notes: true
