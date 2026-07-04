@@ -45,7 +45,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cmd-,", "Open config.json in the system editor"),
     ("cmd-= / cmd--", "Zoom in / out"),
     ("cmd-0", "Reset zoom"),
-    ("cmd-?", "Show this help"),
+    ("cmd-h", "Show this help"),
     ("cmd-q", "Quit"),
 ];
 
@@ -1094,7 +1094,7 @@ impl Render for PgGuiApp {
                     .child(self.status.clone())
                     .child(div().flex_1())
                     .child(format!(
-                        "{} · {} · cmd-? help",
+                        "{} · {} · cmd-h help",
                         if ai_available {
                             "AI ready"
                         } else {
