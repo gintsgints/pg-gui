@@ -8,9 +8,10 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
 
 - **SQL editor** with tree-sitter syntax highlighting, line numbers, and a monospace theme
 - **Execute scripts** against any PostgreSQL server (`cmd-enter` or the Run button);
-  if text is selected in the editor, only the selection runs, otherwise the whole
-  script. Multi-statement scripts are supported via the simple query protocol, and
-  the last result set is shown in a virtualized table (handles large result sets)
+  if text is selected in the editor, only the selection runs, otherwise the
+  statement under the cursor. Multi-statement selections are supported via the
+  simple query protocol, and the last result set is shown in a virtualized table
+  (handles large result sets)
 - **Open / save** `.sql` files with native file dialogs (`cmd-o` / `cmd-s`)
 - **AI completion** (optional): completes the SQL at the cursor using the Claude API
   (`cmd-i` or `ctrl-space`)
@@ -66,12 +67,21 @@ text before and after the cursor and inserts the completion at the cursor.
 
 ## Keybindings
 
+Press `cmd-h` in the app to see this list in a dialog.
+
 | Key | Action |
 | --- | --- |
-| `cmd-enter` / `ctrl-enter` | Run script |
+| `cmd-enter` / `ctrl-enter` | Run the selection or the statement at the cursor |
 | `cmd-i` / `ctrl-space` | AI complete at cursor |
+| `cmd-shift-f` | Format the script |
+| `cmd-p` | Insert a snippet |
 | `cmd-o` | Open a `.sql` file |
 | `cmd-s` | Save (Save As on first save) |
+| `cmd-b` | Show or hide the toolbar |
+| `cmd-,` | Open `config.json` in the system editor |
+| `cmd-=` / `cmd--` | Zoom in / out |
+| `cmd-0` | Reset zoom |
+| `cmd-h` | Show the command help dialog |
 | `cmd-q` | Quit |
 
 ## Code layout
