@@ -26,6 +26,34 @@ fn default_conn() -> String {
     format!("postgres://{user}@localhost:5432/postgres")
 }
 
+/// Replace the username and password in a connection string with stars, for
+/// display. Handles both URL (`postgres://user:pass@host/db`) and
+/// key-value (`host=… user=… password=…`) forms.
+fn mask_credentials(conn: &str) -> String {
+    if let Some(scheme_end) = conn.find("://") {
+        let auth_start = scheme_end + 3;
+        let authority_end = conn[auth_start..]
+            .find(['/', '?', '#'])
+            .map_or(conn.len(), |i| auth_start + i);
+        if let Some(at) = conn[auth_start..authority_end].rfind('@') {
+            let stars = if conn[auth_start..auth_start + at].contains(':') {
+                "****:****"
+            } else {
+                "****"
+            };
+            return format!("{}{stars}{}", &conn[..auth_start], &conn[auth_start + at..]);
+        }
+        return conn.to_string();
+    }
+    conn.split_whitespace()
+        .map(|pair| match pair.split_once('=') {
+            Some((key @ ("user" | "password"), _)) => format!("{key}=****"),
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub struct PgGuiApp {
     conn_input: Entity<InputState>,
     editor: Entity<InputState>,
@@ -35,6 +63,9 @@ pub struct PgGuiApp {
     ai_running: bool,
     config: config::Config,
     save_generation: usize,
+    /// True while we programmatically swap the connection field between its
+    /// real and credential-masked value, so the change isn't taken as input.
+    syncing_conn_input: bool,
     lsp: Option<lsp::Client>,
     _subscriptions: Vec<Subscription>,
 }
@@ -57,7 +88,9 @@ impl PgGuiApp {
         let conn_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("postgres://user:password@host:5432/database")
-                .default_value(config.connection_string.clone())
+                // The field shows masked credentials until focused; the real
+                // value lives in `config.connection_string`.
+                .default_value(mask_credentials(&config.connection_string))
         });
 
         let editor = cx.new(|cx| {
@@ -100,6 +133,7 @@ impl PgGuiApp {
             ai_running: false,
             config,
             save_generation: 0,
+            syncing_conn_input: false,
             lsp: None,
             _subscriptions: subscriptions,
         };
@@ -185,13 +219,35 @@ impl PgGuiApp {
         &mut self,
         state: &Entity<InputState>,
         event: &InputEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if matches!(event, InputEvent::Change) {
-            self.config.connection_string = state.read(cx).value().to_string();
-            self.schedule_save(cx);
+        match event {
+            InputEvent::Change => {
+                if self.syncing_conn_input {
+                    return;
+                }
+                self.config.connection_string = state.read(cx).value().to_string();
+                self.schedule_save(cx);
+            }
+            // Reveal the real connection string while editing, mask the
+            // credentials the rest of the time.
+            InputEvent::Focus => {
+                self.sync_conn_input(self.config.connection_string.clone(), window, cx);
+            }
+            InputEvent::Blur => {
+                self.sync_conn_input(mask_credentials(&self.config.connection_string), window, cx);
+            }
+            InputEvent::PressEnter { .. } => {}
         }
+    }
+
+    fn sync_conn_input(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.syncing_conn_input = true;
+        self.conn_input.update(cx, |state, cx| {
+            state.set_value(value, window, cx);
+        });
+        self.syncing_conn_input = false;
     }
 
     fn on_editor_event(
@@ -245,7 +301,9 @@ impl PgGuiApp {
         if self.running {
             return;
         }
-        let conn = self.conn_input.read(cx).value().to_string();
+        // The input may be showing the masked value; the config always
+        // holds the real connection string.
+        let conn = self.config.connection_string.clone();
 
         // Run only the selected block when there is a selection,
         // otherwise the whole script.
@@ -512,5 +570,50 @@ impl Render for PgGuiApp {
                         "cmd-enter run · cmd-o open · cmd-s save (set ANTHROPIC_API_KEY for AI)"
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mask_credentials;
+
+    #[test]
+    fn masks_user_and_password_in_url() {
+        assert_eq!(
+            mask_credentials("postgres://alice:secret@localhost:5432/db"),
+            "postgres://****:****@localhost:5432/db"
+        );
+    }
+
+    #[test]
+    fn masks_user_without_password() {
+        assert_eq!(
+            mask_credentials("postgres://alice@localhost/db"),
+            "postgres://****@localhost/db"
+        );
+    }
+
+    #[test]
+    fn leaves_credential_free_urls_untouched() {
+        assert_eq!(
+            mask_credentials("postgres://localhost:5432/db"),
+            "postgres://localhost:5432/db"
+        );
+    }
+
+    #[test]
+    fn masks_credentials_in_query_only_urls() {
+        assert_eq!(
+            mask_credentials("postgres://alice:secret@localhost?sslmode=require"),
+            "postgres://****:****@localhost?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn masks_key_value_form() {
+        assert_eq!(
+            mask_credentials("host=localhost user=alice password=secret dbname=db"),
+            "host=localhost user=**** password=**** dbname=db"
+        );
     }
 }
