@@ -23,6 +23,9 @@ actions!(
         OpenSnippets,
         OpenConfig,
         ToggleToolbar,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
         Quit
     ]
 );
@@ -43,6 +46,10 @@ fn main() {
             KeyBinding::new("cmd-p", OpenSnippets, None),
             KeyBinding::new("cmd-,", OpenConfig, None),
             KeyBinding::new("cmd-b", ToggleToolbar, None),
+            KeyBinding::new("cmd-=", ZoomIn, None),
+            KeyBinding::new("cmd-shift-=", ZoomIn, None),
+            KeyBinding::new("cmd--", ZoomOut, None),
+            KeyBinding::new("cmd-0", ZoomReset, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());

@@ -6,11 +6,11 @@ use futures::StreamExt as _;
 use gpui::Subscription;
 use gpui::{
     App, AppContext as _, Context, Entity, EntityInputHandler as _, InteractiveElement as _,
-    IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _, Window,
-    div, px,
+    IntoElement, ParentElement as _, PathPromptOptions, Pixels, Render, SharedString, Styled as _,
+    Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Root, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Root, Sizable as _, Theme, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, RopeExt as _, TabSize},
@@ -22,9 +22,13 @@ use gpui_component::{
 
 use crate::results::ResultsDelegate;
 use crate::{
-    AiComplete, OpenConfig, OpenFile, OpenSnippets, RunQuery, SaveFile, ToggleToolbar, ai, config,
-    db, lsp, snippets, statement,
+    AiComplete, OpenConfig, OpenFile, OpenSnippets, RunQuery, SaveFile, ToggleToolbar, ZoomIn,
+    ZoomOut, ZoomReset, ai, config, db, lsp, snippets, statement,
 };
+
+const ZOOM_STEP: f32 = 0.1;
+const ZOOM_MIN: f32 = 0.5;
+const ZOOM_MAX: f32 = 2.0;
 
 fn default_conn() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
@@ -77,6 +81,10 @@ pub struct PgGuiApp {
     /// Mtime of the config file after our last read or write; a different
     /// mtime on disk means it was edited externally and should be reloaded.
     config_disk_time: Option<SystemTime>,
+    /// Theme font sizes at startup, i.e. at 100% zoom; the configured zoom
+    /// factor scales these.
+    base_font_size: Pixels,
+    base_mono_font_size: Pixels,
     save_generation: usize,
     /// True while we programmatically swap the connection field between its
     /// real and credential-masked value, so the change isn't taken as input.
@@ -153,6 +161,8 @@ impl PgGuiApp {
             config,
             script_path: None,
             config_disk_time: config::modified_time(),
+            base_font_size: cx.theme().font_size,
+            base_mono_font_size: cx.theme().mono_font_size,
             save_generation: 0,
             syncing_conn_input: false,
             lsp: None,
@@ -160,6 +170,7 @@ impl PgGuiApp {
         };
         this.start_lsp(cx);
         Self::watch_config(window, cx);
+        this.apply_zoom(cx);
         this
     }
 
@@ -235,6 +246,10 @@ impl PgGuiApp {
                 table.delegate_mut().set_page_size(page_size);
                 table.refresh(cx);
             });
+        }
+
+        if (self.config.zoom - old.zoom).abs() > f32::EPSILON {
+            self.apply_zoom(cx);
         }
 
         self.set_status("Reloaded config.json", cx);
@@ -780,6 +795,38 @@ impl PgGuiApp {
         cx.notify();
     }
 
+    pub fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom(self.config.zoom + ZOOM_STEP, cx);
+    }
+
+    pub fn zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom(self.config.zoom - ZOOM_STEP, cx);
+    }
+
+    pub fn zoom_reset(&mut self, _: &ZoomReset, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom(1.0, cx);
+    }
+
+    fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        // Snap to the step grid so repeated f32 steps don't accumulate drift.
+        self.config.zoom = (zoom / ZOOM_STEP).round() * ZOOM_STEP;
+        self.apply_zoom(cx);
+        self.set_status(format!("Zoom {:.0}%", self.config.zoom * 100.), cx);
+        self.schedule_save(cx);
+    }
+
+    /// Scale the theme font sizes by the configured zoom factor. All
+    /// default-sized text follows `font_size` (the root sets the window rem
+    /// size from it each frame); the SQL editor follows `mono_font_size`.
+    fn apply_zoom(&mut self, cx: &mut Context<Self>) {
+        let zoom = self.config.zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        self.config.zoom = zoom;
+        let theme = Theme::global_mut(cx);
+        theme.font_size = self.base_font_size * zoom;
+        theme.mono_font_size = self.base_mono_font_size * zoom;
+        cx.refresh_windows();
+    }
+
     pub fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.lsp.clone().filter(|_| self.config.format_on_save) else {
             self.write_script(window, cx);
@@ -877,6 +924,9 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::open_snippet_picker))
             .on_action(cx.listener(Self::open_config))
             .on_action(cx.listener(Self::toggle_toolbar))
+            .on_action(cx.listener(Self::zoom_in))
+            .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::zoom_reset))
             .children(
                 self.config
                     .toolbar_visible

@@ -35,6 +35,9 @@ pub struct Config {
     /// Casing the formatter applies to constants (NULL, TRUE, FALSE).
     #[serde(default)]
     pub constant_case: CaseStyle,
+    /// UI zoom factor (cmd +/-, cmd-0 to reset); 1.0 means 100%.
+    #[serde(default = "default_zoom")]
+    pub zoom: f32,
 }
 
 /// Casing style used by the language-server formatter; stored in
@@ -60,8 +63,13 @@ impl Default for Config {
             format_on_save: false,
             keyword_case: CaseStyle::default(),
             constant_case: CaseStyle::default(),
+            zoom: default_zoom(),
         }
     }
+}
+
+fn default_zoom() -> f32 {
+    1.0
 }
 
 fn default_true() -> bool {
