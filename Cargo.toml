@@ -3,6 +3,13 @@ name = "pg-gui"
 version = "0.1.0"
 edition = "2024"
 
+# Used by `cargo bundle` to produce pg-gui.app with the Dock/Finder icon.
+[package.metadata.bundle]
+name = "pg-gui"
+identifier = "com.gintspolis.pg-gui"
+icon = ["assets/icon.icns"]
+osx_minimum_system_version = "11.0"
+
 [dependencies]
 anyhow = "1"
 dirs = "6"
