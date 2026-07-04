@@ -19,7 +19,7 @@ use gpui_component::{
 };
 
 use crate::results::ResultsDelegate;
-use crate::{AiComplete, OpenFile, RunQuery, SaveFile, ai, config, db, lsp};
+use crate::{AiComplete, OpenFile, RunQuery, SaveFile, ai, config, db, lsp, statement};
 
 fn default_conn() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
@@ -305,8 +305,9 @@ impl PgGuiApp {
         // holds the real connection string.
         let conn = self.config.connection_string.clone();
 
-        // Run only the selected block when there is a selection,
-        // otherwise the whole script.
+        // Run the selected block when there is a selection, otherwise the
+        // statement the cursor is on (or, when the cursor sits after a
+        // statement, the one to its left).
         let selection = self.editor.update(cx, |state, cx| {
             state
                 .selected_text_range(false, window, cx)
@@ -314,22 +315,23 @@ impl PgGuiApp {
                 .and_then(|sel| state.text_for_range(sel.range, &mut None, window, cx))
                 .filter(|text| !text.trim().is_empty())
         });
-        let running_selection = selection.is_some();
-        let sql = selection.unwrap_or_else(|| self.editor.read(cx).value().to_string());
+        let (sql, scope) = if let Some(sql) = selection {
+            (sql, "selection")
+        } else {
+            let state = self.editor.read(cx);
+            let text = state.value();
+            let sql = statement::at(&text, state.cursor())
+                .map(|range| text[range].to_string())
+                .unwrap_or_default();
+            (sql, "statement")
+        };
         if sql.trim().is_empty() {
             self.set_status("Nothing to run", cx);
             return;
         }
 
         self.running = true;
-        self.set_status(
-            if running_selection {
-                "Running selection…"
-            } else {
-                "Running…"
-            },
-            cx,
-        );
+        self.set_status(format!("Running {scope}…"), cx);
 
         cx.spawn_in(window, async move |this, cx| {
             let started = std::time::Instant::now();
@@ -348,10 +350,9 @@ impl PgGuiApp {
                             table.delegate_mut().set_data(outcome.columns, outcome.rows);
                             table.refresh(cx);
                         });
-                        let scope = if running_selection { "selection: " } else { "" };
                         this.set_status(
                             format!(
-                                "{scope}{statements} statement(s) executed in {elapsed:.0?} — showing {row_count} row(s)"
+                                "{scope}: {statements} statement(s) executed in {elapsed:.0?} — showing {row_count} row(s)"
                             ),
                             cx,
                         );

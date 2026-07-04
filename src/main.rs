@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod lsp;
 mod results;
+mod statement;
 
 use gpui::{
     App, AppContext as _, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds,
