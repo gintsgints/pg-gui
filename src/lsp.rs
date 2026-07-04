@@ -391,6 +391,9 @@ impl CompletionProvider for Provider {
         _: &mut Window,
         cx: &mut Context<InputState>,
     ) -> Task<Result<CompletionResponse>> {
+        // gpui-component smuggles the query typed so far in here; keep it
+        // for clamping the items' filter_text below.
+        let query = trigger.trigger_character.clone().unwrap_or_default();
         let params = CompletionParams {
             text_document_position: self.client.text_document_position(text, offset),
             work_done_progress_params: WorkDoneProgressParams::default(),
@@ -409,7 +412,12 @@ impl CompletionProvider for Provider {
             if response.is_null() {
                 return Ok(CompletionResponse::Array(vec![]));
             }
-            Ok(serde_json::from_value(response)?)
+            let mut response: CompletionResponse = serde_json::from_value(response)?;
+            match &mut response {
+                CompletionResponse::Array(items) => clamp_filter_text(items, &query),
+                CompletionResponse::List(list) => clamp_filter_text(&mut list.items, &query),
+            }
+            Ok(response)
         })
     }
 
@@ -448,6 +456,24 @@ impl HoverProvider for Provider {
             let response = await_response(request).await?;
             Ok(serde_json::from_value(response)?)
         })
+    }
+}
+
+/// The completion menu highlights the first `filter_text.len()` bytes of
+/// each item's label — falling back to the typed query's length when
+/// `filter_text` is missing (postgrestools never sets it). When that length
+/// exceeds the label or splits a multi-byte character, gpui aborts on a
+/// char-boundary assertion while rendering the menu. Pin every item's
+/// `filter_text` to a prefix of its own label so the highlight is always
+/// valid.
+fn clamp_filter_text(items: &mut [lsp_types::CompletionItem], query: &str) {
+    for item in items {
+        let len = item.filter_text.as_deref().unwrap_or(query).len();
+        let mut safe = len.min(item.label.len());
+        while safe > 0 && !item.label.is_char_boundary(safe) {
+            safe -= 1;
+        }
+        item.filter_text = Some(item.label[..safe].to_string());
     }
 }
 
@@ -552,9 +578,37 @@ fn file_uri(path: &Path) -> Result<Uri> {
 
 #[cfg(test)]
 mod tests {
-    use lsp_types::{Position, Range, TextEdit};
+    use lsp_types::{CompletionItem, Position, Range, TextEdit};
 
-    use super::apply_edits;
+    use super::{apply_edits, clamp_filter_text};
+
+    fn item(label: &str, filter_text: Option<&str>) -> CompletionItem {
+        CompletionItem {
+            label: label.to_string(),
+            filter_text: filter_text.map(ToString::to_string),
+            ..CompletionItem::default()
+        }
+    }
+
+    #[test]
+    fn clamps_filter_text_to_the_label() {
+        // The query is longer than the "for" label: the highlight length
+        // must not exceed the label (this aborted the app in the wild).
+        let mut items = [item("for", None), item("active", None)];
+        clamp_filter_text(&mut items, "active");
+        assert_eq!(items[0].filter_text.as_deref(), Some("for"));
+        assert_eq!(items[1].filter_text.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn clamps_filter_text_to_char_boundaries() {
+        let mut items = [item("héllo", None), item("ab", Some("abcdef"))];
+        // 2 bytes lands inside the two-byte 'é'; back off to its start.
+        clamp_filter_text(&mut items, "xy");
+        assert_eq!(items[0].filter_text.as_deref(), Some("h"));
+        // An existing filter_text longer than the label is clamped too.
+        assert_eq!(items[1].filter_text.as_deref(), Some("ab"));
+    }
 
     fn edit(start: (u32, u32), end: (u32, u32), new_text: &str) -> TextEdit {
         TextEdit {
