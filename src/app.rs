@@ -22,8 +22,8 @@ use gpui_component::{
 
 use crate::results::ResultsDelegate;
 use crate::{
-    AiComplete, OpenConfig, OpenFile, OpenSnippets, RunQuery, SaveFile, ToggleToolbar, ZoomIn,
-    ZoomOut, ZoomReset, ai, config, db, lsp, snippets, statement,
+    AiComplete, FormatScript, OpenConfig, OpenFile, OpenSnippets, RunQuery, SaveFile,
+    ToggleToolbar, ZoomIn, ZoomOut, ZoomReset, ai, config, db, lsp, snippets, statement,
 };
 
 const ZOOM_STEP: f32 = 0.1;
@@ -827,6 +827,33 @@ impl PgGuiApp {
         cx.refresh_windows();
     }
 
+    /// Format the script through the language server without saving
+    /// (cmd-shift-f).
+    pub fn format_script(&mut self, _: &FormatScript, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.lsp.clone() else {
+            self.set_status("Format unavailable — SQL language server not connected", cx);
+            return;
+        };
+
+        let text = self.editor.read(cx).value().to_string();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = client.format(&text).await;
+            this.update_in(cx, |this, window, cx| match result {
+                // Skip stale results: the buffer changed while the
+                // server was formatting.
+                Ok(Some(formatted)) if this.editor.read(cx).value() == text => {
+                    this.apply_formatted(&formatted, window, cx);
+                    this.set_status("Formatted script", cx);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => this.set_status("Script already formatted", cx),
+                Err(err) => this.set_status(format!("Format failed: {err}"), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.lsp.clone().filter(|_| self.config.format_on_save) else {
             self.write_script(window, cx);
@@ -924,6 +951,7 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::open_snippet_picker))
             .on_action(cx.listener(Self::open_config))
             .on_action(cx.listener(Self::toggle_toolbar))
+            .on_action(cx.listener(Self::format_script))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
