@@ -768,6 +768,56 @@ impl PgGuiApp {
     }
 
     pub fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.lsp.clone().filter(|_| self.config.format_on_save) else {
+            self.write_script(window, cx);
+            return;
+        };
+
+        let text = self.editor.read(cx).value().to_string();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = client.format(&text).await;
+            this.update_in(cx, |this, window, cx| {
+                let format_error = match result {
+                    // Skip stale results: the buffer changed while the
+                    // server was formatting.
+                    Ok(Some(formatted)) if this.editor.read(cx).value() == text => {
+                        this.apply_formatted(&formatted, window, cx);
+                        None
+                    }
+                    Ok(_) => None,
+                    Err(err) => Some(err),
+                };
+                this.write_script(window, cx);
+                if let Some(err) = format_error {
+                    this.set_status(format!("Format on save failed: {err}"), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Swap the formatted text into the editor as a single undoable edit,
+    /// keeping the cursor near where it was. Goes through the input
+    /// handler so the usual change plumbing (LSP sync, config save) runs.
+    fn apply_formatted(&mut self, formatted: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |state, cx| {
+            let cursor = state.cursor();
+            let full_range = 0..state.value().chars().map(char::len_utf16).sum();
+            state.replace_text_in_range(Some(full_range), formatted, window, cx);
+
+            let mut offset = cursor.min(formatted.len());
+            while offset > 0 && !formatted.is_char_boundary(offset) {
+                offset -= 1;
+            }
+            let position = state.text().offset_to_position(offset);
+            state.set_cursor_position(position, window, cx);
+        });
+    }
+
+    /// Write the editor content to the script file, prompting for a
+    /// location the first time.
+    fn write_script(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let content = self.editor.read(cx).value().to_string();
 
         if let Some(path) = self.script_path.clone() {

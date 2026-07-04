@@ -25,6 +25,10 @@ pub struct Config {
     /// `ANTHROPIC_API_KEY` environment variable is used instead.
     #[serde(default)]
     pub ai_api_key: String,
+    /// Whether cmd-s formats the script through the language server
+    /// before writing it to disk. Needs postgrestools ≥ 0.22.
+    #[serde(default)]
+    pub format_on_save: bool,
 }
 
 impl Default for Config {
@@ -36,6 +40,7 @@ impl Default for Config {
             toolbar_visible: true,
             page_size: default_page_size(),
             ai_api_key: String::new(),
+            format_on_save: false,
         }
     }
 }

@@ -22,10 +22,11 @@ use gpui::{App, AppContext as _, Context, Task, Window};
 use gpui_component::input::{CompletionProvider, HoverProvider, InputState, Rope, RopeExt as _};
 use lsp_types::{
     ClientCapabilities, CompletionContext, CompletionParams, CompletionResponse,
-    DidChangeTextDocumentParams, DidOpenTextDocumentParams, Hover, HoverParams, InitializeParams,
-    PartialResultParams, PublishDiagnosticsParams, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
-    VersionedTextDocumentIdentifier, WorkDoneProgressParams, WorkspaceFolder,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
+    FormattingOptions, Hover, HoverParams, InitializeParams, PartialResultParams,
+    PublishDiagnosticsParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
+    WorkDoneProgressParams, WorkspaceFolder,
 };
 use serde_json::{Value, json};
 
@@ -84,7 +85,11 @@ impl Client {
             .stderr(Stdio::null())
             .spawn()
             .with_context(|| {
-                format!("failed to launch `{BINARY} lsp-proxy` (install it with `brew install {BINARY}`)")
+                format!(
+                    "failed to launch `{BINARY} lsp-proxy` (install the release binary from \
+                     https://github.com/supabase-community/postgres-language-server/releases; \
+                     the Homebrew build has broken diagnostics and formatting)"
+                )
             })?;
         let stdin = child.stdin.take().context("language server has no stdin")?;
         let stdout = child
@@ -172,6 +177,45 @@ impl Client {
         if let Ok(params) = serde_json::to_value(params) {
             self.inner.notify("textDocument/didChange", &params).ok();
         }
+    }
+
+    /// Ask the server to format the whole document. The server formats its
+    /// own copy (kept in sync via [`Self::document_changed`]); `text` must
+    /// be the same content and is used to resolve the returned edits into a
+    /// full replacement string. `None` when there is nothing to change —
+    /// including servers without formatting support (postgrestools < 0.22
+    /// answers with a null result).
+    ///
+    /// # Errors
+    ///
+    /// Fails when the server is gone or answers with an error.
+    pub async fn format(&self, text: &str) -> Result<Option<String>> {
+        let params = DocumentFormattingParams {
+            text_document: TextDocumentIdentifier {
+                uri: self.inner.uri.clone(),
+            },
+            // Matches the editor's tab size; postgrestools reads its
+            // indentation from the workspace config, not from here.
+            options: FormattingOptions {
+                tab_size: 2,
+                insert_spaces: true,
+                ..FormattingOptions::default()
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+        let request = self
+            .inner
+            .request("textDocument/formatting", &serde_json::to_value(params)?);
+        let response = await_response(request).await?;
+        if response.is_null() {
+            return Ok(None);
+        }
+        let edits: Vec<TextEdit> = serde_json::from_value(response)?;
+        if edits.is_empty() {
+            return Ok(None);
+        }
+        let formatted = apply_edits(text, &edits);
+        Ok((formatted != text).then_some(formatted))
     }
 
     /// Stop the server process.
@@ -407,6 +451,28 @@ impl HoverProvider for Provider {
     }
 }
 
+/// Apply LSP text edits to `text`. All edit positions refer to the original
+/// document, so they are resolved to byte offsets up front and applied
+/// back-to-front.
+fn apply_edits(text: &str, edits: &[TextEdit]) -> String {
+    let rope = Rope::from(text);
+    let mut edits: Vec<(std::ops::Range<usize>, &str)> = edits
+        .iter()
+        .map(|edit| {
+            let start = rope.position_to_offset(&edit.range.start);
+            let end = rope.position_to_offset(&edit.range.end);
+            (start..end.max(start), edit.new_text.as_str())
+        })
+        .collect();
+    edits.sort_by(|a, b| (b.0.start, b.0.end).cmp(&(a.0.start, a.0.end)));
+
+    let mut result = text.to_string();
+    for (range, new_text) in edits {
+        result.replace_range(range, new_text);
+    }
+    result
+}
+
 fn workspace_dir() -> Result<PathBuf> {
     Ok(dirs::cache_dir()
         .context("no cache directory on this platform")?
@@ -454,6 +520,7 @@ fn write_server_config(workspace: &Path, connection_string: &str) -> Result<()> 
             "disableConnection": db.is_none(),
         },
         "linter": { "enabled": true },
+        "format": { "enabled": true },
     });
     std::fs::write(
         workspace.join("postgres-language-server.jsonc"),
@@ -481,4 +548,42 @@ fn file_uri(path: &Path) -> Result<Uri> {
         }
     }
     Uri::from_str(&uri).map_err(|err| anyhow!("cannot express {} as a URI: {err}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use lsp_types::{Position, Range, TextEdit};
+
+    use super::apply_edits;
+
+    fn edit(start: (u32, u32), end: (u32, u32), new_text: &str) -> TextEdit {
+        TextEdit {
+            range: Range {
+                start: Position::new(start.0, start.1),
+                end: Position::new(end.0, end.1),
+            },
+            new_text: new_text.to_string(),
+        }
+    }
+
+    #[test]
+    fn applies_edits_in_document_order() {
+        // "select    a from t" → "SELECT a FROM t": edits arrive in
+        // document order but must be applied back-to-front.
+        let edits = [
+            edit((0, 0), (0, 6), "SELECT"),
+            edit((0, 6), (0, 10), " "),
+            edit((0, 12), (0, 16), "FROM"),
+        ];
+        assert_eq!(apply_edits("select    a from t", &edits), "SELECT a FROM t");
+    }
+
+    #[test]
+    fn applies_multi_line_and_insert_edits() {
+        let edits = [
+            edit((1, 0), (2, 0), ""),  // delete the blank line
+            edit((2, 1), (2, 1), " "), // insert after the ';'
+        ];
+        assert_eq!(apply_edits("select 1\n\n;", &edits), "select 1\n; ");
+    }
 }
