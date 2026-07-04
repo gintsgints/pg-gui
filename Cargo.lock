@@ -4094,8 +4094,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
+ "futures",
  "gpui",
  "gpui-component",
+ "lsp-types",
  "postgres",
  "serde",
  "serde_json",

@@ -6,8 +6,12 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 dirs = "6"
+futures = "0.3"
 gpui = "0.2.2"
 gpui-component = { version = "0.5.1", features = ["tree-sitter-languages"] }
+# Must stay in lockstep with the lsp-types version gpui-component uses,
+# so our provider impls and its editor traits share the same types.
+lsp-types = "0.97"
 postgres = "0.19"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

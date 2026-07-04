@@ -1,6 +1,8 @@
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
+use futures::StreamExt as _;
 use gpui::Subscription;
 use gpui::{
     App, AppContext as _, Context, Entity, EntityInputHandler as _, InteractiveElement as _,
@@ -17,7 +19,7 @@ use gpui_component::{
 };
 
 use crate::results::ResultsDelegate;
-use crate::{AiComplete, OpenFile, RunQuery, SaveFile, ai, config, db};
+use crate::{AiComplete, OpenFile, RunQuery, SaveFile, ai, config, db, lsp};
 
 fn default_conn() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
@@ -33,6 +35,7 @@ pub struct PgGuiApp {
     ai_running: bool,
     config: config::Config,
     save_generation: usize,
+    lsp: Option<lsp::Client>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -77,14 +80,18 @@ impl PgGuiApp {
         let subscriptions = vec![
             cx.subscribe_in(&conn_input, window, Self::on_conn_input_event),
             cx.subscribe_in(&editor, window, Self::on_editor_event),
-            // Flush any debounced (not yet written) changes on quit.
+            // Flush any debounced (not yet written) changes on quit,
+            // and stop the language server.
             cx.on_app_quit(|this, _| {
                 config::save(&this.config);
+                if let Some(client) = this.lsp.take() {
+                    client.shutdown();
+                }
                 async {}
             }),
         ];
 
-        Self {
+        let mut this = Self {
             conn_input,
             editor,
             results,
@@ -93,8 +100,85 @@ impl PgGuiApp {
             ai_running: false,
             config,
             save_generation: 0,
+            lsp: None,
             _subscriptions: subscriptions,
+        };
+        this.start_lsp(cx);
+        this
+    }
+
+    /// Launch the Postgres language server in the background and plug it
+    /// into the editor once the handshake completes.
+    fn start_lsp(&mut self, cx: &mut Context<Self>) {
+        let conn = self.config.connection_string.clone();
+        let text = self.editor.read(cx).value().to_string();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { lsp::Client::start(&conn, &text) })
+                .await;
+            this.update(cx, |this, cx| match result {
+                Ok((client, diagnostics)) => this.attach_lsp(client, diagnostics, cx),
+                Err(err) => this.set_status(format!("SQL language server unavailable: {err}"), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn attach_lsp(
+        &mut self,
+        client: lsp::Client,
+        mut diagnostics: lsp::DiagnosticsReceiver,
+        cx: &mut Context<Self>,
+    ) {
+        // The connection string changed while the server was starting up;
+        // reconnect with the current one instead.
+        if client.connection_string() != self.config.connection_string {
+            client.shutdown();
+            self.start_lsp(cx);
+            return;
         }
+
+        let provider = Rc::new(lsp::Provider::new(client.clone()));
+        self.editor.update(cx, |state, _| {
+            state.lsp.completion_provider = Some(provider.clone());
+            state.lsp.hover_provider = Some(provider);
+        });
+        // Resync whatever was typed while the server was starting.
+        client.document_changed(self.editor.read(cx).value().to_string());
+        self.lsp = Some(client);
+        self.set_status("SQL language server connected", cx);
+
+        cx.spawn(async move |this, cx| {
+            while let Some(diagnostics) = diagnostics.next().await {
+                let updated = this.update(cx, |this, cx| {
+                    this.editor.update(cx, |state, cx| {
+                        if let Some(set) = state.diagnostics_mut() {
+                            set.clear();
+                            set.extend(diagnostics);
+                        }
+                        cx.notify();
+                    });
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Restart the language server so it reconnects with the current
+    /// connection string (completions follow the database schema).
+    fn restart_lsp(&mut self, cx: &mut Context<Self>) {
+        if let Some(client) = self.lsp.take() {
+            client.shutdown();
+        }
+        self.editor.update(cx, |state, _| {
+            state.lsp.completion_provider = None;
+            state.lsp.hover_provider = None;
+        });
+        self.start_lsp(cx);
     }
 
     fn on_conn_input_event(
@@ -118,13 +202,18 @@ impl PgGuiApp {
         cx: &mut Context<Self>,
     ) {
         if matches!(event, InputEvent::Change) {
-            self.config.script = state.read(cx).value().to_string();
+            let text = state.read(cx).value().to_string();
+            if let Some(client) = &self.lsp {
+                client.document_changed(text.clone());
+            }
+            self.config.script = text;
             self.schedule_save(cx);
         }
     }
 
     /// Persist the config after a short debounce, so typing in the editor
-    /// doesn't hit the disk on every keystroke.
+    /// doesn't hit the disk on every keystroke. Also restarts the language
+    /// server when the connection string has settled on a new value.
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
         self.save_generation = self.save_generation.wrapping_add(1);
         let generation = self.save_generation;
@@ -132,9 +221,14 @@ impl PgGuiApp {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
                 .await;
-            this.update(cx, |this, _| {
+            this.update(cx, |this, cx| {
                 if this.save_generation == generation {
                     config::save(&this.config);
+                    if this.lsp.as_ref().is_some_and(|client| {
+                        client.connection_string() != this.config.connection_string
+                    }) {
+                        this.restart_lsp(cx);
+                    }
                 }
             })
             .ok();

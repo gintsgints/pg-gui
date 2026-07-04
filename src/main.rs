@@ -2,6 +2,7 @@ mod ai;
 mod app;
 mod config;
 mod db;
+mod lsp;
 mod results;
 
 use gpui::{
