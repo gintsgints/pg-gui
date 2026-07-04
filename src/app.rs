@@ -560,7 +560,7 @@ impl PgGuiApp {
                 .await;
             let elapsed = started.elapsed();
 
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 this.running = false;
                 match result {
                     Ok(outcome) => {
@@ -582,13 +582,32 @@ impl PgGuiApp {
                             table.delegate_mut().clear();
                             table.refresh(cx);
                         });
-                        this.set_status(format!("Error: {err}"), cx);
+                        this.show_query_error(&err, window, cx);
                     }
                 }
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Surface a failed execution in a dialog — the status bar alone is
+    /// easy to miss, and postgres errors are often too long to fit there.
+    fn show_query_error(&mut self, error: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // The dialog gets the full multi-line cause; the single-line
+        // status bar keeps just the summary.
+        let summary = error.lines().next().unwrap_or_default();
+        self.set_status(format!("Error: {summary}"), cx);
+        let message = SharedString::from(error.to_string());
+        window.open_dialog(cx, move |dialog, _, cx| {
+            dialog.title("Query failed").w(px(520.)).child(
+                div()
+                    .pb_2()
+                    .text_sm()
+                    .text_color(cx.theme().danger)
+                    .child(message.clone()),
+            )
+        });
     }
 
     /// Toolbar with the connection string and action buttons; hidden and
