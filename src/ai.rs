@@ -1,6 +1,7 @@
 /// SQL completion via the Anthropic Messages API.
 ///
-/// Requires `ANTHROPIC_API_KEY`; model can be overridden with `PG_GUI_AI_MODEL`
+/// The API key comes from the config's `ai_api_key`, falling back to
+/// `ANTHROPIC_API_KEY`; model can be overridden with `PG_GUI_AI_MODEL`
 /// (defaults to `claude-opus-4-8`).
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const DEFAULT_MODEL: &str = "claude-opus-4-8";
@@ -11,7 +12,14 @@ Respond with ONLY the text to insert at the cursor position so the statement bec
 useful PostgreSQL. Do not repeat text that is already before the cursor. \
 No markdown fences, no commentary, no explanation — output raw SQL text only.";
 
-pub fn api_key() -> Option<String> {
+/// The key to use for completions: the one configured in the app config,
+/// or `ANTHROPIC_API_KEY` from the environment when the config is empty.
+/// The config wins so an app-specific key can override a globally set one.
+pub fn api_key(configured: &str) -> Option<String> {
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return Some(configured.to_string());
+    }
     std::env::var("ANTHROPIC_API_KEY")
         .ok()
         .filter(|k| !k.is_empty())

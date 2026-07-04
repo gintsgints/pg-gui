@@ -15,7 +15,16 @@ use gpui_component::Root;
 
 actions!(
     pg_gui,
-    [RunQuery, AiComplete, OpenFile, SaveFile, OpenSnippets, Quit]
+    [
+        RunQuery,
+        AiComplete,
+        OpenFile,
+        SaveFile,
+        OpenSnippets,
+        OpenConfig,
+        ToggleToolbar,
+        Quit
+    ]
 );
 
 fn main() {
@@ -32,6 +41,8 @@ fn main() {
             KeyBinding::new("cmd-o", OpenFile, None),
             KeyBinding::new("cmd-s", SaveFile, None),
             KeyBinding::new("cmd-p", OpenSnippets, None),
+            KeyBinding::new("cmd-,", OpenConfig, None),
+            KeyBinding::new("cmd-b", ToggleToolbar, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());

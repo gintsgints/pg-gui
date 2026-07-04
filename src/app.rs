@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures::StreamExt as _;
 use gpui::Subscription;
@@ -10,20 +10,20 @@ use gpui::{
     div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Root, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Root, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, RopeExt as _, TabSize},
     list::{List, ListEvent, ListState},
-    resizable::{resizable_panel, v_resizable},
+    resizable::{ResizableState, resizable_panel, v_resizable},
     table::{Table, TableState},
     v_flex,
 };
 
 use crate::results::ResultsDelegate;
 use crate::{
-    AiComplete, OpenFile, OpenSnippets, RunQuery, SaveFile, ai, config, db, lsp, snippets,
-    statement,
+    AiComplete, OpenConfig, OpenFile, OpenSnippets, RunQuery, SaveFile, ToggleToolbar, ai, config,
+    db, lsp, snippets, statement,
 };
 
 fn default_conn() -> String {
@@ -63,10 +63,20 @@ pub struct PgGuiApp {
     conn_input: Entity<InputState>,
     editor: Entity<InputState>,
     results: Entity<TableState<ResultsDelegate>>,
+    /// Split state of the editor/results panels; the editor height is
+    /// persisted to the config whenever the divider is dragged.
+    resizable_state: Entity<ResizableState>,
     status: SharedString,
     running: bool,
     ai_running: bool,
     config: config::Config,
+    /// The file the script was opened from or saved to this session, if
+    /// any; cmd-s writes there without prompting. Deliberately not
+    /// persisted — only the script text is restored across launches.
+    script_path: Option<PathBuf>,
+    /// Mtime of the config file after our last read or write; a different
+    /// mtime on disk means it was edited externally and should be reloaded.
+    config_disk_time: Option<SystemTime>,
     save_generation: usize,
     /// True while we programmatically swap the connection field between its
     /// real and credential-masked value, so the change isn't taken as input.
@@ -112,7 +122,9 @@ impl PgGuiApp {
                 .default_value(config.script.clone())
         });
 
-        let results = cx.new(|cx| TableState::new(ResultsDelegate::new(), window, cx));
+        let results =
+            cx.new(|cx| TableState::new(ResultsDelegate::new(config.page_size), window, cx));
+        let resizable_state = cx.new(|_| ResizableState::default());
 
         editor.update(cx, |state, cx| state.focus(window, cx));
 
@@ -122,7 +134,7 @@ impl PgGuiApp {
             // Flush any debounced (not yet written) changes on quit,
             // and stop the language server.
             cx.on_app_quit(|this, _| {
-                config::save(&this.config);
+                this.save_config();
                 if let Some(client) = this.lsp.take() {
                     client.shutdown();
                 }
@@ -134,17 +146,91 @@ impl PgGuiApp {
             conn_input,
             editor,
             results,
+            resizable_state,
             status: "Ready".into(),
             running: false,
             ai_running: false,
             config,
+            script_path: None,
+            config_disk_time: config::modified_time(),
             save_generation: 0,
             syncing_conn_input: false,
             lsp: None,
             _subscriptions: subscriptions,
         };
         this.start_lsp(cx);
+        Self::watch_config(window, cx);
         this
+    }
+
+    /// Write the config and remember the file's new mtime, so the watcher
+    /// doesn't mistake our own write for an external edit.
+    fn save_config(&mut self) {
+        config::save(&self.config);
+        self.config_disk_time = config::modified_time();
+    }
+
+    /// Poll the config file so external edits (e.g. made via cmd-,) are
+    /// picked up live instead of being overwritten by our next save.
+    fn watch_config(window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let alive = this.update_in(cx, |this, window, cx| {
+                    this.check_config_file(window, cx);
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn check_config_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let disk_time = config::modified_time();
+        if disk_time.is_none() || disk_time == self.config_disk_time {
+            return;
+        }
+        self.config_disk_time = disk_time;
+        match config::try_load() {
+            Some(new) => self.apply_external_config(new, window, cx),
+            None => self.set_status("config.json is invalid — keeping current settings", cx),
+        }
+    }
+
+    /// Adopt an externally edited config: swap it in and resync the UI
+    /// pieces that mirror it. `editor_height` is the exception — the panel
+    /// split isn't writable from outside, so it applies on the next launch.
+    fn apply_external_config(
+        &mut self,
+        new: config::Config,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let old = std::mem::replace(&mut self.config, new);
+
+        if self.config.script != old.script {
+            let script = self.config.script.clone();
+            self.editor
+                .update(cx, |state, cx| state.set_value(script, window, cx));
+        }
+
+        if self.config.connection_string != old.connection_string {
+            self.sync_conn_input(mask_credentials(&self.config.connection_string), window, cx);
+            self.restart_lsp(cx);
+        }
+
+        if self.config.page_size != old.page_size {
+            let page_size = self.config.page_size;
+            self.results.update(cx, |table, cx| {
+                table.delegate_mut().set_page_size(page_size);
+                table.refresh(cx);
+            });
+        }
+
+        self.set_status("Reloaded config.json", cx);
+        cx.notify();
     }
 
     /// Launch the Postgres language server in the background and plug it
@@ -285,7 +371,7 @@ impl PgGuiApp {
                 .await;
             this.update(cx, |this, cx| {
                 if this.save_generation == generation {
-                    config::save(&this.config);
+                    this.save_config();
                     if this.lsp.as_ref().is_some_and(|client| {
                         client.connection_string() != this.config.connection_string
                     }) {
@@ -458,13 +544,129 @@ impl PgGuiApp {
         .detach();
     }
 
+    /// Toolbar with the connection string and action buttons; hidden and
+    /// shown with cmd-b.
+    fn render_toolbar(
+        &self,
+        ai_available: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        h_flex()
+            .gap_2()
+            .p_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(div().flex_1().child(Input::new(&self.conn_input)))
+            .child(
+                Button::new("run")
+                    .primary()
+                    .label(if self.running { "Running…" } else { "Run" })
+                    .disabled(self.running)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.run_query(&RunQuery, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("ai")
+                    .label(if self.ai_running {
+                        "AI…"
+                    } else {
+                        "AI Complete"
+                    })
+                    .disabled(self.ai_running || !ai_available)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.ai_complete(&AiComplete, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("snippets")
+                    .label("Snippets")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_snippet_picker(&OpenSnippets, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("open").label("Open").on_click(
+                    cx.listener(|this, _, window, cx| this.open_file(&OpenFile, window, cx)),
+                ),
+            )
+            .child(
+                Button::new("save").label("Save").on_click(
+                    cx.listener(|this, _, window, cx| this.save_file(&SaveFile, window, cx)),
+                ),
+            )
+    }
+
+    /// The "Prev / Next / Page x of y" bar under the results table; `None`
+    /// when everything fits on one page.
+    fn render_results_pager(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let delegate = self.results.read(cx).delegate();
+        let (page, page_count, total_rows) = (
+            delegate.page(),
+            delegate.page_count(),
+            delegate.total_rows(),
+        );
+        if page_count <= 1 {
+            return None;
+        }
+
+        Some(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("prev-page")
+                        .outline()
+                        .small()
+                        .label("‹ Prev")
+                        .disabled(page == 0)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.change_results_page(false, cx);
+                        })),
+                )
+                .child(
+                    Button::new("next-page")
+                        .outline()
+                        .small()
+                        .label("Next ›")
+                        .disabled(page + 1 >= page_count)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.change_results_page(true, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "Page {} of {page_count} · {total_rows} rows",
+                            page + 1
+                        )),
+                ),
+        )
+    }
+
+    fn change_results_page(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.results.update(cx, |table, cx| {
+            let moved = if forward {
+                table.delegate_mut().next_page()
+            } else {
+                table.delegate_mut().prev_page()
+            };
+            if moved {
+                table.scroll_to_row(0, cx);
+                table.refresh(cx);
+            }
+        });
+        cx.notify();
+    }
+
     pub fn ai_complete(&mut self, _: &AiComplete, window: &mut Window, cx: &mut Context<Self>) {
         if self.ai_running {
             return;
         }
-        let Some(key) = ai::api_key() else {
+        let Some(key) = ai::api_key(&self.config.ai_api_key) else {
             self.set_status(
-                "AI completion needs ANTHROPIC_API_KEY set in the environment",
+                "AI completion needs an API key: set ai_api_key in config.json or ANTHROPIC_API_KEY in the environment",
                 cx,
             );
             return;
@@ -532,8 +734,8 @@ impl PgGuiApp {
                     });
                     this.set_status(format!("Opened {}", path.display()), cx);
                     this.config.script = content;
-                    this.config.script_path = Some(path);
-                    config::save(&this.config);
+                    this.script_path = Some(path);
+                    this.save_config();
                 }
                 Err(err) => this.set_status(format!("Open failed: {err}"), cx),
             })
@@ -542,10 +744,33 @@ impl PgGuiApp {
         .detach();
     }
 
+    /// Open the config file in the system default editor (cmd-,).
+    /// Saved edits are picked up live by the config watcher.
+    pub fn open_config(&mut self, _: &OpenConfig, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = config::path() else {
+            self.set_status("No config directory on this platform", cx);
+            return;
+        };
+        // Write the current state first, so the file exists on a fresh
+        // install and reflects this session rather than a stale launch.
+        self.save_config();
+        cx.open_with_system(&path);
+        self.set_status(
+            format!("Opened {} — saved edits reload live", path.display()),
+            cx,
+        );
+    }
+
+    pub fn toggle_toolbar(&mut self, _: &ToggleToolbar, _: &mut Window, cx: &mut Context<Self>) {
+        self.config.toolbar_visible = !self.config.toolbar_visible;
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     pub fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
         let content = self.editor.read(cx).value().to_string();
 
-        if let Some(path) = self.config.script_path.clone() {
+        if let Some(path) = self.script_path.clone() {
             match std::fs::write(&path, &content) {
                 Ok(()) => self.set_status(format!("Saved {}", path.display()), cx),
                 Err(err) => self.set_status(format!("Save failed: {err}"), cx),
@@ -563,8 +788,7 @@ impl PgGuiApp {
             this.update(cx, |this, cx| match result {
                 Ok(()) => {
                     this.set_status(format!("Saved {}", path.display()), cx);
-                    this.config.script_path = Some(path);
-                    config::save(&this.config);
+                    this.script_path = Some(path);
                 }
                 Err(err) => this.set_status(format!("Save failed: {err}"), cx),
             })
@@ -576,7 +800,7 @@ impl PgGuiApp {
 
 impl Render for PgGuiApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let ai_available = ai::api_key().is_some();
+        let ai_available = ai::api_key(&self.config.ai_api_key).is_some();
 
         v_flex()
             .size_full()
@@ -588,68 +812,58 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::save_file))
             .on_action(cx.listener(Self::open_snippet_picker))
-            .child(
-                // Toolbar: connection string + actions
-                h_flex()
-                    .gap_2()
-                    .p_2()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(div().flex_1().child(Input::new(&self.conn_input)))
-                    .child(
-                        Button::new("run")
-                            .primary()
-                            .label(if self.running { "Running…" } else { "Run" })
-                            .disabled(self.running)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.run_query(&RunQuery, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("ai")
-                            .label(if self.ai_running {
-                                "AI…"
-                            } else {
-                                "AI Complete"
-                            })
-                            .disabled(self.ai_running || !ai_available)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.ai_complete(&AiComplete, window, cx);
-                            })),
-                    )
-                    .child(Button::new("snippets").label("Snippets").on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.open_snippet_picker(&OpenSnippets, window, cx);
-                        }),
-                    ))
-                    .child(Button::new("open").label("Open").on_click(
-                        cx.listener(|this, _, window, cx| this.open_file(&OpenFile, window, cx)),
-                    ))
-                    .child(Button::new("save").label("Save").on_click(
-                        cx.listener(|this, _, window, cx| this.save_file(&SaveFile, window, cx)),
-                    )),
+            .on_action(cx.listener(Self::open_config))
+            .on_action(cx.listener(Self::toggle_toolbar))
+            .children(
+                self.config
+                    .toolbar_visible
+                    .then(|| self.render_toolbar(ai_available, cx)),
             )
             .child(
                 // Editor over results, split by a draggable divider. The
-                // group's state is keyed by its id, so the split position
-                // survives re-renders.
+                // split position is persisted to the config on drag and
+                // restored on launch via the editor panel's initial size.
                 div().flex_1().min_h(px(0.)).child(
                     v_resizable("editor-results")
-                        .child(
+                        .with_state(&self.resizable_state)
+                        .on_resize(cx.listener(
+                            |this, state: &Entity<ResizableState>, _, cx| {
+                                if let Some(height) = state.read(cx).sizes().first() {
+                                    this.config.editor_height = Some(f32::from(*height));
+                                    this.schedule_save(cx);
+                                }
+                            },
+                        ))
+                        .child({
                             // SQL editor
-                            resizable_panel().child(
+                            let mut panel = resizable_panel().child(
                                 div().size_full().p_2().child(
                                     Input::new(&self.editor)
                                         .h_full()
                                         .font_family(cx.theme().mono_font_family.clone())
                                         .text_size(cx.theme().mono_font_size),
                                 ),
-                            ),
-                        )
+                            );
+                            if let Some(height) = self.config.editor_height {
+                                panel = panel.size(px(height));
+                            }
+                            panel
+                        })
                         .child(
-                            // Results table
-                            resizable_panel()
-                                .child(div().size_full().p_2().child(Table::new(&self.results))),
+                            // Results table with pager
+                            resizable_panel().child(
+                                v_flex()
+                                    .size_full()
+                                    .p_2()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_h(px(0.))
+                                            .child(Table::new(&self.results)),
+                                    )
+                                    .children(self.render_results_pager(cx)),
+                            ),
                         ),
                 ),
             )
@@ -665,9 +879,9 @@ impl Render for PgGuiApp {
                     .child(self.status.clone())
                     .child(div().flex_1())
                     .child(if ai_available {
-                        "cmd-enter run · cmd-p snippets · cmd-i AI complete · cmd-o open · cmd-s save"
+                        "cmd-enter run · cmd-p snippets · cmd-i AI complete · cmd-o open · cmd-s save · cmd-b toolbar · cmd-, config"
                     } else {
-                        "cmd-enter run · cmd-p snippets · cmd-o open · cmd-s save (set ANTHROPIC_API_KEY for AI)"
+                        "cmd-enter run · cmd-p snippets · cmd-o open · cmd-s save · cmd-b toolbar · cmd-, config (set ai_api_key there or ANTHROPIC_API_KEY for AI)"
                     }),
             )
             // Dialogs (e.g. the snippet picker) are drawn by the app's root
