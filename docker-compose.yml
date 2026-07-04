@@ -6,6 +6,9 @@ services:
       POSTGRES_USER: pgui
       POSTGRES_PASSWORD: pgui
       POSTGRES_DB: pgui_test
+    # pg_stat_statements must be preloaded at server start; the extension
+    # itself is created in docker/init/02-pg-stat-statements.sql.
+    command: postgres -c shared_preload_libraries=pg_stat_statements
     # 5433 on the host to avoid clashing with the locally running Postgres on 5432
     ports:
       - "5433:5432"
