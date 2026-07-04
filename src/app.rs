@@ -105,9 +105,12 @@ pub struct PgGuiApp {
     base_font_size: Pixels,
     base_mono_font_size: Pixels,
     save_generation: usize,
-    /// True while we programmatically swap the connection field between its
-    /// real and credential-masked value, so the change isn't taken as input.
-    syncing_conn_input: bool,
+    /// Count of programmatic swaps of the connection field (between its
+    /// real and credential-masked value) whose Change events are still
+    /// undelivered. GPUI emits those events after the swap call returns,
+    /// so a "currently swapping" flag would already be reset; each event
+    /// consumes one count instead of being taken as user input.
+    pending_conn_syncs: usize,
     lsp: Option<lsp::Client>,
     _subscriptions: Vec<Subscription>,
 }
@@ -183,7 +186,7 @@ impl PgGuiApp {
             base_font_size: cx.theme().font_size,
             base_mono_font_size: cx.theme().mono_font_size,
             save_generation: 0,
-            syncing_conn_input: false,
+            pending_conn_syncs: 0,
             lsp: None,
             _subscriptions: subscriptions,
         };
@@ -363,7 +366,8 @@ impl PgGuiApp {
     ) {
         match event {
             InputEvent::Change => {
-                if self.syncing_conn_input {
+                if self.pending_conn_syncs > 0 {
+                    self.pending_conn_syncs -= 1;
                     return;
                 }
                 self.config.connection_string = state.read(cx).value().to_string();
@@ -382,11 +386,12 @@ impl PgGuiApp {
     }
 
     fn sync_conn_input(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.syncing_conn_input = true;
+        // set_value emits exactly one Change event, delivered after this
+        // returns.
+        self.pending_conn_syncs += 1;
         self.conn_input.update(cx, |state, cx| {
             state.set_value(value, window, cx);
         });
-        self.syncing_conn_input = false;
     }
 
     fn on_editor_event(
