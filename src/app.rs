@@ -828,8 +828,8 @@ impl PgGuiApp {
             return;
         }
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let rx = cx.prompt_for_new_path(&cwd, Some("script.sql"));
+        let dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let rx = cx.prompt_for_new_path(&dir, Some("script.sql"));
 
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = rx.await else { return };
