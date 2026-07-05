@@ -86,7 +86,7 @@ impl Client {
         let scratch = workspace.join("scratch.sql");
         std::fs::write(&scratch, text)?;
 
-        let mut child = Command::new(BINARY)
+        let mut child = Command::new(binary_path())
             .arg("lsp-proxy")
             .current_dir(&workspace)
             .stdin(Stdio::piped())
@@ -515,6 +515,29 @@ fn apply_edits(text: &str, edits: &[TextEdit]) -> String {
         result.replace_range(range, new_text);
     }
     result
+}
+
+/// Locate the language-server binary. `Command::new` searches only `PATH`,
+/// and app bundles launched from Finder inherit launchd's minimal `PATH`
+/// that misses the usual install directories — so when the plain lookup
+/// would fail, search those directories explicitly.
+fn binary_path() -> PathBuf {
+    let on_path = std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(BINARY).is_file()));
+    if on_path {
+        return PathBuf::from(BINARY);
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local").join("bin"));
+    }
+    candidates.push(PathBuf::from("/opt/homebrew/bin"));
+    candidates.push(PathBuf::from("/usr/local/bin"));
+    candidates
+        .into_iter()
+        .map(|dir| dir.join(BINARY))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from(BINARY))
 }
 
 fn workspace_dir() -> Result<PathBuf> {
