@@ -23,7 +23,8 @@ use gpui_component::{
 use crate::results::ResultsDelegate;
 use crate::{
     AiComplete, FormatScript, OpenConfig, OpenFile, OpenSnippets, RunQuery, SaveFile, ShowHelp,
-    ToggleToolbar, ZoomIn, ZoomOut, ZoomReset, ai, config, db, lsp, snippets, statement,
+    ToggleComment, ToggleToolbar, ZoomIn, ZoomOut, ZoomReset, ai, config, db, lsp, snippets,
+    statement,
 };
 
 const ZOOM_STEP: f32 = 0.1;
@@ -40,12 +41,13 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("cmd-i / ctrl-space", "AI-complete SQL at the cursor"),
     ("cmd-shift-f", "Format the script"),
+    ("cmd-/", "Comment or uncomment the line / selection"),
     ("cmd-p", "Insert a snippet"),
     ("cmd-o", "Open a SQL script"),
     ("cmd-s", "Save the script"),
     ("cmd-b", "Show or hide the toolbar"),
     ("cmd-,", "Open config.json in the system editor"),
-    ("cmd-= / cmd--", "Zoom in / out"),
+    ("cmd-plus / cmd-minus", "Zoom in / out"),
     ("cmd-0", "Reset zoom"),
     ("cmd-h", "Show this help"),
     ("cmd-q", "Quit"),
@@ -58,12 +60,13 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("ctrl-i / ctrl-space", "AI-complete SQL at the cursor"),
     ("ctrl-shift-f", "Format the script"),
+    ("ctrl-/", "Comment or uncomment the line / selection"),
     ("ctrl-p", "Insert a snippet"),
     ("ctrl-o", "Open a SQL script"),
     ("ctrl-s", "Save the script"),
     ("ctrl-b", "Show or hide the toolbar"),
     ("ctrl-,", "Open config.json in the system editor"),
-    ("ctrl-= / ctrl--", "Zoom in / out"),
+    ("ctrl-plus / ctrl-minus", "Zoom in / out"),
     ("ctrl-0", "Reset zoom"),
     ("f1", "Show this help"),
     ("ctrl-q", "Quit"),
@@ -100,6 +103,36 @@ fn mask_credentials(conn: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Toggle `--` line comments on a block of full lines: when every
+/// non-blank line is already commented the prefix is removed, otherwise
+/// `-- ` is inserted after each line's leading whitespace (blank lines
+/// are left alone).
+fn toggle_line_comments(block: &str) -> String {
+    let uncomment = block.lines().any(|line| !line.trim().is_empty())
+        && block
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .all(|line| line.trim_start().starts_with("--"));
+
+    block
+        .split('\n')
+        .map(|line| {
+            let indent_len = line.len() - line.trim_start().len();
+            let (indent, rest) = line.split_at(indent_len);
+            if uncomment {
+                let rest = rest.strip_prefix("--").unwrap_or(rest);
+                let rest = rest.strip_prefix(' ').unwrap_or(rest);
+                format!("{indent}{rest}")
+            } else if rest.is_empty() {
+                line.to_string()
+            } else {
+                format!("{indent}-- {rest}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub struct PgGuiApp {
@@ -955,6 +988,69 @@ impl PgGuiApp {
         .detach();
     }
 
+    /// Comment or uncomment the current line, or every line the selection
+    /// touches, with `--` (cmd-/). Goes through the input handler so the
+    /// edit is undoable and the usual change plumbing runs.
+    pub fn toggle_comment(
+        &mut self,
+        _: &ToggleComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.update(cx, |state, cx| {
+            let selection = state
+                .selected_text_range(false, window, cx)
+                .map(|sel| sel.range);
+            let cursor = state.cursor();
+
+            let text = state.text();
+            let selection = selection.map_or(cursor..cursor, |range| {
+                text.offset_utf16_to_offset(range.start)..text.offset_utf16_to_offset(range.end)
+            });
+
+            // Expand to whole lines. A selection ending at the start of a
+            // line does not pull that line in.
+            let start_row = text.offset_to_point(selection.start).row;
+            let mut end_row = text.offset_to_point(selection.end).row;
+            if end_row > start_row && text.offset_to_point(selection.end).column == 0 {
+                end_row -= 1;
+            }
+            let start = text.line_start_offset(start_row);
+            let end = text.line_end_offset(end_row);
+            let block = text.slice(start..end).to_string();
+            let range_utf16 = text.offset_to_offset_utf16(start)..text.offset_to_offset_utf16(end);
+
+            let toggled = toggle_line_comments(&block);
+            if toggled == block {
+                return;
+            }
+
+            // Map the cursor onto the toggled text so it stays put within
+            // its line, shifted by that line's inserted/removed prefix.
+            let mut new_cursor = start + toggled.len();
+            let mut old_line_start = start;
+            let mut new_line_start = start;
+            for (old_line, new_line) in block.split('\n').zip(toggled.split('\n')) {
+                if cursor <= old_line_start + old_line.len() {
+                    let column = cursor - old_line_start;
+                    let column = if new_line.len() >= old_line.len() {
+                        column + (new_line.len() - old_line.len())
+                    } else {
+                        column.saturating_sub(old_line.len() - new_line.len())
+                    };
+                    new_cursor = new_line_start + column.min(new_line.len());
+                    break;
+                }
+                old_line_start += old_line.len() + 1;
+                new_line_start += new_line.len() + 1;
+            }
+
+            state.replace_text_in_range(Some(range_utf16), &toggled, window, cx);
+            let position = state.text().offset_to_position(new_cursor);
+            state.set_cursor_position(position, window, cx);
+        });
+    }
+
     pub fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.lsp.clone().filter(|_| self.config.format_on_save) else {
             self.write_script(window, cx);
@@ -1053,6 +1149,7 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::open_config))
             .on_action(cx.listener(Self::toggle_toolbar))
             .on_action(cx.listener(Self::format_script))
+            .on_action(cx.listener(Self::toggle_comment))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
@@ -1141,7 +1238,64 @@ impl Render for PgGuiApp {
 
 #[cfg(test)]
 mod tests {
-    use super::mask_credentials;
+    use super::{mask_credentials, toggle_line_comments};
+
+    #[test]
+    fn comments_a_single_line() {
+        assert_eq!(toggle_line_comments("select 1;"), "-- select 1;");
+    }
+
+    #[test]
+    fn uncomments_a_single_line() {
+        assert_eq!(toggle_line_comments("-- select 1;"), "select 1;");
+        assert_eq!(toggle_line_comments("--select 1;"), "select 1;");
+    }
+
+    #[test]
+    fn comments_after_indentation() {
+        assert_eq!(
+            toggle_line_comments("  from users\n\tjoin orders"),
+            "  -- from users\n\t-- join orders"
+        );
+    }
+
+    #[test]
+    fn uncomments_indented_lines() {
+        assert_eq!(
+            toggle_line_comments("  -- from users\n\t--join orders"),
+            "  from users\n\tjoin orders"
+        );
+    }
+
+    #[test]
+    fn comments_when_any_line_is_uncommented() {
+        assert_eq!(
+            toggle_line_comments("-- select 1;\nselect 2;"),
+            "-- -- select 1;\n-- select 2;"
+        );
+    }
+
+    #[test]
+    fn skips_blank_lines_when_commenting() {
+        assert_eq!(
+            toggle_line_comments("select 1;\n\nselect 2;"),
+            "-- select 1;\n\n-- select 2;"
+        );
+    }
+
+    #[test]
+    fn ignores_blank_lines_when_uncommenting() {
+        assert_eq!(
+            toggle_line_comments("-- select 1;\n\n-- select 2;"),
+            "select 1;\n\nselect 2;"
+        );
+    }
+
+    #[test]
+    fn blank_only_block_is_untouched() {
+        assert_eq!(toggle_line_comments(""), "");
+        assert_eq!(toggle_line_comments("  \n"), "  \n");
+    }
 
     #[test]
     fn masks_user_and_password_in_url() {

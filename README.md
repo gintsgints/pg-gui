@@ -75,12 +75,13 @@ On Linux, `cmd` is `ctrl` throughout.
 | `cmd-enter` / `ctrl-enter` | Run the selection or the statement at the cursor |
 | `cmd-i` / `ctrl-space` | AI complete at cursor |
 | `cmd-shift-f` | Format the script |
+| `cmd-/` | Comment or uncomment the line / selection |
 | `cmd-p` | Insert a snippet |
 | `cmd-o` | Open a `.sql` file |
 | `cmd-s` | Save (Save As on first save) |
 | `cmd-b` | Show or hide the toolbar |
 | `cmd-,` | Open `config.json` in the system editor |
-| `cmd-=` / `cmd--` | Zoom in / out |
+| `cmd-plus` / `cmd-minus` | Zoom in / out |
 | `cmd-0` | Reset zoom |
 | `cmd-h` / `F1` | Show the command help dialog |
 | `cmd-q` | Quit |
