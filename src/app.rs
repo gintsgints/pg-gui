@@ -858,7 +858,7 @@ impl PgGuiApp {
                     });
                     this.set_status(format!("Opened {}", path.display()), cx);
                     this.config.script = content;
-                    this.script_path = Some(path);
+                    this.set_script_path(path, window);
                     this.save_config();
                 }
                 Err(err) => this.set_status(format!("Open failed: {err}"), cx),
@@ -1119,16 +1119,23 @@ impl PgGuiApp {
             let Ok(Ok(Some(path))) = rx.await else { return };
             let result = std::fs::write(&path, &content);
 
-            this.update(cx, |this, cx| match result {
+            this.update_in(cx, |this, window, cx| match result {
                 Ok(()) => {
                     this.set_status(format!("Saved {}", path.display()), cx);
-                    this.script_path = Some(path);
+                    this.set_script_path(path, window);
                 }
                 Err(err) => this.set_status(format!("Save failed: {err}"), cx),
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Remember where the script lives on disk and show that path in the
+    /// window title.
+    fn set_script_path(&mut self, path: PathBuf, window: &mut Window) {
+        window.set_window_title(&format!("pg-gui — {}", path.display()));
+        self.script_path = Some(path);
     }
 }
 
