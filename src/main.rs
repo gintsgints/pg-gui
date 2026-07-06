@@ -18,6 +18,7 @@ actions!(
     [
         RunQuery,
         AiComplete,
+        NewFile,
         OpenFile,
         SaveFile,
         OpenSnippets,
@@ -52,6 +53,7 @@ fn main() {
             KeyBinding::new("ctrl-enter", RunQuery, None),
             KeyBinding::new("secondary-i", AiComplete, None),
             KeyBinding::new("ctrl-space", AiComplete, None),
+            KeyBinding::new("secondary-n", NewFile, None),
             KeyBinding::new("secondary-o", OpenFile, None),
             KeyBinding::new("secondary-s", SaveFile, None),
             KeyBinding::new("secondary-p", OpenSnippets, None),

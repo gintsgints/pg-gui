@@ -11,6 +11,10 @@ pub struct Config {
     /// The editor buffer, restored on the next launch (unsaved edits included).
     #[serde(default)]
     pub script: String,
+    /// The file the script was last opened from or saved to; restored on
+    /// launch so the titlebar shows it and cmd-s keeps writing there.
+    #[serde(default)]
+    pub script_file: Option<PathBuf>,
     /// Height of the SQL editor panel in pixels; `None` until the divider
     /// is first dragged (both panels then split the window evenly).
     #[serde(default)]
@@ -56,6 +60,7 @@ impl Default for Config {
         Self {
             connection_string: String::new(),
             script: String::new(),
+            script_file: None,
             editor_height: None,
             toolbar_visible: true,
             page_size: default_page_size(),

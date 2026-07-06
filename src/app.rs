@@ -22,9 +22,9 @@ use gpui_component::{
 
 use crate::results::ResultsDelegate;
 use crate::{
-    AiComplete, FormatScript, OpenConfig, OpenFile, OpenSnippets, RunQuery, SaveFile, ShowHelp,
-    ToggleComment, ToggleToolbar, ZoomIn, ZoomOut, ZoomReset, ai, config, db, lsp, snippets,
-    statement,
+    AiComplete, FormatScript, NewFile, OpenConfig, OpenFile, OpenSnippets, RunQuery, SaveFile,
+    ShowHelp, ToggleComment, ToggleToolbar, ZoomIn, ZoomOut, ZoomReset, ai, config, db, lsp,
+    snippets, statement,
 };
 
 const ZOOM_STEP: f32 = 0.1;
@@ -43,6 +43,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cmd-shift-f", "Format the script"),
     ("cmd-/", "Comment or uncomment the line / selection"),
     ("cmd-p", "Insert a snippet"),
+    ("cmd-n", "New script"),
     ("cmd-o", "Open a SQL script"),
     ("cmd-s", "Save the script"),
     ("cmd-b", "Show or hide the toolbar"),
@@ -62,6 +63,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("ctrl-shift-f", "Format the script"),
     ("ctrl-/", "Comment or uncomment the line / selection"),
     ("ctrl-p", "Insert a snippet"),
+    ("ctrl-n", "New script"),
     ("ctrl-o", "Open a SQL script"),
     ("ctrl-s", "Save the script"),
     ("ctrl-b", "Show or hide the toolbar"),
@@ -146,9 +148,9 @@ pub struct PgGuiApp {
     running: bool,
     ai_running: bool,
     config: config::Config,
-    /// The file the script was opened from or saved to this session, if
-    /// any; cmd-s writes there without prompting. Deliberately not
-    /// persisted — only the script text is restored across launches.
+    /// The file the script was opened from or saved to, if any; cmd-s
+    /// writes there without prompting. Persisted to the config and
+    /// restored on launch alongside the script text.
     script_path: Option<PathBuf>,
     /// Mtime of the config file after our last read or write; a different
     /// mtime on disk means it was edited externally and should be reloaded.
@@ -243,6 +245,12 @@ impl PgGuiApp {
             lsp: None,
             _subscriptions: subscriptions,
         };
+        // Restore which file the restored script belongs to, so the
+        // titlebar shows it and cmd-s keeps writing there. A path whose
+        // file is gone is dropped instead, back to prompt-on-save.
+        if let Some(path) = this.config.script_file.clone().filter(|path| path.exists()) {
+            this.set_script_path(path, window);
+        }
         this.start_lsp(cx);
         Self::watch_config(window, cx);
         this.apply_zoom(cx);
@@ -304,6 +312,15 @@ impl PgGuiApp {
 
         if self.config.connection_string != old.connection_string {
             self.sync_conn_input(mask_credentials(&self.config.connection_string), window, cx);
+        }
+
+        if self.config.script_file != old.script_file {
+            if let Some(path) = self.config.script_file.clone() {
+                self.set_script_path(path, window);
+            } else {
+                self.script_path = None;
+                window.set_window_title("pg-gui");
+            }
         }
 
         // The language server reads all of these from its generated
@@ -710,6 +727,11 @@ impl PgGuiApp {
                     })),
             )
             .child(
+                Button::new("new").label("New").on_click(
+                    cx.listener(|this, _, window, cx| this.new_file(&NewFile, window, cx)),
+                ),
+            )
+            .child(
                 Button::new("open").label("Open").on_click(
                     cx.listener(|this, _, window, cx| this.open_file(&OpenFile, window, cx)),
                 ),
@@ -830,6 +852,21 @@ impl PgGuiApp {
             .ok();
         })
         .detach();
+    }
+
+    /// Start a fresh script (cmd-n): clear the editor and forget the
+    /// current file, so cmd-s prompts for a new location.
+    pub fn new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        self.script_path = None;
+        window.set_window_title("pg-gui");
+        self.config.script = String::new();
+        self.config.script_file = None;
+        self.save_config();
+        self.set_status("New script", cx);
     }
 
     // &mut self is imposed by the action listener signature.
@@ -1123,6 +1160,7 @@ impl PgGuiApp {
                 Ok(()) => {
                     this.set_status(format!("Saved {}", path.display()), cx);
                     this.set_script_path(path, window);
+                    this.save_config();
                 }
                 Err(err) => this.set_status(format!("Save failed: {err}"), cx),
             })
@@ -1132,9 +1170,10 @@ impl PgGuiApp {
     }
 
     /// Remember where the script lives on disk and show that path in the
-    /// window title.
+    /// window title. Callers persist the config afterwards.
     fn set_script_path(&mut self, path: PathBuf, window: &mut Window) {
         window.set_window_title(&format!("pg-gui — {}", path.display()));
+        self.config.script_file = Some(path.clone());
         self.script_path = Some(path);
     }
 }
@@ -1150,6 +1189,7 @@ impl Render for PgGuiApp {
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::ai_complete))
+            .on_action(cx.listener(Self::new_file))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::save_file))
             .on_action(cx.listener(Self::open_snippet_picker))
