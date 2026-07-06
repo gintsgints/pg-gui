@@ -13,7 +13,8 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
   simple query protocol, and the last result set is shown in a virtualized table
   (handles large result sets)
 - **Open / save** `.sql` files with native file dialogs (`cmd-o` / `cmd-s`),
-  each open script in its own editor tab
+  each open script in its own editor tab; a tab with unsaved edits is marked
+  with a `•` and prompts to save before it's closed
 - **AI completion** (optional): completes the SQL at the cursor using the Claude API
   (`cmd-i` or `ctrl-space`)
 

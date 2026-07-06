@@ -148,6 +148,14 @@ fn toggle_line_comments(block: &str) -> String {
 struct EditorTab {
     editor: Entity<InputState>,
     path: Option<PathBuf>,
+    /// The content last written to (or read from) disk — the baseline the
+    /// buffer is compared against to decide if the tab has unsaved edits.
+    /// Empty for a never-saved tab. Not persisted: recomputed on launch
+    /// from the file so restored edits still register as unsaved.
+    saved: String,
+    /// Whether the buffer differs from `saved`, cached so the tab bar can
+    /// show a marker without diffing on every frame.
+    dirty: bool,
     _subscription: Subscription,
 }
 
@@ -220,7 +228,7 @@ impl PgGuiApp {
         let tabs: Vec<EditorTab> = config
             .tabs
             .iter()
-            .map(|tab| Self::build_tab(tab, window, cx))
+            .map(|tab| Self::build_tab(tab, Self::launch_baseline(tab), window, cx))
             .collect();
         let active_tab = config.active_tab;
 
@@ -271,9 +279,11 @@ impl PgGuiApp {
     }
 
     /// Create the editor for one tab and wire it into the change plumbing.
+    /// `saved` is the on-disk baseline used for the unsaved-edits marker.
     /// The caller hooks up the language server, if connected.
     fn build_tab(
         tab: &config::ScriptTab,
+        saved: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> EditorTab {
@@ -293,7 +303,32 @@ impl PgGuiApp {
         EditorTab {
             editor,
             path: tab.file.clone(),
+            dirty: tab.script != saved,
+            saved,
             _subscription: subscription,
+        }
+    }
+
+    /// The on-disk baseline for a restored tab: the file's current content
+    /// (so edits persisted since the last save show as unsaved), or empty
+    /// for a tab that was never saved to a file.
+    fn launch_baseline(tab: &config::ScriptTab) -> String {
+        match &tab.file {
+            Some(path) => std::fs::read_to_string(path).unwrap_or_else(|_| tab.script.clone()),
+            None => String::new(),
+        }
+    }
+
+    /// Recompute a tab's unsaved-edits marker and repaint if it flipped.
+    fn refresh_dirty(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix >= self.tabs.len() {
+            return;
+        }
+        let value = self.tabs[ix].editor.read(cx).value().to_string();
+        let dirty = value != self.tabs[ix].saved;
+        if self.tabs[ix].dirty != dirty {
+            self.tabs[ix].dirty = dirty;
+            cx.notify();
         }
     }
 
@@ -311,7 +346,9 @@ impl PgGuiApp {
         cx: &mut Context<Self>,
     ) -> usize {
         let tab_config = config::ScriptTab { script, file };
-        let tab = Self::build_tab(&tab_config, window, cx);
+        // A freshly added tab starts clean: its content is the baseline
+        // (empty for a new script, the file's text for an opened one).
+        let tab = Self::build_tab(&tab_config, tab_config.script.clone(), window, cx);
         if let Some(client) = &self.lsp {
             Self::attach_lsp_providers(client, &tab.editor, cx);
         }
@@ -365,7 +402,77 @@ impl PgGuiApp {
     }
 
     pub fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_tab_at(self.active_tab, window, cx);
+        self.request_close_tab(self.active_tab, window, cx);
+    }
+
+    /// Close a tab, but prompt first when it has unsaved edits.
+    fn request_close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix < self.tabs.len() && self.tabs[ix].dirty {
+            self.prompt_save_before_close(ix, window, cx);
+        } else {
+            self.close_tab_at(ix, window, cx);
+        }
+    }
+
+    /// Ask whether to save a tab's unsaved edits before closing it.
+    fn prompt_save_before_close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let name = self.tab_label(ix);
+        let app = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (save, discard) = (app.clone(), app.clone());
+            dialog.title("Unsaved changes").w(px(420.)).child(
+                v_flex()
+                    .gap_4()
+                    .pb_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .child(format!("“{name}” has unsaved changes.")),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(Button::new("cancel").label("Cancel").on_click(
+                                |_, window, cx| {
+                                    window.close_dialog(cx);
+                                },
+                            ))
+                            .child(
+                                Button::new("discard")
+                                    .danger()
+                                    .label("Don't Save")
+                                    .on_click(move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        discard
+                                            .update(cx, |this, cx| {
+                                                this.close_tab_at(ix, window, cx);
+                                            })
+                                            .ok();
+                                    }),
+                            )
+                            .child(Button::new("save").primary().label("Save").on_click(
+                                move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    save.update(cx, |this, cx| {
+                                        this.save_tab_then_close(ix, window, cx);
+                                    })
+                                    .ok();
+                                },
+                            )),
+                    ),
+            )
+        });
+    }
+
+    /// Save a tab (prompting for a path if it has no file) and close it
+    /// once the write succeeds.
+    fn save_tab_then_close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_tab(ix, window, cx);
+        self.save_active(true, window, cx);
     }
 
     pub fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -468,7 +575,7 @@ impl PgGuiApp {
             .config
             .tabs
             .iter()
-            .map(|tab| Self::build_tab(tab, window, cx))
+            .map(|tab| Self::build_tab(tab, Self::launch_baseline(tab), window, cx))
             .collect();
         if let Some(client) = &self.lsp {
             for tab in &self.tabs {
@@ -631,6 +738,7 @@ impl PgGuiApp {
             client.document_changed(text.clone());
         }
         self.config.tabs[ix].script = text;
+        self.refresh_dirty(ix, cx);
         self.schedule_save(cx);
     }
 
@@ -1059,6 +1167,8 @@ impl PgGuiApp {
                     let ix = if this.tab_is_pristine(this.active_tab, cx) {
                         let ix = this.active_tab;
                         this.config.tabs[ix].script.clone_from(&content);
+                        this.tabs[ix].saved.clone_from(&content);
+                        this.tabs[ix].dirty = false;
                         this.tabs[ix].editor.update(cx, |state, cx| {
                             state.set_value(content, window, cx);
                         });
@@ -1262,8 +1372,15 @@ impl PgGuiApp {
     }
 
     pub fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_active(false, window, cx);
+    }
+
+    /// Save the active tab, optionally closing it once the write succeeds
+    /// (`close_after` is set by the save-before-close prompt). Applies
+    /// format-on-save first when enabled.
+    fn save_active(&mut self, close_after: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.lsp.clone().filter(|_| self.config.format_on_save) else {
-            self.write_script(window, cx);
+            self.write_script(close_after, window, cx);
             return;
         };
 
@@ -1281,7 +1398,7 @@ impl PgGuiApp {
                     Ok(_) => None,
                     Err(err) => Some(err),
                 };
-                this.write_script(window, cx);
+                this.write_script(close_after, window, cx);
                 if let Some(err) = format_error {
                     this.set_status(format!("Format on save failed: {err}"), cx);
                 }
@@ -1310,14 +1427,22 @@ impl PgGuiApp {
     }
 
     /// Write the active tab's content to its script file, prompting for a
-    /// location the first time.
-    fn write_script(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// location the first time. On success the tab's saved baseline is
+    /// updated (clearing its unsaved-edits marker) and, when `close_after`
+    /// is set, the tab is closed.
+    fn write_script(&mut self, close_after: bool, window: &mut Window, cx: &mut Context<Self>) {
         let ix = self.active_tab;
         let content = self.editor().read(cx).value().to_string();
 
         if let Some(path) = self.tabs[ix].path.clone() {
             match std::fs::write(&path, &content) {
-                Ok(()) => self.set_status(format!("Saved {}", path.display()), cx),
+                Ok(()) => {
+                    self.mark_saved(ix, content, cx);
+                    self.set_status(format!("Saved {}", path.display()), cx);
+                    if close_after {
+                        self.close_tab_at(ix, window, cx);
+                    }
+                }
                 Err(err) => self.set_status(format!("Save failed: {err}"), cx),
             }
             return;
@@ -1334,13 +1459,27 @@ impl PgGuiApp {
                 Ok(()) => {
                     this.set_status(format!("Saved {}", path.display()), cx);
                     this.set_tab_path(ix, path, window);
+                    this.mark_saved(ix, content, cx);
                     this.save_config();
+                    if close_after {
+                        this.close_tab_at(ix, window, cx);
+                    }
                 }
                 Err(err) => this.set_status(format!("Save failed: {err}"), cx),
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Adopt `content` as a tab's on-disk baseline, clearing its
+    /// unsaved-edits marker.
+    fn mark_saved(&mut self, ix: usize, content: String, cx: &mut Context<Self>) {
+        if ix >= self.tabs.len() {
+            return;
+        }
+        self.tabs[ix].saved = content;
+        self.refresh_dirty(ix, cx);
     }
 
     /// Remember where a tab's script lives on disk and refresh the window
@@ -1363,9 +1502,22 @@ impl PgGuiApp {
         }
     }
 
+    /// A tab's display name: its file name, or "untitled".
+    fn tab_label(&self, ix: usize) -> String {
+        self.tabs[ix]
+            .path
+            .as_deref()
+            .and_then(|path| path.file_name())
+            .map_or_else(
+                || "untitled".to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+    }
+
     /// One tab per open script, with a "×" close button each and a
-    /// trailing "+" that opens a fresh one. gpui-component ships no icon
-    /// assets, so these use text glyphs rather than `IconName` SVGs.
+    /// trailing "+" that opens a fresh one. A tab with unsaved edits is
+    /// marked with a leading "•". gpui-component ships no icon assets, so
+    /// these use text glyphs rather than `IconName` SVGs.
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         TabBar::new("script-tabs")
             .small()
@@ -1384,14 +1536,11 @@ impl PgGuiApp {
                     })),
             )
             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
-                let label = tab
-                    .path
-                    .as_deref()
-                    .and_then(|path| path.file_name())
-                    .map_or_else(
-                        || "untitled".to_string(),
-                        |name| name.to_string_lossy().into_owned(),
-                    );
+                let label = if tab.dirty {
+                    format!("• {}", self.tab_label(ix))
+                } else {
+                    self.tab_label(ix)
+                };
                 Tab::new().label(label).suffix(
                     Button::new(("close-tab", ix))
                         .ghost()
@@ -1399,7 +1548,7 @@ impl PgGuiApp {
                         .label("×")
                         .tooltip("Close tab")
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.close_tab_at(ix, window, cx);
+                            this.request_close_tab(ix, window, cx);
                         })),
                 )
             }))
