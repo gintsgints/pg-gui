@@ -12,7 +12,8 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
   statement under the cursor. Multi-statement selections are supported via the
   simple query protocol, and the last result set is shown in a virtualized table
   (handles large result sets)
-- **Open / save** `.sql` files with native file dialogs (`cmd-o` / `cmd-s`)
+- **Open / save** `.sql` files with native file dialogs (`cmd-o` / `cmd-s`),
+  each open script in its own editor tab
 - **AI completion** (optional): completes the SQL at the cursor using the Claude API
   (`cmd-i` or `ctrl-space`)
 
@@ -22,11 +23,11 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
 cargo run
 ```
 
-The connection string and the SQL editor buffer are remembered between launches:
+The connection string and the open editor tabs are remembered between launches:
 both are saved to `~/Library/Application Support/pg-gui/config.json` (the platform
-config directory) as you type — the script with a short debounce — and restored on
-the next start, unsaved edits included. The path of the last opened/saved `.sql`
-file is remembered too, so `cmd-s` keeps writing to the same file after a restart.
+config directory) as you type — the scripts with a short debounce — and restored on
+the next start, unsaved edits included. Each tab's `.sql` file path is remembered
+too, so `cmd-s` keeps writing to the same file after a restart.
 A `DATABASE_URL` environment variable, if set, overrides the saved connection
 string for that launch; with neither present the field defaults to
 `postgres://$USER@localhost:5432/postgres`. TLS connections are not supported yet
@@ -77,6 +78,9 @@ On Linux, `cmd` is `ctrl` throughout.
 | `cmd-shift-f` | Format the script |
 | `cmd-/` | Comment or uncomment the line / selection |
 | `cmd-p` | Insert a snippet |
+| `cmd-n` | New script tab |
+| `cmd-w` | Close the tab |
+| `ctrl-tab` / `ctrl-shift-tab` | Next / previous tab |
 | `cmd-o` | Open a `.sql` file |
 | `cmd-s` | Save (Save As on first save) |
 | `cmd-b` | Show or hide the toolbar |

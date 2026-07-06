@@ -2,19 +2,34 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// One editor tab: the buffer text (unsaved edits included) and the file
+/// it was opened from or saved to, if any.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptTab {
+    #[serde(default)]
+    pub script: String,
+    #[serde(default)]
+    pub file: Option<PathBuf>,
+}
+
 /// Persisted app settings, stored as JSON in the platform config directory
 /// (`~/Library/Application Support/pg-gui/config.json` on macOS).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub connection_string: String,
-    /// The editor buffer, restored on the next launch (unsaved edits included).
+    /// Pre-tabs single-script fields; read once to seed `tabs` in
+    /// [`try_load`] and no longer written.
+    #[serde(default, skip_serializing)]
+    script: String,
+    #[serde(default, skip_serializing)]
+    script_file: Option<PathBuf>,
+    /// The open editor tabs, restored on the next launch.
     #[serde(default)]
-    pub script: String,
-    /// The file the script was last opened from or saved to; restored on
-    /// launch so the titlebar shows it and cmd-s keeps writing there.
+    pub tabs: Vec<ScriptTab>,
+    /// Index of the selected tab.
     #[serde(default)]
-    pub script_file: Option<PathBuf>,
+    pub active_tab: usize,
     /// Height of the SQL editor panel in pixels; `None` until the divider
     /// is first dragged (both panels then split the window evenly).
     #[serde(default)]
@@ -61,6 +76,8 @@ impl Default for Config {
             connection_string: String::new(),
             script: String::new(),
             script_file: None,
+            tabs: Vec::new(),
+            active_tab: 0,
             editor_height: None,
             toolbar_visible: true,
             page_size: default_page_size(),
@@ -100,7 +117,15 @@ pub fn load() -> Config {
 /// in-memory config instead of falling back to defaults.
 pub fn try_load() -> Option<Config> {
     let text = std::fs::read_to_string(path()?).ok()?;
-    serde_json::from_str(&text).ok()
+    let mut config: Config = serde_json::from_str(&text).ok()?;
+    // Migrate a pre-tabs config: its single script becomes the only tab.
+    if config.tabs.is_empty() && (!config.script.is_empty() || config.script_file.is_some()) {
+        config.tabs.push(ScriptTab {
+            script: std::mem::take(&mut config.script),
+            file: config.script_file.take(),
+        });
+    }
+    Some(config)
 }
 
 /// The config file's last modification time; `None` when it doesn't

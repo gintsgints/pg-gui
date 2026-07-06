@@ -16,15 +16,16 @@ use gpui_component::{
     input::{Input, InputEvent, InputState, RopeExt as _, TabSize},
     list::{List, ListEvent, ListState},
     resizable::{ResizableState, resizable_panel, v_resizable},
+    tab::{Tab, TabBar},
     table::{Table, TableState},
     v_flex,
 };
 
 use crate::results::ResultsDelegate;
 use crate::{
-    AiComplete, FormatScript, NewFile, OpenConfig, OpenFile, OpenSnippets, RunQuery, SaveFile,
-    ShowHelp, ToggleComment, ToggleToolbar, ZoomIn, ZoomOut, ZoomReset, ai, config, db, lsp,
-    snippets, statement,
+    AiComplete, CloseTab, FormatScript, NewFile, NextTab, OpenConfig, OpenFile, OpenSnippets,
+    PrevTab, RunQuery, SaveFile, ShowHelp, ToggleComment, ToggleToolbar, ZoomIn, ZoomOut,
+    ZoomReset, ai, config, db, lsp, snippets, statement,
 };
 
 const ZOOM_STEP: f32 = 0.1;
@@ -43,7 +44,9 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cmd-shift-f", "Format the script"),
     ("cmd-/", "Comment or uncomment the line / selection"),
     ("cmd-p", "Insert a snippet"),
-    ("cmd-n", "New script"),
+    ("cmd-n", "New script tab"),
+    ("cmd-w", "Close the tab"),
+    ("ctrl-tab / ctrl-shift-tab", "Next / previous tab"),
     ("cmd-o", "Open a SQL script"),
     ("cmd-s", "Save the script"),
     ("cmd-b", "Show or hide the toolbar"),
@@ -63,7 +66,9 @@ const COMMANDS: &[(&str, &str)] = &[
     ("ctrl-shift-f", "Format the script"),
     ("ctrl-/", "Comment or uncomment the line / selection"),
     ("ctrl-p", "Insert a snippet"),
-    ("ctrl-n", "New script"),
+    ("ctrl-n", "New script tab"),
+    ("ctrl-w", "Close the tab"),
+    ("ctrl-tab / ctrl-shift-tab", "Next / previous tab"),
     ("ctrl-o", "Open a SQL script"),
     ("ctrl-s", "Save the script"),
     ("ctrl-b", "Show or hide the toolbar"),
@@ -137,9 +142,19 @@ fn toggle_line_comments(block: &str) -> String {
         .join("\n")
 }
 
+/// One open script: its editor buffer and the file it belongs to, if
+/// any — cmd-s writes there without prompting. Mirrored in
+/// `config.tabs` at the same index, which holds the persisted text.
+struct EditorTab {
+    editor: Entity<InputState>,
+    path: Option<PathBuf>,
+    _subscription: Subscription,
+}
+
 pub struct PgGuiApp {
     conn_input: Entity<InputState>,
-    editor: Entity<InputState>,
+    tabs: Vec<EditorTab>,
+    active_tab: usize,
     results: Entity<TableState<ResultsDelegate>>,
     /// Split state of the editor/results panels; the editor height is
     /// persisted to the config whenever the divider is dragged.
@@ -148,10 +163,6 @@ pub struct PgGuiApp {
     running: bool,
     ai_running: bool,
     config: config::Config,
-    /// The file the script was opened from or saved to, if any; cmd-s
-    /// writes there without prompting. Persisted to the config and
-    /// restored on launch alongside the script text.
-    script_path: Option<PathBuf>,
     /// Mtime of the config file after our last read or write; a different
     /// mtime on disk means it was edited externally and should be reloaded.
     config_disk_time: Option<SystemTime>,
@@ -186,6 +197,18 @@ impl PgGuiApp {
             config.connection_string = default_conn();
         }
 
+        if config.tabs.is_empty() {
+            config.tabs.push(config::ScriptTab::default());
+        }
+        config.active_tab = config.active_tab.min(config.tabs.len() - 1);
+        // A remembered path whose file is gone is dropped, back to
+        // prompt-on-save.
+        for tab in &mut config.tabs {
+            if tab.file.as_ref().is_some_and(|path| !path.exists()) {
+                tab.file = None;
+            }
+        }
+
         let conn_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("postgres://user:password@host:5432/database")
@@ -194,28 +217,23 @@ impl PgGuiApp {
                 .default_value(mask_credentials(&config.connection_string))
         });
 
-        let editor = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor("sql")
-                .multi_line(true)
-                .line_number(true)
-                .tab_size(TabSize {
-                    tab_size: 2,
-                    ..Default::default()
-                })
-                .placeholder("-- Write PostgreSQL here, then press cmd-enter to run")
-                .default_value(config.script.clone())
-        });
+        let tabs: Vec<EditorTab> = config
+            .tabs
+            .iter()
+            .map(|tab| Self::build_tab(tab, window, cx))
+            .collect();
+        let active_tab = config.active_tab;
 
         let results =
             cx.new(|cx| TableState::new(ResultsDelegate::new(config.page_size), window, cx));
         let resizable_state = cx.new(|_| ResizableState::default());
 
-        editor.update(cx, |state, cx| state.focus(window, cx));
+        tabs[active_tab]
+            .editor
+            .update(cx, |state, cx| state.focus(window, cx));
 
         let subscriptions = vec![
             cx.subscribe_in(&conn_input, window, Self::on_conn_input_event),
-            cx.subscribe_in(&editor, window, Self::on_editor_event),
             // Flush any debounced (not yet written) changes on quit,
             // and stop the language server.
             cx.on_app_quit(|this, _| {
@@ -229,14 +247,14 @@ impl PgGuiApp {
 
         let mut this = Self {
             conn_input,
-            editor,
+            tabs,
+            active_tab,
             results,
             resizable_state,
             status: "Ready".into(),
             running: false,
             ai_running: false,
             config,
-            script_path: None,
             config_disk_time: config::modified_time(),
             base_font_size: cx.theme().font_size,
             base_mono_font_size: cx.theme().mono_font_size,
@@ -245,16 +263,118 @@ impl PgGuiApp {
             lsp: None,
             _subscriptions: subscriptions,
         };
-        // Restore which file the restored script belongs to, so the
-        // titlebar shows it and cmd-s keeps writing there. A path whose
-        // file is gone is dropped instead, back to prompt-on-save.
-        if let Some(path) = this.config.script_file.clone().filter(|path| path.exists()) {
-            this.set_script_path(path, window);
-        }
+        this.update_window_title(window);
         this.start_lsp(cx);
         Self::watch_config(window, cx);
         this.apply_zoom(cx);
         this
+    }
+
+    /// Create the editor for one tab and wire it into the change plumbing.
+    /// The caller hooks up the language server, if connected.
+    fn build_tab(
+        tab: &config::ScriptTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> EditorTab {
+        let editor = cx.new(|cx| {
+            InputState::new(window, cx)
+                .code_editor("sql")
+                .multi_line(true)
+                .line_number(true)
+                .tab_size(TabSize {
+                    tab_size: 2,
+                    ..Default::default()
+                })
+                .placeholder("-- Write PostgreSQL here, then press cmd-enter to run")
+                .default_value(tab.script.clone())
+        });
+        let subscription = cx.subscribe_in(&editor, window, Self::on_editor_event);
+        EditorTab {
+            editor,
+            path: tab.file.clone(),
+            _subscription: subscription,
+        }
+    }
+
+    /// The active tab's editor.
+    fn editor(&self) -> Entity<InputState> {
+        self.tabs[self.active_tab].editor.clone()
+    }
+
+    /// Append a tab (not yet selected) and its config mirror.
+    fn add_tab(
+        &mut self,
+        script: String,
+        file: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let tab_config = config::ScriptTab { script, file };
+        let tab = Self::build_tab(&tab_config, window, cx);
+        if let Some(client) = &self.lsp {
+            Self::attach_lsp_providers(client, &tab.editor, cx);
+        }
+        self.tabs.push(tab);
+        self.config.tabs.push(tab_config);
+        self.tabs.len() - 1
+    }
+
+    /// Select a tab: focus its editor, retitle the window, and point the
+    /// language server at its content.
+    fn activate_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix >= self.tabs.len() {
+            return;
+        }
+        self.active_tab = ix;
+        self.config.active_tab = ix;
+        let editor = self.editor();
+        editor.update(cx, |state, cx| {
+            // Any diagnostics in this buffer are from when it was last
+            // active; clear them until the server re-checks it.
+            if let Some(set) = state.diagnostics_mut() {
+                set.clear();
+            }
+            state.focus(window, cx);
+        });
+        if let Some(client) = &self.lsp {
+            client.document_changed(editor.read(cx).value().to_string());
+        }
+        self.update_window_title(window);
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// Close a tab; the last one is replaced with a fresh empty script.
+    fn close_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(ix);
+        self.config.tabs.remove(ix);
+        if self.tabs.is_empty() {
+            self.add_tab(String::new(), None, window, cx);
+        }
+        let active = if ix < self.active_tab {
+            self.active_tab - 1
+        } else {
+            self.active_tab.min(self.tabs.len() - 1)
+        };
+        self.activate_tab(active, window, cx);
+        self.save_config();
+    }
+
+    pub fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_tab_at(self.active_tab, window, cx);
+    }
+
+    pub fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_tab((self.active_tab + 1) % self.tabs.len(), window, cx);
+    }
+
+    pub fn prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.tabs.len();
+        self.activate_tab((self.active_tab + count - 1) % count, window, cx);
     }
 
     /// Write the config and remember the file's new mtime, so the watcher
@@ -304,23 +424,12 @@ impl PgGuiApp {
     ) {
         let old = std::mem::replace(&mut self.config, new);
 
-        if self.config.script != old.script {
-            let script = self.config.script.clone();
-            self.editor
-                .update(cx, |state, cx| state.set_value(script, window, cx));
+        if self.config.tabs != old.tabs || self.config.active_tab != old.active_tab {
+            self.rebuild_tabs(window, cx);
         }
 
         if self.config.connection_string != old.connection_string {
             self.sync_conn_input(mask_credentials(&self.config.connection_string), window, cx);
-        }
-
-        if self.config.script_file != old.script_file {
-            if let Some(path) = self.config.script_file.clone() {
-                self.set_script_path(path, window);
-            } else {
-                self.script_path = None;
-                window.set_window_title("pg-gui");
-            }
         }
 
         // The language server reads all of these from its generated
@@ -348,11 +457,32 @@ impl PgGuiApp {
         cx.notify();
     }
 
+    /// Recreate every editor tab from the config, after an external edit
+    /// changed the tab list itself.
+    fn rebuild_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.config.tabs.is_empty() {
+            self.config.tabs.push(config::ScriptTab::default());
+        }
+        self.config.active_tab = self.config.active_tab.min(self.config.tabs.len() - 1);
+        self.tabs = self
+            .config
+            .tabs
+            .iter()
+            .map(|tab| Self::build_tab(tab, window, cx))
+            .collect();
+        if let Some(client) = &self.lsp {
+            for tab in &self.tabs {
+                Self::attach_lsp_providers(client, &tab.editor, cx);
+            }
+        }
+        self.activate_tab(self.config.active_tab, window, cx);
+    }
+
     /// Launch the Postgres language server in the background and plug it
     /// into the editor once the handshake completes.
     fn start_lsp(&mut self, cx: &mut Context<Self>) {
         let conn = self.config.connection_string.clone();
-        let text = self.editor.read(cx).value().to_string();
+        let text = self.editor().read(cx).value().to_string();
         let (keyword_case, constant_case) = (self.config.keyword_case, self.config.constant_case);
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -385,20 +515,20 @@ impl PgGuiApp {
             return;
         }
 
-        let provider = Rc::new(lsp::Provider::new(client.clone()));
-        self.editor.update(cx, |state, _| {
-            state.lsp.completion_provider = Some(provider.clone());
-            state.lsp.hover_provider = Some(provider);
-        });
+        for tab in &self.tabs {
+            Self::attach_lsp_providers(&client, &tab.editor, cx);
+        }
         // Resync whatever was typed while the server was starting.
-        client.document_changed(self.editor.read(cx).value().to_string());
+        client.document_changed(self.editor().read(cx).value().to_string());
         self.lsp = Some(client);
         self.set_status("SQL language server connected", cx);
 
         cx.spawn(async move |this, cx| {
             while let Some(diagnostics) = diagnostics.next().await {
                 let updated = this.update(cx, |this, cx| {
-                    this.editor.update(cx, |state, cx| {
+                    // Diagnostics are for the server's single document,
+                    // which mirrors the active tab.
+                    this.editor().update(cx, |state, cx| {
                         if let Some(set) = state.diagnostics_mut() {
                             set.clear();
                             set.extend(diagnostics);
@@ -414,16 +544,32 @@ impl PgGuiApp {
         .detach();
     }
 
+    /// Plug the language server's completion and hover providers into one
+    /// tab's editor.
+    fn attach_lsp_providers(
+        client: &lsp::Client,
+        editor: &Entity<InputState>,
+        cx: &mut Context<Self>,
+    ) {
+        let provider = Rc::new(lsp::Provider::new(client.clone()));
+        editor.update(cx, |state, _| {
+            state.lsp.completion_provider = Some(provider.clone());
+            state.lsp.hover_provider = Some(provider);
+        });
+    }
+
     /// Restart the language server so it reconnects with the current
     /// connection string (completions follow the database schema).
     fn restart_lsp(&mut self, cx: &mut Context<Self>) {
         if let Some(client) = self.lsp.take() {
             client.shutdown();
         }
-        self.editor.update(cx, |state, _| {
-            state.lsp.completion_provider = None;
-            state.lsp.hover_provider = None;
-        });
+        for tab in &self.tabs {
+            tab.editor.update(cx, |state, _| {
+                state.lsp.completion_provider = None;
+                state.lsp.hover_provider = None;
+            });
+        }
         self.start_lsp(cx);
     }
 
@@ -471,14 +617,21 @@ impl PgGuiApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if matches!(event, InputEvent::Change) {
-            let text = state.read(cx).value().to_string();
-            if let Some(client) = &self.lsp {
-                client.document_changed(text.clone());
-            }
-            self.config.script = text;
-            self.schedule_save(cx);
+        if !matches!(event, InputEvent::Change) {
+            return;
         }
+        let Some(ix) = self.tabs.iter().position(|tab| tab.editor == *state) else {
+            return;
+        };
+        let text = state.read(cx).value().to_string();
+        // The server tracks a single document: the active tab's.
+        if ix == self.active_tab
+            && let Some(client) = &self.lsp
+        {
+            client.document_changed(text.clone());
+        }
+        self.config.tabs[ix].script = text;
+        self.schedule_save(cx);
     }
 
     /// Persist the config after a short debounce, so typing in the editor
@@ -562,7 +715,7 @@ impl PgGuiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.editor.update(cx, |state, cx| {
+        self.editor().update(cx, |state, cx| {
             let sql = snippet.sql.trim();
             let text = state.value();
             let mut cursor = state.cursor().min(text.len());
@@ -603,7 +756,7 @@ impl PgGuiApp {
         // Run the selected block when there is a selection, otherwise the
         // statement the cursor is on (or, when the cursor sits after a
         // statement, the one to its left).
-        let selection = self.editor.update(cx, |state, cx| {
+        let selection = self.editor().update(cx, |state, cx| {
             state
                 .selected_text_range(false, window, cx)
                 .filter(|sel| !sel.range.is_empty())
@@ -613,7 +766,7 @@ impl PgGuiApp {
         let (sql, scope) = if let Some(sql) = selection {
             (sql, "selection")
         } else {
-            let state = self.editor.read(cx);
+            let state = self.editor().read(cx);
             let text = state.value();
             let sql = statement::at(&text, state.cursor())
                 .map(|range| text[range].to_string())
@@ -819,7 +972,7 @@ impl PgGuiApp {
         };
 
         let (before, after) = {
-            let state = self.editor.read(cx);
+            let state = self.editor().read(cx);
             let text = state.value().to_string();
             let mut cursor = state.cursor().min(text.len());
             while cursor > 0 && !text.is_char_boundary(cursor) {
@@ -840,7 +993,7 @@ impl PgGuiApp {
                 this.ai_running = false;
                 match result {
                     Ok(completion) => {
-                        this.editor.update(cx, |state, cx| {
+                        this.editor().update(cx, |state, cx| {
                             state.insert(completion, window, cx);
                             state.focus(window, cx);
                         });
@@ -854,19 +1007,19 @@ impl PgGuiApp {
         .detach();
     }
 
-    /// Start a fresh script (cmd-n): clear the editor and forget the
-    /// current file, so cmd-s prompts for a new location.
+    /// Start a fresh script in a new tab (cmd-n); cmd-s prompts for its
+    /// location.
     pub fn new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<Self>) {
-        self.editor.update(cx, |state, cx| {
-            state.set_value("", window, cx);
-            state.focus(window, cx);
-        });
-        self.script_path = None;
-        window.set_window_title("pg-gui");
-        self.config.script = String::new();
-        self.config.script_file = None;
+        let ix = self.add_tab(String::new(), None, window, cx);
+        self.activate_tab(ix, window, cx);
         self.save_config();
         self.set_status("New script", cx);
+    }
+
+    /// Whether a tab holds an untouched fresh script, safe to reuse for an
+    /// opened file.
+    fn tab_is_pristine(&self, ix: usize, cx: &Context<Self>) -> bool {
+        self.tabs[ix].path.is_none() && self.tabs[ix].editor.read(cx).value().is_empty()
     }
 
     // &mut self is imposed by the action listener signature.
@@ -890,13 +1043,33 @@ impl PgGuiApp {
 
             this.update_in(cx, |this, window, cx| match content {
                 Ok(content) => {
-                    this.editor.update(cx, |state, cx| {
-                        state.set_value(content.clone(), window, cx);
-                    });
-                    this.set_status(format!("Opened {}", path.display()), cx);
-                    this.config.script = content;
-                    this.set_script_path(path, window);
+                    // A file that is already open just gets its tab
+                    // selected, keeping any unsaved edits in its buffer.
+                    if let Some(ix) = this
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.path.as_deref() == Some(path.as_path()))
+                    {
+                        this.activate_tab(ix, window, cx);
+                        this.set_status(format!("{} was already open", path.display()), cx);
+                        return;
+                    }
+                    // Open into a new tab, except an untouched fresh tab
+                    // is filled in place.
+                    let ix = if this.tab_is_pristine(this.active_tab, cx) {
+                        let ix = this.active_tab;
+                        this.config.tabs[ix].script.clone_from(&content);
+                        this.tabs[ix].editor.update(cx, |state, cx| {
+                            state.set_value(content, window, cx);
+                        });
+                        ix
+                    } else {
+                        this.add_tab(content, None, window, cx)
+                    };
+                    this.activate_tab(ix, window, cx);
+                    this.set_tab_path(ix, path.clone(), window);
                     this.save_config();
+                    this.set_status(format!("Opened {}", path.display()), cx);
                 }
                 Err(err) => this.set_status(format!("Open failed: {err}"), cx),
             })
@@ -1006,13 +1179,13 @@ impl PgGuiApp {
             return;
         };
 
-        let text = self.editor.read(cx).value().to_string();
+        let text = self.editor().read(cx).value().to_string();
         cx.spawn_in(window, async move |this, cx| {
             let result = client.format(&text).await;
             this.update_in(cx, |this, window, cx| match result {
                 // Skip stale results: the buffer changed while the
                 // server was formatting.
-                Ok(Some(formatted)) if this.editor.read(cx).value() == text => {
+                Ok(Some(formatted)) if this.editor().read(cx).value() == text => {
                     this.apply_formatted(&formatted, window, cx);
                     this.set_status("Formatted script", cx);
                 }
@@ -1034,7 +1207,7 @@ impl PgGuiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.editor.update(cx, |state, cx| {
+        self.editor().update(cx, |state, cx| {
             let selection = state
                 .selected_text_range(false, window, cx)
                 .map(|sel| sel.range);
@@ -1094,14 +1267,14 @@ impl PgGuiApp {
             return;
         };
 
-        let text = self.editor.read(cx).value().to_string();
+        let text = self.editor().read(cx).value().to_string();
         cx.spawn_in(window, async move |this, cx| {
             let result = client.format(&text).await;
             this.update_in(cx, |this, window, cx| {
                 let format_error = match result {
                     // Skip stale results: the buffer changed while the
                     // server was formatting.
-                    Ok(Some(formatted)) if this.editor.read(cx).value() == text => {
+                    Ok(Some(formatted)) if this.editor().read(cx).value() == text => {
                         this.apply_formatted(&formatted, window, cx);
                         None
                     }
@@ -1122,7 +1295,7 @@ impl PgGuiApp {
     /// keeping the cursor near where it was. Goes through the input
     /// handler so the usual change plumbing (LSP sync, config save) runs.
     fn apply_formatted(&mut self, formatted: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.editor.update(cx, |state, cx| {
+        self.editor().update(cx, |state, cx| {
             let cursor = state.cursor();
             let full_range = 0..state.value().chars().map(char::len_utf16).sum();
             state.replace_text_in_range(Some(full_range), formatted, window, cx);
@@ -1136,12 +1309,13 @@ impl PgGuiApp {
         });
     }
 
-    /// Write the editor content to the script file, prompting for a
+    /// Write the active tab's content to its script file, prompting for a
     /// location the first time.
     fn write_script(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let content = self.editor.read(cx).value().to_string();
+        let ix = self.active_tab;
+        let content = self.editor().read(cx).value().to_string();
 
-        if let Some(path) = self.script_path.clone() {
+        if let Some(path) = self.tabs[ix].path.clone() {
             match std::fs::write(&path, &content) {
                 Ok(()) => self.set_status(format!("Saved {}", path.display()), cx),
                 Err(err) => self.set_status(format!("Save failed: {err}"), cx),
@@ -1159,7 +1333,7 @@ impl PgGuiApp {
             this.update_in(cx, |this, window, cx| match result {
                 Ok(()) => {
                     this.set_status(format!("Saved {}", path.display()), cx);
-                    this.set_script_path(path, window);
+                    this.set_tab_path(ix, path, window);
                     this.save_config();
                 }
                 Err(err) => this.set_status(format!("Save failed: {err}"), cx),
@@ -1169,12 +1343,66 @@ impl PgGuiApp {
         .detach();
     }
 
-    /// Remember where the script lives on disk and show that path in the
-    /// window title. Callers persist the config afterwards.
-    fn set_script_path(&mut self, path: PathBuf, window: &mut Window) {
-        window.set_window_title(&format!("pg-gui — {}", path.display()));
-        self.config.script_file = Some(path.clone());
-        self.script_path = Some(path);
+    /// Remember where a tab's script lives on disk and refresh the window
+    /// title. Callers persist the config afterwards.
+    fn set_tab_path(&mut self, ix: usize, path: PathBuf, window: &mut Window) {
+        // The tab may have been closed while a save dialog was open.
+        if ix >= self.tabs.len() {
+            return;
+        }
+        self.config.tabs[ix].file = Some(path.clone());
+        self.tabs[ix].path = Some(path);
+        self.update_window_title(window);
+    }
+
+    /// Show the active tab's file path in the window title.
+    fn update_window_title(&self, window: &mut Window) {
+        match &self.tabs[self.active_tab].path {
+            Some(path) => window.set_window_title(&format!("pg-gui — {}", path.display())),
+            None => window.set_window_title("pg-gui"),
+        }
+    }
+
+    /// One tab per open script, with a "×" close button each and a
+    /// trailing "+" that opens a fresh one. gpui-component ships no icon
+    /// assets, so these use text glyphs rather than `IconName` SVGs.
+    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        TabBar::new("script-tabs")
+            .small()
+            .selected_index(self.active_tab)
+            .on_click(cx.listener(|this, ix: &usize, window, cx| {
+                this.activate_tab(*ix, window, cx);
+            }))
+            .suffix(
+                Button::new("new-tab")
+                    .ghost()
+                    .small()
+                    .label("+")
+                    .tooltip("New script tab")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.new_file(&NewFile, window, cx);
+                    })),
+            )
+            .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
+                let label = tab
+                    .path
+                    .as_deref()
+                    .and_then(|path| path.file_name())
+                    .map_or_else(
+                        || "untitled".to_string(),
+                        |name| name.to_string_lossy().into_owned(),
+                    );
+                Tab::new().label(label).suffix(
+                    Button::new(("close-tab", ix))
+                        .ghost()
+                        .xsmall()
+                        .label("×")
+                        .tooltip("Close tab")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.close_tab_at(ix, window, cx);
+                        })),
+                )
+            }))
     }
 }
 
@@ -1190,6 +1418,9 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::ai_complete))
             .on_action(cx.listener(Self::new_file))
+            .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::next_tab))
+            .on_action(cx.listener(Self::prev_tab))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::save_file))
             .on_action(cx.listener(Self::open_snippet_picker))
@@ -1220,13 +1451,15 @@ impl Render for PgGuiApp {
                             }
                         }))
                         .child({
-                            // SQL editor
+                            // Tab bar over the SQL editor
                             let mut panel = resizable_panel().child(
-                                div().size_full().p_2().child(
-                                    Input::new(&self.editor)
-                                        .h_full()
-                                        .font_family(cx.theme().mono_font_family.clone())
-                                        .text_size(cx.theme().mono_font_size),
+                                v_flex().size_full().child(self.render_tab_bar(cx)).child(
+                                    div().flex_1().min_h(px(0.)).p_2().child(
+                                        Input::new(&self.editor())
+                                            .h_full()
+                                            .font_family(cx.theme().mono_font_family.clone())
+                                            .text_size(cx.theme().mono_font_size),
+                                    ),
                                 ),
                             );
                             if let Some(height) = self.config.editor_height {
