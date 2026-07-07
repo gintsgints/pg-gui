@@ -1,16 +1,32 @@
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
 /// One editor tab: the buffer text (unsaved edits included) and the file
 /// it was opened from or saved to, if any.
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ScriptTab {
     #[serde(default)]
     pub script: String,
     #[serde(default)]
     pub file: Option<PathBuf>,
+    /// The file's mtime when we last read or wrote it, persisted so the next
+    /// launch can tell whether the file changed while the app was closed
+    /// (which, combined with unsaved edits, means a save would clobber it).
+    /// Excluded from `PartialEq` so a bare mtime change doesn't count as a
+    /// tab edit for the config watcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_time: Option<SystemTime>,
 }
+
+impl PartialEq for ScriptTab {
+    fn eq(&self, other: &Self) -> bool {
+        self.script == other.script && self.file == other.file
+    }
+}
+
+impl Eq for ScriptTab {}
 
 /// Persisted app settings, stored as JSON in the platform config directory
 /// (`~/Library/Application Support/pg-gui/config.json` on macOS).
@@ -123,6 +139,7 @@ pub fn try_load() -> Option<Config> {
         config.tabs.push(ScriptTab {
             script: std::mem::take(&mut config.script),
             file: config.script_file.take(),
+            disk_time: None,
         });
     }
     Some(config)

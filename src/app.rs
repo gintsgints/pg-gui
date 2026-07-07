@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
@@ -84,6 +84,12 @@ fn default_conn() -> String {
     format!("postgres://{user}@localhost:5432/postgres")
 }
 
+/// A file's last modification time, or `None` when it's missing or can't be
+/// stat'd. Used to notice when a tab's file was edited outside the app.
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    path.metadata().ok()?.modified().ok()
+}
+
 /// Replace the username and password in a connection string with stars, for
 /// display. Handles both URL (`postgres://user:pass@host/db`) and
 /// key-value (`host=… user=… password=…`) forms.
@@ -156,6 +162,14 @@ struct EditorTab {
     /// Whether the buffer differs from `saved`, cached so the tab bar can
     /// show a marker without diffing on every frame.
     dirty: bool,
+    /// Mtime of `path` after our last read or write; a newer mtime on disk
+    /// means the file was edited externally. `None` for a tab with no file
+    /// (or one whose file is missing).
+    disk_time: Option<SystemTime>,
+    /// Set when the file changed on disk while the tab had unsaved edits, so
+    /// a plain reload would clobber one side or the other. Shown with a
+    /// distinct tab glyph and enforced with a prompt before overwriting.
+    diverged: bool,
     _subscription: Subscription,
 }
 
@@ -273,7 +287,7 @@ impl PgGuiApp {
         };
         this.update_window_title(window);
         this.start_lsp(cx);
-        Self::watch_config(window, cx);
+        Self::watch_files(window, cx);
         this.apply_zoom(cx);
         this
     }
@@ -300,11 +314,21 @@ impl PgGuiApp {
                 .default_value(tab.script.clone())
         });
         let subscription = cx.subscribe_in(&editor, window, Self::on_editor_event);
+        let disk_time = tab.file.as_deref().and_then(file_mtime);
+        let dirty = tab.script != saved;
+        // If the file changed while the app was closed (its mtime differs
+        // from the one we persisted last session) and this tab still has
+        // unsaved edits, a save would clobber that external change — start
+        // it diverged so the save path prompts. A never-synced tab
+        // (`tab.disk_time` is `None`) has nothing to compare, so it can't.
+        let diverged = dirty && tab.disk_time.is_some() && disk_time != tab.disk_time;
         EditorTab {
             editor,
+            disk_time,
             path: tab.file.clone(),
-            dirty: tab.script != saved,
+            dirty,
             saved,
+            diverged,
             _subscription: subscription,
         }
     }
@@ -345,7 +369,11 @@ impl PgGuiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
-        let tab_config = config::ScriptTab { script, file };
+        let tab_config = config::ScriptTab {
+            script,
+            file,
+            disk_time: None,
+        };
         // A freshly added tab starts clean: its content is the baseline
         // (empty for a new script, the file's text for an opened one).
         let tab = Self::build_tab(&tab_config, tab_config.script.clone(), window, cx);
@@ -487,18 +515,25 @@ impl PgGuiApp {
     /// Write the config and remember the file's new mtime, so the watcher
     /// doesn't mistake our own write for an external edit.
     fn save_config(&mut self) {
+        // Persist each tab's last-synced file mtime alongside its script, so
+        // the next launch can detect files edited while the app was closed.
+        for (cfg, tab) in self.config.tabs.iter_mut().zip(&self.tabs) {
+            cfg.disk_time = tab.disk_time;
+        }
         config::save(&self.config);
         self.config_disk_time = config::modified_time();
     }
 
-    /// Poll the config file so external edits (e.g. made via cmd-,) are
+    /// Poll the config file and every open script file once a second, so
+    /// external edits (config via cmd-,, scripts via another editor) are
     /// picked up live instead of being overwritten by our next save.
-    fn watch_config(window: &mut Window, cx: &mut Context<Self>) {
+    fn watch_files(window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 let alive = this.update_in(cx, |this, window, cx| {
                     this.check_config_file(window, cx);
+                    this.check_tab_files(window, cx);
                 });
                 if alive.is_err() {
                     break;
@@ -506,6 +541,74 @@ impl PgGuiApp {
             }
         })
         .detach();
+    }
+
+    /// Notice when an open tab's file changed on disk. A clean tab reloads
+    /// silently; a tab with unsaved edits is flagged diverged (its buffer is
+    /// left untouched) so the next save can prompt before clobbering.
+    /// A missing file is ignored — only "exists with a newer mtime" reacts,
+    /// which sidesteps the transient gap during an external temp-file swap.
+    fn check_tab_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for ix in 0..self.tabs.len() {
+            let Some(path) = self.tabs[ix].path.clone() else {
+                continue;
+            };
+            let Some(disk_time) = file_mtime(&path) else {
+                continue;
+            };
+            if Some(disk_time) == self.tabs[ix].disk_time {
+                continue;
+            }
+            self.tabs[ix].disk_time = Some(disk_time);
+
+            let name = self.tab_label(ix);
+            if self.tabs[ix].dirty {
+                // Already flagged: stay silent, the glyph is the standing
+                // signal. Only announce the first divergence.
+                if !self.tabs[ix].diverged {
+                    self.tabs[ix].diverged = true;
+                    self.set_status(
+                        format!("{name} changed on disk — you have unsaved edits"),
+                        cx,
+                    );
+                    cx.notify();
+                }
+            } else {
+                self.reload_tab(ix, window, cx);
+                self.set_status(format!("Reloaded {name} — it changed on disk"), cx);
+            }
+        }
+    }
+
+    /// Replace a tab's buffer with its file's current content, resetting the
+    /// saved baseline and clearing the diverged flag. Best-effort keeps the
+    /// caret near where it was. Shared by the silent clean-tab reload and the
+    /// "reload theirs" choice in the diverged-save prompt.
+    fn reload_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.tabs[ix].path.clone() else {
+            return;
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(err) => {
+                self.set_status(format!("Reload failed: {err}"), cx);
+                return;
+            }
+        };
+        // Baseline first, so the Change event set_value emits recomputes the
+        // tab as clean rather than newly dirty.
+        self.tabs[ix].saved.clone_from(&content);
+        self.tabs[ix].disk_time = file_mtime(&path);
+        self.tabs[ix].diverged = false;
+        self.tabs[ix].editor.update(cx, |state, cx| {
+            let mut offset = state.cursor().min(content.len());
+            while offset > 0 && !content.is_char_boundary(offset) {
+                offset -= 1;
+            }
+            state.set_value(content, window, cx);
+            let position = state.text().offset_to_position(offset);
+            state.set_cursor_position(position, window, cx);
+        });
     }
 
     fn check_config_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1376,9 +1479,109 @@ impl PgGuiApp {
     }
 
     /// Save the active tab, optionally closing it once the write succeeds
-    /// (`close_after` is set by the save-before-close prompt). Applies
-    /// format-on-save first when enabled.
+    /// (`close_after` is set by the save-before-close prompt). When the file
+    /// changed on disk since our last read or write, prompt before clobbering
+    /// it; otherwise write straight through. The check re-stats the file here
+    /// rather than trusting the 1s watcher, so a save that races an external
+    /// edit still catches it.
     fn save_active(&mut self, close_after: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let ix = self.active_tab;
+        // Either the watcher already flagged it, or it changed in the sub-
+        // second race since the last poll (the watcher clears the mtime gap
+        // when it flags, so both checks are needed to cover both timings).
+        if self.tabs[ix].diverged || self.file_changed_on_disk(ix) {
+            // Keep the tab-bar glyph in step in case the watcher hadn't yet.
+            self.tabs[ix].diverged = true;
+            cx.notify();
+            self.prompt_overwrite_diverged(close_after, window, cx);
+        } else {
+            self.perform_save(close_after, window, cx);
+        }
+    }
+
+    /// Whether a tab's file exists on disk with a different mtime than the one
+    /// we recorded at our last read or write — i.e. it was edited externally.
+    /// A missing file is not a conflict: a save simply recreates it.
+    fn file_changed_on_disk(&self, ix: usize) -> bool {
+        let tab = &self.tabs[ix];
+        tab.path
+            .as_deref()
+            .and_then(file_mtime)
+            .is_some_and(|mtime| Some(mtime) != tab.disk_time)
+    }
+
+    /// Ask what to do about a tab whose file changed on disk since our last
+    /// read or write: keep our version (overwrite), take the disk version
+    /// (losing our edits), or cancel.
+    fn prompt_overwrite_diverged(
+        &mut self,
+        close_after: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let ix = self.active_tab;
+        let name = self.tab_label(ix);
+        let app = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (overwrite, reload) = (app.clone(), app.clone());
+            dialog.title("Changed on disk").w(px(460.)).child(
+                v_flex()
+                    .gap_4()
+                    .pb_2()
+                    .child(div().text_sm().child(format!(
+                        "“{name}” changed on disk since you last opened or saved it. \
+                         Overwrite it with your version, or reload the version on disk?"
+                    )))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(Button::new("cancel").label("Cancel").on_click(
+                                |_, window, cx| {
+                                    window.close_dialog(cx);
+                                },
+                            ))
+                            .child(
+                                Button::new("reload")
+                                    .danger()
+                                    .label("Reload theirs (lose my edits)")
+                                    .on_click(move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        reload
+                                            .update(cx, |this, cx| {
+                                                this.reload_tab(ix, window, cx);
+                                                if close_after {
+                                                    this.close_tab_at(ix, window, cx);
+                                                }
+                                            })
+                                            .ok();
+                                    }),
+                            )
+                            .child(
+                                Button::new("overwrite")
+                                    .primary()
+                                    .label("Overwrite")
+                                    .on_click(move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        overwrite
+                                            .update(cx, |this, cx| {
+                                                this.perform_save(close_after, window, cx);
+                                            })
+                                            .ok();
+                                    }),
+                            ),
+                    ),
+            )
+        });
+    }
+
+    /// Write the active tab to disk, applying format-on-save first when
+    /// enabled. Split out from [`Self::save_active`] so the diverged-save
+    /// prompt's "Overwrite" can reuse it without re-checking divergence.
+    fn perform_save(&mut self, close_after: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(client) = self.lsp.clone().filter(|_| self.config.format_on_save) else {
             self.write_script(close_after, window, cx);
             return;
@@ -1473,12 +1676,15 @@ impl PgGuiApp {
     }
 
     /// Adopt `content` as a tab's on-disk baseline, clearing its
-    /// unsaved-edits marker.
+    /// unsaved-edits and diverged markers and remembering the file's new
+    /// mtime so the watcher doesn't read our own write as an external edit.
     fn mark_saved(&mut self, ix: usize, content: String, cx: &mut Context<Self>) {
         if ix >= self.tabs.len() {
             return;
         }
         self.tabs[ix].saved = content;
+        self.tabs[ix].disk_time = self.tabs[ix].path.as_deref().and_then(file_mtime);
+        self.tabs[ix].diverged = false;
         self.refresh_dirty(ix, cx);
     }
 
@@ -1490,6 +1696,7 @@ impl PgGuiApp {
             return;
         }
         self.config.tabs[ix].file = Some(path.clone());
+        self.tabs[ix].disk_time = file_mtime(&path);
         self.tabs[ix].path = Some(path);
         self.update_window_title(window);
     }
@@ -1516,8 +1723,9 @@ impl PgGuiApp {
 
     /// One tab per open script, with a "×" close button each and a
     /// trailing "+" that opens a fresh one. A tab with unsaved edits is
-    /// marked with a leading "•". gpui-component ships no icon assets, so
-    /// these use text glyphs rather than `IconName` SVGs.
+    /// marked with a leading "•", or "⟳" when its file also changed on disk
+    /// (diverged). gpui-component ships no icon assets, so these use text
+    /// glyphs rather than `IconName` SVGs.
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         TabBar::new("script-tabs")
             .small()
@@ -1536,7 +1744,9 @@ impl PgGuiApp {
                     })),
             )
             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
-                let label = if tab.dirty {
+                let label = if tab.diverged {
+                    format!("⟳ {}", self.tab_label(ix))
+                } else if tab.dirty {
                     format!("• {}", self.tab_label(ix))
                 } else {
                     self.tab_label(ix)
