@@ -21,6 +21,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The embedded Postgres Language Server generates its tree-sitter
+      # grammar at build time and needs the CLI on PATH.
+      - name: Install tree-sitter CLI
+        uses: tree-sitter/setup-action/cli@v2
+        with:
+          tree-sitter-ref: v0.25.9
+
       - name: Install cargo-bundle
         run: cargo install cargo-bundle --locked
 
@@ -78,6 +85,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      # The embedded Postgres Language Server generates its tree-sitter
+      # grammar at build time and needs the CLI on PATH.
+      - name: Install tree-sitter CLI
+        uses: tree-sitter/setup-action/cli@v2
+        with:
+          tree-sitter-ref: v0.25.9
 
       - name: Build
         run: cargo build --release
