@@ -1,394 +1,304 @@
 //! SQL language support for the editor, backed by the Postgres Language
-//! Server (`postgrestools lsp-proxy`, <https://pg-language-server.com>).
+//! Server (<https://pg-language-server.com>) used as a library.
 //!
-//! This is a minimal LSP client over stdio. Completions, hover and
-//! diagnostics are plugged into the `gpui-component` editor through its
-//! provider traits. The server reads its database credentials from a
-//! generated `postgres-language-server.jsonc` in a private workspace
-//! directory, which is what makes completions schema-aware.
+//! Instead of spawning `postgrestools lsp-proxy` and talking LSP over stdio,
+//! we embed the server's `pgls_workspace` crate directly and call its
+//! [`Workspace`] trait. Completions, hover and diagnostics are plugged into
+//! the `gpui-component` editor through its provider traits. The database
+//! credentials come from the workspace settings we push at startup, which is
+//! what makes completions schema-aware.
 
-use std::collections::HashMap;
-use std::fmt::Write as _;
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::str::FromStr as _;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::mpsc::{Receiver as StdReceiver, RecvTimeoutError};
+use std::time::Duration;
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use futures::channel::{mpsc, oneshot};
 use gpui::{App, AppContext as _, Context, Task, Window};
 use gpui_component::input::{CompletionProvider, HoverProvider, InputState, Rope, RopeExt as _};
 use lsp_types::{
-    ClientCapabilities, CompletionContext, CompletionParams, CompletionResponse,
-    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
-    FormattingOptions, Hover, HoverParams, InitializeParams, PartialResultParams,
-    PublishDiagnosticsParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
-    WorkDoneProgressParams, WorkspaceFolder,
+    CompletionContext, CompletionItemLabelDetails, CompletionResponse, CompletionTextEdit,
+    DiagnosticSeverity, Hover, HoverContents, InsertTextFormat, MarkedString, NumberOrString,
+    Range, TextEdit,
 };
-use serde_json::{Value, json};
+
+use pgls_analyse::RuleCategories;
+use pgls_completions::CompletionItemKind as PgCompletionItemKind;
+use pgls_configuration::PartialConfiguration;
+use pgls_configuration::database::PartialDatabaseConfiguration;
+use pgls_configuration::format::{KeywordCase, PartialFormatConfiguration};
+use pgls_diagnostics::{Diagnostic as _, PrintDescription, Severity};
+use pgls_fs::PgLSPath;
+use pgls_text_size::{TextRange, TextSize};
+use pgls_workspace::features::completions::GetCompletionsParams;
+use pgls_workspace::features::diagnostics::PullFileDiagnosticsParams;
+use pgls_workspace::features::format::PullFileFormattingParams;
+use pgls_workspace::features::on_hover::OnHoverParams;
+use pgls_workspace::workspace::{
+    ChangeFileParams, CloseFileParams, GetFileContentParams, OpenFileParams,
+    RegisterProjectFolderParams, UpdateSettingsParams,
+};
+use pgls_workspace::{Workspace, WorkspaceError};
 
 use crate::config::CaseStyle;
 
-const BINARY: &str = "postgrestools";
+/// How long a burst of edits is allowed to settle before we re-run the
+/// (potentially database-touching) diagnostics analysis.
+const DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// Diagnostics published by the server for the editor document.
+/// Diagnostics computed for the editor document.
 pub type DiagnosticsReceiver = mpsc::UnboundedReceiver<Vec<lsp_types::Diagnostic>>;
 
-/// A handle to a running language server. Cloning is cheap; the server
-/// process is killed once the last clone is dropped.
+/// A handle to an embedded language-server workspace. Cloning is cheap; the
+/// workspace and its background diagnostics worker are torn down once the last
+/// clone is dropped.
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<Inner>,
 }
 
 struct Inner {
+    workspace: Arc<dyn Workspace>,
+    path: PgLSPath,
     connection_string: String,
     keyword_case: CaseStyle,
     constant_case: CaseStyle,
-    uri: Uri,
-    stdin: Mutex<ChildStdin>,
-    child: Mutex<Child>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
-    next_id: AtomicU64,
     version: AtomicI32,
-}
-
-impl Drop for Inner {
-    fn drop(&mut self) {
-        if let Ok(child) = self.child.get_mut() {
-            child.kill().ok();
-            child.wait().ok();
-        }
-    }
+    /// Wakes the diagnostics worker after the document changed. Dropping it
+    /// (with the last [`Client`] clone) signals the worker to exit.
+    diag_signal: std::sync::mpsc::Sender<()>,
 }
 
 impl Client {
-    /// Spawn `postgrestools lsp-proxy`, run the LSP handshake and open the
-    /// editor buffer as a document. Blocks until the server has answered
-    /// `initialize`, so call it from a background thread.
+    /// Create an in-process workspace, configure it with the database
+    /// credentials and formatter options, and open the editor buffer as a
+    /// document. Loading the schema cache happens lazily on the first
+    /// completion/diagnostic, so call this from a background thread.
     ///
     /// # Errors
     ///
-    /// Fails when the binary is not installed, the workspace directory
-    /// cannot be prepared, or the server misbehaves during the handshake.
+    /// Fails when the workspace directory cannot be prepared or the workspace
+    /// rejects the initial configuration or document.
     pub fn start(
         connection_string: &str,
         text: &str,
         keyword_case: CaseStyle,
         constant_case: CaseStyle,
     ) -> Result<(Self, DiagnosticsReceiver)> {
-        let workspace = workspace_dir()?;
-        std::fs::create_dir_all(&workspace)?;
-        write_server_config(&workspace, connection_string, keyword_case, constant_case)?;
-        let scratch = workspace.join("scratch.sql");
-        std::fs::write(&scratch, text)?;
+        let workspace = pgls_workspace::workspace::server_sync();
+        let dir = workspace_dir()?;
+        std::fs::create_dir_all(&dir).ok();
+        let path = PgLSPath::new(dir.join("scratch.sql"));
 
-        let mut child = Command::new(binary_path())
-            .arg("lsp-proxy")
-            .current_dir(&workspace)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to launch `{BINARY} lsp-proxy` (install the release binary from \
-                     https://github.com/supabase-community/postgres-language-server/releases; \
-                     the Homebrew build has broken diagnostics and formatting)"
-                )
+        workspace
+            .register_project_folder(RegisterProjectFolderParams {
+                path: Some(dir.clone()),
+                set_as_current_workspace: true,
+            })
+            .map_err(|err| anyhow!("failed to register language server project: {err}"))?;
+
+        workspace
+            .update_settings(UpdateSettingsParams {
+                configuration: build_configuration(connection_string, keyword_case, constant_case),
+                vcs_base_path: None,
+                gitignore_matches: Vec::new(),
+                workspace_directory: Some(dir),
+            })
+            .map_err(|err| anyhow!("failed to configure language server: {err}"))?;
+
+        workspace
+            .open_file(OpenFileParams {
+                path: path.clone(),
+                content: text.to_string(),
+                version: 0,
+            })
+            .map_err(|err| anyhow!("failed to open document: {err}"))?;
+
+        let (diagnostics_tx, diagnostics_rx) = mpsc::unbounded();
+        let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+
+        let worker_workspace = workspace.clone();
+        let worker_path = path.clone();
+        std::thread::Builder::new()
+            .name("pg-lsp-diagnostics".into())
+            .spawn(move || {
+                diagnostics_worker(&worker_workspace, &worker_path, &signal_rx, &diagnostics_tx);
             })?;
-        let stdin = child.stdin.take().context("language server has no stdin")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("language server has no stdout")?;
+        // Publish an initial set for the freshly opened document.
+        signal_tx.send(()).ok();
 
         let inner = Arc::new(Inner {
+            workspace,
+            path,
             connection_string: connection_string.to_string(),
             keyword_case,
             constant_case,
-            uri: file_uri(&scratch)?,
-            stdin: Mutex::new(stdin),
-            child: Mutex::new(child),
-            pending: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(0),
             version: AtomicI32::new(0),
+            diag_signal: signal_tx,
         });
-
-        let (diagnostics_tx, diagnostics_rx) = mpsc::unbounded();
-        let weak = Arc::downgrade(&inner);
-        std::thread::Builder::new()
-            .name("pg-lsp-reader".into())
-            .spawn(move || reader_loop(BufReader::new(stdout), &weak, &diagnostics_tx))?;
-
-        let client = Self { inner };
-        client.initialize(&workspace, text)?;
-        Ok((client, diagnostics_rx))
+        Ok((Self { inner }, diagnostics_rx))
     }
 
-    fn initialize(&self, workspace: &Path, text: &str) -> Result<()> {
-        let root = file_uri(workspace)?;
-        // root_uri is deprecated in the LSP spec in favor of workspace
-        // folders, but postgrestools resolves its configuration through it.
-        #[allow(deprecated)]
-        let params = InitializeParams {
-            root_uri: Some(root.clone()),
-            workspace_folders: Some(vec![WorkspaceFolder {
-                uri: root,
-                name: "pg-gui".into(),
-            }]),
-            capabilities: ClientCapabilities::default(),
-            ..InitializeParams::default()
-        };
-
-        let request = self
-            .inner
-            .request("initialize", &serde_json::to_value(params)?);
-        futures::executor::block_on(request)
-            .map_err(|_| anyhow!("language server exited during initialization"))?
-            .map_err(|err| anyhow!("initialize failed: {err}"))?;
-
-        self.inner.notify("initialized", &json!({}))?;
-        self.inner.notify(
-            "textDocument/didOpen",
-            &serde_json::to_value(DidOpenTextDocumentParams {
-                text_document: TextDocumentItem {
-                    uri: self.inner.uri.clone(),
-                    language_id: "sql".into(),
-                    version: 0,
-                    text: text.to_string(),
-                },
-            })?,
-        )
-    }
-
-    /// The connection string the server was configured with at startup.
+    /// The connection string the workspace was configured with at startup.
     #[must_use]
     pub fn connection_string(&self) -> &str {
         &self.inner.connection_string
     }
 
-    /// The formatter casing options the server was configured with at
+    /// The formatter casing options the workspace was configured with at
     /// startup, as `(keyword_case, constant_case)`.
     #[must_use]
     pub fn case_options(&self) -> (CaseStyle, CaseStyle) {
         (self.inner.keyword_case, self.inner.constant_case)
     }
 
-    /// Tell the server the editor buffer changed (full-text sync).
+    /// Tell the workspace the editor buffer changed (full-text sync) and
+    /// schedule a fresh diagnostics run.
     pub fn document_changed(&self, text: String) {
         let version = self.inner.version.fetch_add(1, Ordering::Relaxed) + 1;
-        let params = DidChangeTextDocumentParams {
-            text_document: VersionedTextDocumentIdentifier {
-                uri: self.inner.uri.clone(),
+        self.inner
+            .workspace
+            .change_file(ChangeFileParams {
+                path: self.inner.path.clone(),
                 version,
-            },
-            content_changes: vec![TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text,
-            }],
-        };
-        if let Ok(params) = serde_json::to_value(params) {
-            self.inner.notify("textDocument/didChange", &params).ok();
-        }
+                content: text,
+            })
+            .ok();
+        self.inner.diag_signal.send(()).ok();
     }
 
-    /// Ask the server to format the whole document. The server formats its
-    /// own copy (kept in sync via [`Self::document_changed`]); `text` must
-    /// be the same content and is used to resolve the returned edits into a
-    /// full replacement string. `None` when there is nothing to change —
-    /// including servers without formatting support (postgrestools < 0.22
-    /// answers with a null result).
+    /// Format the whole document. The workspace formats its own copy (kept in
+    /// sync via [`Self::document_changed`]); `text` is used only to decide
+    /// whether anything changed. `None` when there is nothing to change —
+    /// including when formatting is unavailable or the document does not
+    /// parse. Runs on a dedicated thread so the caller's executor is not
+    /// blocked.
     ///
     /// # Errors
     ///
-    /// Fails when the server is gone or answers with an error.
+    /// Fails when the workspace rejects the request.
     pub async fn format(&self, text: &str) -> Result<Option<String>> {
-        let params = DocumentFormattingParams {
-            text_document: TextDocumentIdentifier {
-                uri: self.inner.uri.clone(),
-            },
-            // Matches the editor's tab size; postgrestools reads its
-            // indentation from the workspace config, not from here.
-            options: FormattingOptions {
-                tab_size: 2,
-                insert_spaces: true,
-                ..FormattingOptions::default()
-            },
-            work_done_progress_params: WorkDoneProgressParams::default(),
-        };
-        let request = self
-            .inner
-            .request("textDocument/formatting", &serde_json::to_value(params)?);
-        let response = await_response(request).await?;
-        if response.is_null() {
-            return Ok(None);
-        }
-        let edits: Vec<TextEdit> = serde_json::from_value(response)?;
-        if edits.is_empty() {
-            return Ok(None);
-        }
-        let formatted = apply_edits(text, &edits);
-        Ok((formatted != text).then_some(formatted))
-    }
-
-    /// Stop the server process.
-    pub fn shutdown(&self) {
-        self.inner.notify("exit", &Value::Null).ok();
-        if let Ok(mut child) = self.inner.child.lock() {
-            child.kill().ok();
-            child.wait().ok();
-        }
-    }
-
-    fn text_document_position(&self, text: &Rope, offset: usize) -> TextDocumentPositionParams {
-        TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier {
-                uri: self.inner.uri.clone(),
-            },
-            position: text.offset_to_position(offset),
-        }
-    }
-}
-
-impl Inner {
-    fn send(&self, message: &Value) -> Result<()> {
-        let body = serde_json::to_string(message)?;
-        let mut stdin = self
-            .stdin
-            .lock()
-            .map_err(|_| anyhow!("language server stdin poisoned"))?;
-        write!(stdin, "Content-Length: {}\r\n\r\n{body}", body.len())?;
-        stdin.flush()?;
-        Ok(())
-    }
-
-    fn notify(&self, method: &str, params: &Value) -> Result<()> {
-        self.send(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
-    }
-
-    fn request(&self, method: &str, params: &Value) -> oneshot::Receiver<Result<Value, String>> {
+        let workspace = self.inner.workspace.clone();
+        let path = self.inner.path.clone();
+        let text = text.to_string();
         let (tx, rx) = oneshot::channel();
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.insert(id, tx);
-        }
-        let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        if let Err(err) = self.send(&message)
-            && let Ok(mut pending) = self.pending.lock()
-            && let Some(tx) = pending.remove(&id)
-        {
-            tx.send(Err(err.to_string())).ok();
-        }
-        rx
+        std::thread::spawn(move || {
+            tx.send(format_document(&workspace, &path, &text)).ok();
+        });
+        rx.await
+            .map_err(|_| anyhow!("formatting task was cancelled"))?
+    }
+
+    /// Close the workspace document. The background worker stops once the last
+    /// [`Client`] clone is dropped.
+    pub fn shutdown(&self) {
+        self.inner
+            .workspace
+            .close_file(CloseFileParams {
+                path: self.inner.path.clone(),
+            })
+            .ok();
     }
 }
 
-fn read_message(reader: &mut BufReader<ChildStdout>) -> Result<Value> {
-    let mut content_length = None;
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            bail!("language server closed its stdout");
-        }
-        let line = line.trim_end();
-        if line.is_empty() {
-            break;
-        }
-        if let Some(value) = line.strip_prefix("Content-Length:") {
-            content_length = value.trim().parse::<usize>().ok();
-        }
-    }
-    let length = content_length.context("message without a Content-Length header")?;
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body)?;
-    Ok(serde_json::from_slice(&body)?)
-}
-
-fn reader_loop(
-    mut reader: BufReader<ChildStdout>,
-    inner: &Weak<Inner>,
+/// Blocks on the workspace waiting for change signals, coalescing bursts and
+/// republishing diagnostics after each settled edit. Returns when the signal
+/// channel is dropped (i.e. the last [`Client`] is gone).
+fn diagnostics_worker(
+    workspace: &Arc<dyn Workspace>,
+    path: &PgLSPath,
+    signal: &StdReceiver<()>,
     diagnostics_tx: &mpsc::UnboundedSender<Vec<lsp_types::Diagnostic>>,
 ) {
-    while let Ok(message) = read_message(&mut reader) {
-        let Some(inner) = inner.upgrade() else { return };
-        match (
-            message.get("method").and_then(Value::as_str),
-            message.get("id"),
-        ) {
-            // Server-to-client request: answer with an empty result so the
-            // server never blocks waiting on capabilities we don't have.
-            (Some(method), Some(id)) => {
-                let result = if method == "workspace/configuration" {
-                    let items = message
-                        .pointer("/params/items")
-                        .and_then(Value::as_array)
-                        .map_or(0, Vec::len);
-                    Value::Array(vec![Value::Null; items])
-                } else {
-                    Value::Null
-                };
-                inner
-                    .send(&json!({ "jsonrpc": "2.0", "id": id, "result": result }))
-                    .ok();
+    while signal.recv().is_ok() {
+        // Coalesce a rapid-fire burst of edits into a single analysis run.
+        loop {
+            match signal.recv_timeout(DEBOUNCE) {
+                Ok(()) => {}
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
             }
-            (Some("textDocument/publishDiagnostics"), None) => {
-                let Some(params) = message.get("params") else {
-                    continue;
-                };
-                if let Ok(params) =
-                    serde_json::from_value::<PublishDiagnosticsParams>(params.clone())
-                    && params.uri == inner.uri
-                {
-                    diagnostics_tx.unbounded_send(params.diagnostics).ok();
-                }
-            }
-            (None, Some(id)) => {
-                let Some(id) = id.as_u64() else { continue };
-                let Some(tx) = inner
-                    .pending
-                    .lock()
-                    .ok()
-                    .and_then(|mut pending| pending.remove(&id))
-                else {
-                    continue;
-                };
-                let result = match message.get("error") {
-                    Some(error) => Err(error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown language server error")
-                        .to_string()),
-                    None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
-                };
-                tx.send(result).ok();
-            }
-            // Notifications we don't care about.
-            (_, None) => {}
         }
-    }
-    // The server is gone; fail whatever is still waiting on it.
-    if let Some(inner) = inner.upgrade()
-        && let Ok(mut pending) = inner.pending.lock()
-    {
-        for (_, tx) in pending.drain() {
-            tx.send(Err("language server exited".into())).ok();
+        let diagnostics = pull_diagnostics(workspace, path);
+        if diagnostics_tx.unbounded_send(diagnostics).is_err() {
+            return;
         }
     }
 }
 
-async fn await_response(request: oneshot::Receiver<Result<Value, String>>) -> Result<Value> {
-    request
-        .await
-        .map_err(|_| anyhow!("language server exited"))?
-        .map_err(anyhow::Error::msg)
+fn pull_diagnostics(workspace: &Arc<dyn Workspace>, path: &PgLSPath) -> Vec<lsp_types::Diagnostic> {
+    let Ok(content) = workspace.get_file_content(GetFileContentParams { path: path.clone() })
+    else {
+        return Vec::new();
+    };
+    let rope = Rope::from(content.as_str());
+    let result = workspace.pull_file_diagnostics(PullFileDiagnosticsParams {
+        path: path.clone(),
+        categories: RuleCategories::all(),
+        max_diagnostics: u32::MAX,
+        only: Vec::new(),
+        skip: Vec::new(),
+    });
+    let Ok(result) = result else {
+        return Vec::new();
+    };
+    result
+        .diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic_to_lsp(diagnostic, &rope))
+        .collect()
 }
 
-/// Bridges the language server into the editor's LSP provider traits.
+fn diagnostic_to_lsp(
+    diagnostic: &pgls_diagnostics::serde::Diagnostic,
+    rope: &Rope,
+) -> Option<lsp_types::Diagnostic> {
+    let span = diagnostic.location().span?;
+    let severity = match diagnostic.severity() {
+        Severity::Fatal | Severity::Error => DiagnosticSeverity::ERROR,
+        Severity::Warning => DiagnosticSeverity::WARNING,
+        Severity::Information => DiagnosticSeverity::INFORMATION,
+        Severity::Hint => DiagnosticSeverity::HINT,
+    };
+    let code = diagnostic
+        .category()
+        .map(|category| NumberOrString::String(category.name().to_string()));
+    let message = PrintDescription(diagnostic).to_string();
+    if message.is_empty() {
+        return None;
+    }
+    Some(lsp_types::Diagnostic {
+        range: text_range_to_range(span, rope),
+        severity: Some(severity),
+        code,
+        source: Some("pg".into()),
+        message,
+        ..Default::default()
+    })
+}
+
+fn format_document(
+    workspace: &Arc<dyn Workspace>,
+    path: &PgLSPath,
+    text: &str,
+) -> Result<Option<String>> {
+    let result = workspace
+        .pull_file_formatting(PullFileFormattingParams {
+            path: path.clone(),
+            range: None,
+        })
+        .map_err(|err| anyhow!("formatting failed: {err}"))?;
+    let formatted = result.formatted;
+    // Formatting is disabled or the document did not parse: never blank the
+    // buffer with an empty result.
+    if formatted.is_empty() && !text.is_empty() {
+        return Ok(None);
+    }
+    Ok((formatted != text).then_some(formatted))
+}
+
+/// Bridges the embedded workspace into the editor's LSP provider traits.
 pub struct Provider {
     client: Client,
 }
@@ -409,33 +319,28 @@ impl CompletionProvider for Provider {
         _: &mut Window,
         cx: &mut Context<InputState>,
     ) -> Task<Result<CompletionResponse>> {
-        // gpui-component smuggles the query typed so far in here; keep it
-        // for clamping the items' filter_text below.
-        let query = trigger.trigger_character.clone().unwrap_or_default();
-        let params = CompletionParams {
-            text_document_position: self.client.text_document_position(text, offset),
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: PartialResultParams::default(),
-            context: Some(trigger),
-        };
-        let request = match serde_json::to_value(params) {
-            Ok(params) => self
-                .client
-                .inner
-                .request("textDocument/completion", &params),
-            Err(err) => return Task::ready(Err(err.into())),
-        };
+        // gpui-component smuggles the query typed so far in here; keep it for
+        // clamping the items' filter_text below.
+        let query = trigger.trigger_character.unwrap_or_default();
+        let position = to_text_size(offset);
+        let workspace = self.client.inner.workspace.clone();
+        let path = self.client.inner.path.clone();
+        let rope = text.clone();
         cx.background_spawn(async move {
-            let response = await_response(request).await?;
-            if response.is_null() {
-                return Ok(CompletionResponse::Array(vec![]));
-            }
-            let mut response: CompletionResponse = serde_json::from_value(response)?;
-            match &mut response {
-                CompletionResponse::Array(items) => clamp_filter_text(items, &query),
-                CompletionResponse::List(list) => clamp_filter_text(&mut list.items, &query),
-            }
-            Ok(response)
+            let result = match workspace.get_completions(GetCompletionsParams { path, position }) {
+                Ok(result) => result,
+                // The database is unreachable; offer nothing rather than error.
+                Err(WorkspaceError::DatabaseConnectionError(_)) => {
+                    return Ok(CompletionResponse::Array(Vec::new()));
+                }
+                Err(err) => return Err(anyhow!("completion request failed: {err}")),
+            };
+            let mut items: Vec<lsp_types::CompletionItem> = result
+                .into_iter()
+                .map(|item| completion_to_lsp(item, &rope))
+                .collect();
+            clamp_filter_text(&mut items, &query);
+            Ok(CompletionResponse::Array(items))
         })
     }
 
@@ -446,7 +351,7 @@ impl CompletionProvider for Provider {
         _: &mut Context<InputState>,
     ) -> bool {
         // Word characters continue an existing completion; the rest are the
-        // trigger characters postgrestools declares in its capabilities.
+        // trigger characters the server acts on.
         new_text
             .chars()
             .next_back()
@@ -457,33 +362,88 @@ impl CompletionProvider for Provider {
 impl HoverProvider for Provider {
     fn hover(
         &self,
-        text: &Rope,
+        _text: &Rope,
         offset: usize,
         _: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Option<Hover>>> {
-        let params = HoverParams {
-            text_document_position_params: self.client.text_document_position(text, offset),
-            work_done_progress_params: WorkDoneProgressParams::default(),
-        };
-        let request = match serde_json::to_value(params) {
-            Ok(params) => self.client.inner.request("textDocument/hover", &params),
-            Err(err) => return Task::ready(Err(err.into())),
-        };
+        let position = to_text_size(offset);
+        let workspace = self.client.inner.workspace.clone();
+        let path = self.client.inner.path.clone();
         cx.background_spawn(async move {
-            let response = await_response(request).await?;
-            Ok(serde_json::from_value(response)?)
+            let result = match workspace.on_hover(OnHoverParams { path, position }) {
+                Ok(result) => result,
+                Err(WorkspaceError::DatabaseConnectionError(_)) => return Ok(None),
+                Err(err) => return Err(anyhow!("hover request failed: {err}")),
+            };
+            let blocks: Vec<MarkedString> = result
+                .into_iter()
+                .map(MarkedString::from_markdown)
+                .collect();
+            if blocks.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(Hover {
+                contents: HoverContents::Array(blocks),
+                range: None,
+            }))
         })
     }
 }
 
-/// The completion menu highlights the first `filter_text.len()` bytes of
-/// each item's label — falling back to the typed query's length when
-/// `filter_text` is missing (postgrestools never sets it). When that length
-/// exceeds the label or splits a multi-byte character, gpui aborts on a
-/// char-boundary assertion while rendering the menu. Pin every item's
-/// `filter_text` to a prefix of its own label so the highlight is always
-/// valid.
+fn completion_to_lsp(
+    item: pgls_completions::CompletionItem,
+    rope: &Rope,
+) -> lsp_types::CompletionItem {
+    let is_snippet = item.completion_text.as_ref().is_some_and(|c| c.is_snippet);
+    let detail = item
+        .detail
+        .map_or_else(|| format!(" {}", item.kind), |detail| format!(" {detail}"));
+    let text_edit = item.completion_text.map(|completion| {
+        CompletionTextEdit::Edit(TextEdit {
+            new_text: completion.text,
+            range: text_range_to_range(completion.range, rope),
+        })
+    });
+    lsp_types::CompletionItem {
+        kind: Some(completion_kind(&item.kind)),
+        label: item.label,
+        label_details: Some(CompletionItemLabelDetails {
+            description: Some(item.description),
+            detail: Some(detail),
+        }),
+        preselect: Some(item.preselected),
+        sort_text: Some(item.sort_text),
+        insert_text_format: Some(if is_snippet {
+            InsertTextFormat::SNIPPET
+        } else {
+            InsertTextFormat::PLAIN_TEXT
+        }),
+        text_edit,
+        ..lsp_types::CompletionItem::default()
+    }
+}
+
+fn completion_kind(kind: &PgCompletionItemKind) -> lsp_types::CompletionItemKind {
+    match kind {
+        PgCompletionItemKind::Function => lsp_types::CompletionItemKind::FUNCTION,
+        PgCompletionItemKind::Table | PgCompletionItemKind::Schema => {
+            lsp_types::CompletionItemKind::CLASS
+        }
+        PgCompletionItemKind::Column => lsp_types::CompletionItemKind::FIELD,
+        PgCompletionItemKind::Policy | PgCompletionItemKind::Role => {
+            lsp_types::CompletionItemKind::CONSTANT
+        }
+        PgCompletionItemKind::Keyword => lsp_types::CompletionItemKind::KEYWORD,
+    }
+}
+
+/// The completion menu highlights the first `filter_text.len()` bytes of each
+/// item's label — falling back to the typed query's length when `filter_text`
+/// is missing (the server never sets it). When that length exceeds the label
+/// or splits a multi-byte character, gpui aborts on a char-boundary assertion
+/// while rendering the menu. Pin every item's `filter_text` to a prefix of its
+/// own label so the highlight is always valid.
 fn clamp_filter_text(items: &mut [lsp_types::CompletionItem], query: &str) {
     for item in items {
         let len = item.filter_text.as_deref().unwrap_or(query).len();
@@ -495,70 +455,39 @@ fn clamp_filter_text(items: &mut [lsp_types::CompletionItem], query: &str) {
     }
 }
 
-/// Apply LSP text edits to `text`. All edit positions refer to the original
-/// document, so they are resolved to byte offsets up front and applied
-/// back-to-front.
-fn apply_edits(text: &str, edits: &[TextEdit]) -> String {
-    let rope = Rope::from(text);
-    let mut edits: Vec<(std::ops::Range<usize>, &str)> = edits
-        .iter()
-        .map(|edit| {
-            let start = rope.position_to_offset(&edit.range.start);
-            let end = rope.position_to_offset(&edit.range.end);
-            (start..end.max(start), edit.new_text.as_str())
-        })
-        .collect();
-    edits.sort_by(|a, b| (b.0.start, b.0.end).cmp(&(a.0.start, a.0.end)));
-
-    let mut result = text.to_string();
-    for (range, new_text) in edits {
-        result.replace_range(range, new_text);
-    }
-    result
+/// A byte offset into the editor buffer as the workspace's [`TextSize`].
+fn to_text_size(offset: usize) -> TextSize {
+    TextSize::from(u32::try_from(offset).unwrap_or(u32::MAX))
 }
 
-/// Locate the language-server binary. `Command::new` searches only `PATH`,
-/// and app bundles launched from Finder inherit launchd's minimal `PATH`
-/// that misses the usual install directories — so when the plain lookup
-/// would fail, search those directories explicitly.
-fn binary_path() -> PathBuf {
-    let on_path = std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(BINARY).is_file()));
-    if on_path {
-        return PathBuf::from(BINARY);
+/// Convert a workspace byte range into an LSP line/column range using the
+/// document rope.
+fn text_range_to_range(range: TextRange, rope: &Rope) -> Range {
+    Range {
+        start: rope.offset_to_position(usize::from(range.start())),
+        end: rope.offset_to_position(usize::from(range.end())),
     }
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".local").join("bin"));
-    }
-    candidates.push(PathBuf::from("/opt/homebrew/bin"));
-    candidates.push(PathBuf::from("/usr/local/bin"));
-    candidates
-        .into_iter()
-        .map(|dir| dir.join(BINARY))
-        .find(|path| path.is_file())
-        .unwrap_or_else(|| PathBuf::from(BINARY))
 }
 
-fn workspace_dir() -> Result<PathBuf> {
+fn workspace_dir() -> Result<std::path::PathBuf> {
     Ok(dirs::cache_dir()
-        .context("no cache directory on this platform")?
+        .ok_or_else(|| anyhow!("no cache directory on this platform"))?
         .join("pg-gui")
         .join("lsp-workspace"))
 }
 
-/// Write the server configuration next to the scratch document. The server
-/// picks up the `db` credentials from here; without them it still parses
-/// and lints, but completions are no longer schema-aware.
-fn write_server_config(
-    workspace: &Path,
+/// Build the workspace configuration: database credentials (so completions are
+/// schema-aware) and the formatter casing options. The connection string is
+/// decomposed into individual fields; when it does not parse, the connection is
+/// disabled and the workspace still parses and lints.
+fn build_configuration(
     connection_string: &str,
     keyword_case: CaseStyle,
     constant_case: CaseStyle,
-) -> Result<()> {
+) -> PartialConfiguration {
     let db = connection_string.parse::<postgres::Config>().ok();
-    let db = db.as_ref();
-    let host = db.and_then(|db| db.get_hosts().first()).map_or_else(
+    let db_ref = db.as_ref();
+    let host = db_ref.and_then(|db| db.get_hosts().first()).map_or_else(
         || "127.0.0.1".to_string(),
         |host| match host {
             postgres::config::Host::Tcp(host) => host.clone(),
@@ -566,71 +495,59 @@ fn write_server_config(
             postgres::config::Host::Unix(path) => path.display().to_string(),
         },
     );
-    let port = db
+    let port = db_ref
         .and_then(|db| db.get_ports().first().copied())
         .unwrap_or(5432);
-    let username = db
+    let username = db_ref
         .and_then(postgres::Config::get_user)
         .map_or_else(default_user, ToString::to_string);
-    let password = db
+    let password = db_ref
         .and_then(postgres::Config::get_password)
         .map(|password| String::from_utf8_lossy(password).into_owned())
         .unwrap_or_default();
-    let database = db
+    let database = db_ref
         .and_then(postgres::Config::get_dbname)
         .map_or_else(|| username.clone(), ToString::to_string);
 
-    let config = json!({
-        "$schema": "https://pg-language-server.com/latest/schema.json",
-        "db": {
-            "host": host,
-            "port": port,
-            "username": username,
-            "password": password,
-            "database": database,
-            "connTimeoutSecs": 10,
-            "disableConnection": db.is_none(),
-        },
-        "linter": { "enabled": true },
-        "format": {
-            "enabled": true,
-            "keywordCase": keyword_case,
-            "constantCase": constant_case,
-        },
+    let mut config = PartialConfiguration::init();
+    config.db = Some(PartialDatabaseConfiguration {
+        host: Some(host),
+        port: Some(port),
+        username: Some(username),
+        password: Some(password),
+        database: Some(database),
+        conn_timeout_secs: Some(10),
+        disable_connection: Some(db.is_none()),
+        ..PartialDatabaseConfiguration::default()
     });
-    std::fs::write(
-        workspace.join("postgres-language-server.jsonc"),
-        serde_json::to_string_pretty(&config)?,
-    )?;
-    Ok(())
+    config.format = Some(PartialFormatConfiguration {
+        enabled: Some(true),
+        keyword_case: Some(to_keyword_case(keyword_case)),
+        constant_case: Some(to_keyword_case(constant_case)),
+        ..PartialFormatConfiguration::default()
+    });
+    config
+}
+
+fn to_keyword_case(case: CaseStyle) -> KeywordCase {
+    match case {
+        CaseStyle::Lower => KeywordCase::Lower,
+        CaseStyle::Upper => KeywordCase::Upper,
+    }
 }
 
 fn default_user() -> String {
     std::env::var("USER").unwrap_or_else(|_| "postgres".to_string())
 }
 
-/// Build a `file://` URI, percent-encoding anything outside the unreserved
-/// set (macOS config paths contain spaces, for example).
-fn file_uri(path: &Path) -> Result<Uri> {
-    let mut uri = String::from("file://");
-    for &byte in path.to_string_lossy().as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
-                uri.push(char::from(byte));
-            }
-            _ => {
-                let _ = write!(uri, "%{byte:02X}");
-            }
-        }
-    }
-    Uri::from_str(&uri).map_err(|err| anyhow!("cannot express {} as a URI: {err}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
-    use lsp_types::{CompletionItem, Position, Range, TextEdit};
+    use std::time::Duration;
 
-    use super::{apply_edits, clamp_filter_text};
+    use lsp_types::CompletionItem;
+
+    use super::{CaseStyle, Client, clamp_filter_text, to_text_size};
+    use pgls_workspace::features::completions::GetCompletionsParams;
 
     fn item(label: &str, filter_text: Option<&str>) -> CompletionItem {
         CompletionItem {
@@ -642,8 +559,8 @@ mod tests {
 
     #[test]
     fn clamps_filter_text_to_the_label() {
-        // The query is longer than the "for" label: the highlight length
-        // must not exceed the label (this aborted the app in the wild).
+        // The query is longer than the "for" label: the highlight length must
+        // not exceed the label (this aborted the app in the wild).
         let mut items = [item("for", None), item("active", None)];
         clamp_filter_text(&mut items, "active");
         assert_eq!(items[0].filter_text.as_deref(), Some("for"));
@@ -660,34 +577,62 @@ mod tests {
         assert_eq!(items[1].filter_text.as_deref(), Some("ab"));
     }
 
-    fn edit(start: (u32, u32), end: (u32, u32), new_text: &str) -> TextEdit {
-        TextEdit {
-            range: Range {
-                start: Position::new(start.0, start.1),
-                end: Position::new(end.0, end.1),
-            },
-            new_text: new_text.to_string(),
+    /// End-to-end check of the embedded language server against the local
+    /// Docker Postgres (`docker compose up -d`). Ignored by default because it
+    /// needs the database; run with:
+    /// `cargo test --  --ignored embedded_server`.
+    #[test]
+    #[ignore = "requires the docker Postgres on localhost:5433"]
+    fn embedded_server_completions_diagnostics_and_formatting() {
+        const CONN: &str = "postgres://pgui:pgui@localhost:5433/pgui_test";
+
+        let (client, mut diagnostics) =
+            Client::start(CONN, "SELECT * FROM o", CaseStyle::Upper, CaseStyle::Upper)
+                .expect("client starts");
+
+        // Schema-aware completions: the public `orders` table is offered for
+        // the `o` prefix, which only works if the schema cache loaded from the
+        // database.
+        let completions = client
+            .inner
+            .workspace
+            .get_completions(GetCompletionsParams {
+                path: client.inner.path.clone(),
+                position: to_text_size("SELECT * FROM o".len()),
+            })
+            .expect("completions");
+        let labels: Vec<String> = completions.into_iter().map(|item| item.label).collect();
+        assert!(
+            labels.iter().any(|label| label == "orders"),
+            "expected `orders` in completions, got {labels:?}"
+        );
+
+        // Diagnostics: a syntax error reaches the receiver.
+        client.document_changed("SELCT 1;\n".to_string());
+        let mut diags = Vec::new();
+        for _ in 0..50 {
+            match diagnostics.try_recv() {
+                Ok(batch) if !batch.is_empty() => {
+                    diags = batch;
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) if err.is_closed() => break,
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
         }
-    }
+        assert!(!diags.is_empty(), "expected diagnostics for a syntax error");
 
-    #[test]
-    fn applies_edits_in_document_order() {
-        // "select    a from t" → "SELECT a FROM t": edits arrive in
-        // document order but must be applied back-to-front.
-        let edits = [
-            edit((0, 0), (0, 6), "SELECT"),
-            edit((0, 6), (0, 10), " "),
-            edit((0, 12), (0, 16), "FROM"),
-        ];
-        assert_eq!(apply_edits("select    a from t", &edits), "SELECT a FROM t");
-    }
+        // Formatting applies the configured (upper) keyword casing.
+        client.document_changed("select 1;\n".to_string());
+        let formatted = futures::executor::block_on(client.format("select 1;\n"))
+            .expect("format request succeeds")
+            .expect("formatting changed the text");
+        assert!(
+            formatted.contains("SELECT"),
+            "expected uppercased keyword, got {formatted:?}"
+        );
 
-    #[test]
-    fn applies_multi_line_and_insert_edits() {
-        let edits = [
-            edit((1, 0), (2, 0), ""),  // delete the blank line
-            edit((2, 1), (2, 1), " "), // insert after the ';'
-        ];
-        assert_eq!(apply_edits("select 1\n\n;", &edits), "select 1\n; ");
+        client.shutdown();
     }
 }

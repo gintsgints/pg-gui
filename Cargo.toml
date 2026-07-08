@@ -1,6 +1,6 @@
 [package]
 name = "pg-gui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 # Used by `cargo bundle` to produce pg-gui.app with the Dock/Finder icon.
@@ -19,6 +19,16 @@ gpui-component = { version = "0.5.1", features = ["tree-sitter-languages"] }
 # Must stay in lockstep with the lsp-types version gpui-component uses,
 # so our provider impls and its editor traits share the same types.
 lsp-types = "0.97"
+# The Postgres Language Server, embedded as a library (was: spawned
+# `postgrestools lsp-proxy` binary). Points at a fork so a modified server can
+# be used. `pgls_workspace` enables its `db` feature by default.
+pgls_analyse = { git = "https://github.com/gintsgints/postgres-language-server", branch = "preserve_comments" }
+pgls_completions = { git = "https://github.com/gintsgints/postgres-language-server", branch = "preserve_comments" }
+pgls_configuration = { git = "https://github.com/gintsgints/postgres-language-server", branch = "preserve_comments" }
+pgls_diagnostics = { git = "https://github.com/gintsgints/postgres-language-server", branch = "preserve_comments" }
+pgls_fs = { git = "https://github.com/gintsgints/postgres-language-server", branch = "preserve_comments" }
+pgls_text_size = { git = "https://github.com/gintsgints/postgres-language-server", branch = "preserve_comments" }
+pgls_workspace = { git = "https://github.com/gintsgints/postgres-language-server", branch = "preserve_comments" }
 postgres = "0.19"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
