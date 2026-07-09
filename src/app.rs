@@ -24,9 +24,9 @@ use gpui_component::{
 
 use crate::results::ResultsDelegate;
 use crate::{
-    AiComplete, CloseTab, Connect, FormatScript, NewConnection, NewFile, NextTab, OpenConfig,
-    OpenFile, OpenGitHub, OpenSnippets, PrevTab, Quit, RunQuery, SaveFile, ShowHelp, ToggleComment,
-    ZoomIn, ZoomOut, ZoomReset, ai, config, db, lsp, snippets, statement,
+    AiComplete, CloseTab, Connect, EditConnection, FormatScript, NewConnection, NewFile, NextTab,
+    OpenConfig, OpenFile, OpenGitHub, OpenSnippets, PrevTab, Quit, RunQuery, SaveFile, ShowHelp,
+    ToggleComment, ZoomIn, ZoomOut, ZoomReset, ai, config, db, lsp, snippets, statement,
 };
 
 /// The project's GitHub page, opened from the About application menu.
@@ -158,6 +158,7 @@ fn build_menus(recents: &[config::RecentConnection]) -> Vec<Menu> {
             name: "Connection".into(),
             items: vec![
                 MenuItem::action("New Connection…", NewConnection),
+                MenuItem::action("Edit Connection…", EditConnection),
                 MenuItem::submenu(Menu {
                     name: "Recent".into(),
                     items: recent_items,
@@ -1314,20 +1315,52 @@ impl PgGuiApp {
         cx.set_menus(build_menus(&self.config.recent_connections));
     }
 
-    /// Connection ▸ New Connection…: prompt for the connection's fields
-    /// (host, port, database, user, password), showing the assembled
-    /// connection string live, then reconnect. Seeded with the current
-    /// connection so it can be tweaked rather than retyped.
+    /// Connection ▸ New Connection…: open the connection form on a fresh
+    /// default connection to fill in.
     pub fn new_connection(
         &mut self,
         _: &NewConnection,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_connection_form("New connection", &default_conn(), "", window, cx);
+    }
+
+    /// Connection ▸ Edit Connection…: open the connection form seeded with
+    /// the current connection's details, to update it in place.
+    pub fn edit_connection(
+        &mut self,
+        _: &EditConnection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let url = self.config.connection_string.clone();
+        // Seed the name from the matching recent entry, so an already-named
+        // connection shows its name.
+        let name = self
+            .config
+            .recent_connections
+            .iter()
+            .find(|c| c.url == url)
+            .map_or(String::new(), |c| c.name.clone());
+        self.open_connection_form("Edit connection", &url, &name, window, cx);
+    }
+
+    /// Build the field inputs seeded from `seed_url`/`seed_name`, wire up the
+    /// live connection-string preview, and show the connection dialog titled
+    /// `title`. Shared by New Connection and Edit Connection.
+    fn open_connection_form(
+        &mut self,
+        title: &'static str,
+        seed_url: &str,
+        seed_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if window.has_active_dialog(cx) {
             return;
         }
-        let parts = ConnectionParts::parse(&self.config.connection_string);
+        let parts = ConnectionParts::parse(seed_url);
         let mut field = |value: String, placeholder: &str, cx: &mut Context<Self>| {
             let placeholder = placeholder.to_string();
             cx.new(|cx| {
@@ -1336,15 +1369,7 @@ impl PgGuiApp {
                     .default_value(value)
             })
         };
-        // Seed the name from the matching recent entry, so re-opening an
-        // already-named connection shows its name.
-        let current_name = self
-            .config
-            .recent_connections
-            .iter()
-            .find(|c| c.url == self.config.connection_string)
-            .map_or(String::new(), |c| c.name.clone());
-        let name = field(current_name, "My database (optional)", cx);
+        let name = field(seed_name.to_string(), "My database (optional)", cx);
         let fields = ConnectionFields {
             host: field(parts.host, "localhost", cx),
             port: field(parts.port, "5432", cx),
@@ -1356,9 +1381,7 @@ impl PgGuiApp {
                     .default_value(parts.password)
             }),
         };
-        let preview = cx.new(|cx| {
-            InputState::new(window, cx).default_value(self.config.connection_string.clone())
-        });
+        let preview = cx.new(|cx| InputState::new(window, cx).default_value(seed_url.to_string()));
         let test_status = cx.new(|_| ConnectionTest::Idle);
 
         // Recompute the previewed connection string whenever any field
@@ -1396,12 +1419,14 @@ impl PgGuiApp {
             })
             .collect();
 
-        Self::open_connection_dialog(name, fields, preview, test_status, window, cx);
+        Self::open_connection_dialog(title, name, fields, preview, test_status, window, cx);
     }
 
-    /// Build and show the New Connection dialog for the given name and field
-    /// inputs, live connection-string preview, and Test Connection result.
+    /// Build and show the connection dialog for the given title, name and
+    /// field inputs, live connection-string preview, and Test Connection
+    /// result.
     fn open_connection_dialog(
+        title: &'static str,
         name: Entity<InputState>,
         fields: ConnectionFields,
         preview: Entity<InputState>,
@@ -1448,7 +1473,7 @@ impl PgGuiApp {
                     .child(Input::new(input))
             };
 
-            dialog.title("New connection").w(px(520.)).child(
+            dialog.title(title).w(px(520.)).child(
                 v_flex()
                     .gap_4()
                     .pb_2()
@@ -2229,6 +2254,7 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::ai_complete))
             .on_action(cx.listener(Self::new_connection))
+            .on_action(cx.listener(Self::edit_connection))
             .on_action(cx.listener(Self::connect_recent))
             .on_action(cx.listener(Self::new_file))
             .on_action(cx.listener(Self::close_tab))

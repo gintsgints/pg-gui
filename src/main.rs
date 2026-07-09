@@ -27,6 +27,7 @@ actions!(
         OpenSnippets,
         OpenConfig,
         NewConnection,
+        EditConnection,
         OpenGitHub,
         FormatScript,
         ToggleComment,
