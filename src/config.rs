@@ -28,16 +28,53 @@ impl PartialEq for ScriptTab {
 
 impl Eq for ScriptTab {}
 
+/// A remembered connection: an optional user-given name and the connection
+/// string it maps to. Shown in the Connection ▸ Recent menu by name, or by
+/// the masked connection string when unnamed.
+#[derive(Clone, Serialize, PartialEq, Eq)]
+pub struct RecentConnection {
+    pub name: String,
+    pub url: String,
+}
+
+impl<'de> Deserialize<'de> for RecentConnection {
+    /// Accept both the current object form (`{ "name": …, "url": … }`) and
+    /// the legacy bare-string form — older configs stored
+    /// `recent_connections` as a plain array of URLs.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Url(String),
+            Named {
+                #[serde(default)]
+                name: String,
+                url: String,
+            },
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Url(url) => Self {
+                name: String::new(),
+                url,
+            },
+            Raw::Named { name, url } => Self { name, url },
+        })
+    }
+}
+
 /// Persisted app settings, stored as JSON in the platform config directory
 /// (`~/Library/Application Support/pg-gui/config.json` on macOS).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub connection_string: String,
-    /// Previously used connection strings, most recent first, shown in the
+    /// Previously used connections, most recent first, shown in the
     /// Connection ▸ Recent application menu.
     #[serde(default)]
-    pub recent_connections: Vec<String>,
+    pub recent_connections: Vec<RecentConnection>,
     /// Pre-tabs single-script fields; read once to seed `tabs` in
     /// [`try_load`] and no longer written.
     #[serde(default, skip_serializing)]
@@ -161,5 +198,29 @@ pub fn save(config: &Config) {
         });
     if let Err(err) = result {
         eprintln!("pg-gui: failed to save config to {}: {err}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_connections_accept_legacy_strings_and_named_objects() {
+        let json = r#"{
+            "recent_connections": [
+                "postgres://a@localhost/db",
+                { "name": "Prod", "url": "postgres://b@remote/db" }
+            ]
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.recent_connections.len(), 2);
+        assert_eq!(config.recent_connections[0].name, "");
+        assert_eq!(
+            config.recent_connections[0].url,
+            "postgres://a@localhost/db"
+        );
+        assert_eq!(config.recent_connections[1].name, "Prod");
+        assert_eq!(config.recent_connections[1].url, "postgres://b@remote/db");
     }
 }

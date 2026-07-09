@@ -39,11 +39,13 @@ actions!(
 );
 
 /// Connect to a specific connection string; carried by the "Recent"
-/// application-menu items so each remembers which URL it reconnects to.
+/// application-menu items so each remembers which URL it reconnects to and
+/// the name it was saved under (empty when unnamed).
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = pg_gui, no_json)]
 pub struct Connect {
     pub url: String,
+    pub name: String,
 }
 
 fn main() {

@@ -87,17 +87,33 @@ fn default_conn() -> String {
     format!("postgres://{user}@localhost:5432/postgres")
 }
 
-/// Number of connection strings kept in the Recent menu.
+/// Number of connections kept in the Recent menu.
 const MAX_RECENT_CONNECTIONS: usize = 10;
 
-/// Move `url` to the front of the recent-connections list (dedup, capped),
-/// ignoring an empty string.
-fn record_recent(recents: &mut Vec<String>, url: &str) {
+/// Move the connection at `url` to the front of the recent list (dedup by
+/// url, capped), ignoring an empty url. A non-empty `name` labels the
+/// entry; an empty one keeps whatever name the url was already recorded
+/// under, so simply reconnecting doesn't erase a saved name.
+fn record_recent(recents: &mut Vec<config::RecentConnection>, url: &str, name: &str) {
     if url.is_empty() {
         return;
     }
-    recents.retain(|c| c != url);
-    recents.insert(0, url.to_string());
+    let name = if name.is_empty() {
+        recents
+            .iter()
+            .find(|c| c.url == url)
+            .map_or(String::new(), |c| c.name.clone())
+    } else {
+        name.to_string()
+    };
+    recents.retain(|c| c.url != url);
+    recents.insert(
+        0,
+        config::RecentConnection {
+            name,
+            url: url.to_string(),
+        },
+    );
     recents.truncate(MAX_RECENT_CONNECTIONS);
 }
 
@@ -105,14 +121,28 @@ fn record_recent(recents: &mut Vec<String>, url: &str) {
 /// is gone; the OS fills in each item's shortcut from the keybindings in
 /// `main.rs`. `recents` becomes the Connection ▸ Recent submenu, each entry
 /// carrying its (unmasked) connection string in a [`Connect`] action while
-/// showing the credentials masked.
-fn build_menus(recents: &[String]) -> Vec<Menu> {
+/// showing the user-given name (or the masked connection string when
+/// unnamed).
+fn build_menus(recents: &[config::RecentConnection]) -> Vec<Menu> {
     let recent_items = if recents.is_empty() {
         vec![MenuItem::action("No recent connections", NoAction)]
     } else {
         recents
             .iter()
-            .map(|url| MenuItem::action(mask_credentials(url), Connect { url: url.clone() }))
+            .map(|c| {
+                let label = if c.name.is_empty() {
+                    mask_credentials(&c.url)
+                } else {
+                    c.name.clone()
+                };
+                MenuItem::action(
+                    label,
+                    Connect {
+                        url: c.url.clone(),
+                        name: c.name.clone(),
+                    },
+                )
+            })
             .collect()
     };
 
@@ -467,7 +497,11 @@ impl PgGuiApp {
         }
         // Keep the active connection at the head of the recent list so
         // Connection ▸ Recent always offers to reconnect to it.
-        record_recent(&mut config.recent_connections, &config.connection_string);
+        record_recent(
+            &mut config.recent_connections,
+            &config.connection_string,
+            "",
+        );
 
         if config.tabs.is_empty() {
             config.tabs.push(config::ScriptTab::default());
@@ -883,6 +917,7 @@ impl PgGuiApp {
             record_recent(
                 &mut self.config.recent_connections,
                 &self.config.connection_string,
+                "",
             );
             self.refresh_menus(cx);
         }
@@ -1285,6 +1320,15 @@ impl PgGuiApp {
                     .default_value(value)
             })
         };
+        // Seed the name from the matching recent entry, so re-opening an
+        // already-named connection shows its name.
+        let current_name = self
+            .config
+            .recent_connections
+            .iter()
+            .find(|c| c.url == self.config.connection_string)
+            .map_or(String::new(), |c| c.name.clone());
+        let name = field(current_name, "My database (optional)", cx);
         let fields = ConnectionFields {
             host: field(parts.host, "localhost", cx),
             port: field(parts.port, "5432", cx),
@@ -1327,12 +1371,13 @@ impl PgGuiApp {
             })
             .collect();
 
-        Self::open_connection_dialog(fields, preview, window, cx);
+        Self::open_connection_dialog(name, fields, preview, window, cx);
     }
 
-    /// Build and show the New Connection dialog for the given field inputs
-    /// and live connection-string preview.
+    /// Build and show the New Connection dialog for the given name and field
+    /// inputs and live connection-string preview.
     fn open_connection_dialog(
+        name: Entity<InputState>,
         fields: ConnectionFields,
         preview: Entity<InputState>,
         window: &mut Window,
@@ -1340,13 +1385,14 @@ impl PgGuiApp {
     ) {
         let app = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, cx| {
-            let (fields, preview) = (fields.clone(), preview.clone());
+            let (name, fields, preview) = (name.clone(), fields.clone(), preview.clone());
             let connect = {
-                let (app, fields) = (app.clone(), fields.clone());
+                let (app, name, fields) = (app.clone(), name.clone(), fields.clone());
                 move |window: &mut Window, cx: &mut App| {
                     let url = fields.read(cx).to_url();
+                    let name = name.read(cx).value().trim().to_string();
                     window.close_dialog(cx);
-                    app.update(cx, |this, cx| this.apply_connection(&url, cx))
+                    app.update(cx, |this, cx| this.apply_connection(&url, &name, cx))
                         .ok();
                 }
             };
@@ -1374,6 +1420,7 @@ impl PgGuiApp {
                 v_flex()
                     .gap_4()
                     .pb_2()
+                    .child(labeled("Name", &name, cx))
                     .child(
                         h_flex()
                             .gap_3()
@@ -1452,24 +1499,29 @@ impl PgGuiApp {
         .detach();
     }
 
-    /// Connection ▸ Recent ▸ …: reconnect to a previously used string.
+    /// Connection ▸ Recent ▸ …: reconnect to a previously used connection.
     pub fn connect_recent(&mut self, action: &Connect, _: &mut Window, cx: &mut Context<Self>) {
-        self.apply_connection(&action.url, cx);
+        self.apply_connection(&action.url, &action.name, cx);
     }
 
-    /// Switch to `url`: remember it, persist, and restart the language
-    /// server so completions follow the new database's schema.
-    fn apply_connection(&mut self, url: &str, cx: &mut Context<Self>) {
+    /// Switch to `url` (saved under `name`, which may be empty): remember
+    /// it, persist, and restart the language server so completions follow
+    /// the new database's schema.
+    fn apply_connection(&mut self, url: &str, name: &str, cx: &mut Context<Self>) {
         if url.is_empty() {
             return;
         }
-        let masked = mask_credentials(url);
         self.config.connection_string = url.to_string();
-        record_recent(&mut self.config.recent_connections, url);
+        record_recent(&mut self.config.recent_connections, url, name);
         self.save_config();
         self.refresh_menus(cx);
         self.restart_lsp(cx);
-        self.set_status(format!("Connecting to {masked}"), cx);
+        let label = if name.is_empty() {
+            mask_credentials(url)
+        } else {
+            name.to_string()
+        };
+        self.set_status(format!("Connecting to {label}"), cx);
     }
 
     /// About ▸ pg-gui on GitHub: open the project page in the browser.
