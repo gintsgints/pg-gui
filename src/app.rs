@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 use futures::StreamExt as _;
 use gpui::Subscription;
 use gpui::{
-    App, AppContext as _, Context, Entity, EntityInputHandler as _, InteractiveElement as _,
+    App, AppContext as _, Context, Entity, EntityInputHandler as _, Hsla, InteractiveElement as _,
     IntoElement, Menu, MenuItem, NoAction, ParentElement as _, PathPromptOptions, Pixels, Render,
     SharedString, Styled as _, Window, div, px,
 };
@@ -16,7 +16,6 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState, RopeExt as _, TabSize},
     list::{List, ListEvent, ListState},
-    notification::Notification,
     resizable::{ResizableState, resizable_panel, v_resizable},
     tab::{Tab, TabBar},
     table::{Table, TableState},
@@ -241,10 +240,27 @@ fn mask_credentials(conn: &str) -> String {
         .join(" ")
 }
 
-/// Marker type keying the Test Connection notification, so the "testing…"
-/// toast is replaced in place by its success/failure result rather than
-/// stacking.
-struct TestConnectionNotice;
+/// The Test Connection outcome, shown inline in the New Connection dialog
+/// as green ("succeeded") or red ("failed: …") text.
+enum ConnectionTest {
+    /// No test run yet — nothing is shown.
+    Idle,
+    Testing,
+    Ok,
+    Failed(SharedString),
+}
+
+impl Render for ConnectionTest {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (text, color): (SharedString, Hsla) = match self {
+            ConnectionTest::Idle => return div(),
+            ConnectionTest::Testing => ("Testing connection…".into(), cx.theme().muted_foreground),
+            ConnectionTest::Ok => ("Connection succeeded".into(), cx.theme().green),
+            ConnectionTest::Failed(message) => (message.clone(), cx.theme().red),
+        };
+        div().text_sm().text_color(color).child(text)
+    }
+}
 
 /// The individual pieces of a `PostgreSQL` connection, edited as separate
 /// fields in the New Connection dialog and recombined into a URL.
@@ -1343,15 +1359,24 @@ impl PgGuiApp {
         let preview = cx.new(|cx| {
             InputState::new(window, cx).default_value(self.config.connection_string.clone())
         });
+        let test_status = cx.new(|_| ConnectionTest::Idle);
 
         // Recompute the previewed connection string whenever any field
-        // changes. The subscriptions live in `self` so they outlast this
-        // method but are dropped the next time the dialog opens.
+        // changes, and drop any stale Test Connection result (it belonged to
+        // the previous url). The subscriptions live in `self` so they outlast
+        // this method but are dropped the next time the dialog opens.
         let recompute = {
-            let (fields, preview) = (fields.clone(), preview.clone());
+            let (fields, preview, test_status) =
+                (fields.clone(), preview.clone(), test_status.clone());
             move |window: &mut Window, cx: &mut App| {
                 let url = fields.read(cx).to_url();
                 preview.update(cx, |state, cx| state.set_value(url, window, cx));
+                test_status.update(cx, |status, cx| {
+                    if !matches!(status, ConnectionTest::Idle) {
+                        *status = ConnectionTest::Idle;
+                        cx.notify();
+                    }
+                });
             }
         };
         self.connection_dialog_subs = fields
@@ -1371,21 +1396,27 @@ impl PgGuiApp {
             })
             .collect();
 
-        Self::open_connection_dialog(name, fields, preview, window, cx);
+        Self::open_connection_dialog(name, fields, preview, test_status, window, cx);
     }
 
     /// Build and show the New Connection dialog for the given name and field
-    /// inputs and live connection-string preview.
+    /// inputs, live connection-string preview, and Test Connection result.
     fn open_connection_dialog(
         name: Entity<InputState>,
         fields: ConnectionFields,
         preview: Entity<InputState>,
+        test_status: Entity<ConnectionTest>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let app = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, cx| {
-            let (name, fields, preview) = (name.clone(), fields.clone(), preview.clone());
+            let (name, fields, preview, test_status) = (
+                name.clone(),
+                fields.clone(),
+                preview.clone(),
+                test_status.clone(),
+            );
             let connect = {
                 let (app, name, fields) = (app.clone(), name.clone(), fields.clone());
                 move |window: &mut Window, cx: &mut App| {
@@ -1397,10 +1428,11 @@ impl PgGuiApp {
                 }
             };
             let test = {
-                let (app, fields) = (app.clone(), fields.clone());
-                move |window: &mut Window, cx: &mut App| {
+                let (app, fields, test_status) = (app.clone(), fields.clone(), test_status.clone());
+                move |cx: &mut App| {
                     let url = fields.read(cx).to_url();
-                    app.update(cx, |_, cx| Self::run_connection_test(url, window, cx))
+                    let status = test_status.clone();
+                    app.update(cx, |_, cx| Self::run_connection_test(url, status, cx))
                         .ok();
                 }
             };
@@ -1444,7 +1476,9 @@ impl PgGuiApp {
                     .child(
                         h_flex()
                             .gap_2()
-                            .justify_end()
+                            .items_center()
+                            .child(test_status)
+                            .child(div().flex_1())
                             .child(Button::new("cancel").label("Cancel").on_click(
                                 |_, window, cx| {
                                     window.close_dialog(cx);
@@ -1454,7 +1488,7 @@ impl PgGuiApp {
                                 Button::new("test")
                                     .outline()
                                     .label("Test Connection")
-                                    .on_click(move |_, window, cx| test(window, cx)),
+                                    .on_click(move |_, _, cx| test(cx)),
                             )
                             .child(
                                 Button::new("connect")
@@ -1468,33 +1502,33 @@ impl PgGuiApp {
     }
 
     /// Try to open a connection with `url` in the background and report the
-    /// outcome as a notification, so the New Connection dialog's Test
-    /// Connection button gives feedback without leaving the dialog.
-    fn run_connection_test(url: String, window: &mut Window, cx: &mut Context<Self>) {
-        window.push_notification(
-            Notification::info("Testing connection…")
-                .id::<TestConnectionNotice>()
-                .autohide(false),
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
+    /// outcome through `status`, which the New Connection dialog renders as
+    /// green ("succeeded") or red ("failed: …") text — feedback without
+    /// leaving the dialog.
+    fn run_connection_test(url: String, status: Entity<ConnectionTest>, cx: &mut Context<Self>) {
+        status.update(cx, |status, cx| {
+            *status = ConnectionTest::Testing;
+            cx.notify();
+        });
+        cx.spawn(async move |_, cx| {
             let result = cx
                 .background_spawn(async move { db::test_connection(&url) })
                 .await;
-            this.update_in(cx, |_, window, cx| {
-                let note = match result {
-                    Ok(()) => {
-                        Notification::success("Connection succeeded").id::<TestConnectionNotice>()
-                    }
-                    Err(err) => Notification::error(format!(
-                        "Connection failed: {}",
-                        err.lines().next().unwrap_or_default()
-                    ))
-                    .id::<TestConnectionNotice>(),
-                };
-                window.push_notification(note, cx);
-            })
-            .ok();
+            status
+                .update(cx, |status, cx| {
+                    *status = match result {
+                        Ok(()) => ConnectionTest::Ok,
+                        Err(err) => ConnectionTest::Failed(
+                            format!(
+                                "Connection failed: {}",
+                                err.lines().next().unwrap_or_default()
+                            )
+                            .into(),
+                        ),
+                    };
+                    cx.notify();
+                })
+                .ok();
         })
         .detach();
     }
