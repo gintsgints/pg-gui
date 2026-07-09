@@ -8,7 +8,7 @@ mod snippets;
 mod statement;
 
 use gpui::{
-    App, AppContext as _, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds,
+    Action, App, AppContext as _, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds,
     WindowOptions, actions, px, size,
 };
 use gpui_component::Root;
@@ -26,7 +26,8 @@ actions!(
         SaveFile,
         OpenSnippets,
         OpenConfig,
-        ToggleToolbar,
+        NewConnection,
+        OpenGitHub,
         FormatScript,
         ToggleComment,
         ZoomIn,
@@ -36,6 +37,14 @@ actions!(
         Quit
     ]
 );
+
+/// Connect to a specific connection string; carried by the "Recent"
+/// application-menu items so each remembers which URL it reconnects to.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = pg_gui, no_json)]
+pub struct Connect {
+    pub url: String,
+}
 
 fn main() {
     let app = Application::new();
@@ -64,7 +73,6 @@ fn main() {
             KeyBinding::new("secondary-s", SaveFile, None),
             KeyBinding::new("secondary-p", OpenSnippets, None),
             KeyBinding::new("secondary-,", OpenConfig, None),
-            KeyBinding::new("secondary-b", ToggleToolbar, None),
             KeyBinding::new("secondary-shift-f", FormatScript, None),
             KeyBinding::new("secondary-/", ToggleComment, None),
             KeyBinding::new("secondary-=", ZoomIn, None),

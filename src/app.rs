@@ -6,8 +6,8 @@ use futures::StreamExt as _;
 use gpui::Subscription;
 use gpui::{
     App, AppContext as _, Context, Entity, EntityInputHandler as _, InteractiveElement as _,
-    IntoElement, ParentElement as _, PathPromptOptions, Pixels, Render, SharedString, Styled as _,
-    Window, div, px,
+    IntoElement, Menu, MenuItem, NoAction, ParentElement as _, PathPromptOptions, Pixels, Render,
+    SharedString, Styled as _, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Root, Sizable as _, Theme, WindowExt as _,
@@ -23,10 +23,13 @@ use gpui_component::{
 
 use crate::results::ResultsDelegate;
 use crate::{
-    AiComplete, CloseTab, FormatScript, NewFile, NextTab, OpenConfig, OpenFile, OpenSnippets,
-    PrevTab, RunQuery, SaveFile, ShowHelp, ToggleComment, ToggleToolbar, ZoomIn, ZoomOut,
-    ZoomReset, ai, config, db, lsp, snippets, statement,
+    AiComplete, CloseTab, Connect, FormatScript, NewConnection, NewFile, NextTab, OpenConfig,
+    OpenFile, OpenGitHub, OpenSnippets, PrevTab, Quit, RunQuery, SaveFile, ShowHelp, ToggleComment,
+    ZoomIn, ZoomOut, ZoomReset, ai, config, db, lsp, snippets, statement,
 };
+
+/// The project's GitHub page, opened from the About application menu.
+const REPO_URL: &str = "https://github.com/gintsgints/pg-gui";
 
 const ZOOM_STEP: f32 = 0.1;
 const ZOOM_MIN: f32 = 0.5;
@@ -49,7 +52,6 @@ const COMMANDS: &[(&str, &str)] = &[
     ("ctrl-tab / ctrl-shift-tab", "Next / previous tab"),
     ("cmd-o", "Open a SQL script"),
     ("cmd-s", "Save the script"),
-    ("cmd-b", "Show or hide the toolbar"),
     ("cmd-,", "Open config.json in the system editor"),
     ("cmd-plus / cmd-minus", "Zoom in / out"),
     ("cmd-0", "Reset zoom"),
@@ -71,7 +73,6 @@ const COMMANDS: &[(&str, &str)] = &[
     ("ctrl-tab / ctrl-shift-tab", "Next / previous tab"),
     ("ctrl-o", "Open a SQL script"),
     ("ctrl-s", "Save the script"),
-    ("ctrl-b", "Show or hide the toolbar"),
     ("ctrl-,", "Open config.json in the system editor"),
     ("ctrl-plus / ctrl-minus", "Zoom in / out"),
     ("ctrl-0", "Reset zoom"),
@@ -82,6 +83,96 @@ const COMMANDS: &[(&str, &str)] = &[
 fn default_conn() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
     format!("postgres://{user}@localhost:5432/postgres")
+}
+
+/// Number of connection strings kept in the Recent menu.
+const MAX_RECENT_CONNECTIONS: usize = 10;
+
+/// Move `url` to the front of the recent-connections list (dedup, capped),
+/// ignoring an empty string.
+fn record_recent(recents: &mut Vec<String>, url: &str) {
+    if url.is_empty() {
+        return;
+    }
+    recents.retain(|c| c != url);
+    recents.insert(0, url.to_string());
+    recents.truncate(MAX_RECENT_CONNECTIONS);
+}
+
+/// The application menu bar. Every command lives here now that the toolbar
+/// is gone; the OS fills in each item's shortcut from the keybindings in
+/// `main.rs`. `recents` becomes the Connection ▸ Recent submenu, each entry
+/// carrying its (unmasked) connection string in a [`Connect`] action while
+/// showing the credentials masked.
+fn build_menus(recents: &[String]) -> Vec<Menu> {
+    let recent_items = if recents.is_empty() {
+        vec![MenuItem::action("No recent connections", NoAction)]
+    } else {
+        recents
+            .iter()
+            .map(|url| MenuItem::action(mask_credentials(url), Connect { url: url.clone() }))
+            .collect()
+    };
+
+    vec![
+        Menu {
+            name: "pg-gui".into(),
+            items: vec![
+                MenuItem::action("Preferences…", OpenConfig),
+                MenuItem::separator(),
+                MenuItem::action("Quit", Quit),
+            ],
+        },
+        Menu {
+            name: "Connection".into(),
+            items: vec![
+                MenuItem::action("New Connection…", NewConnection),
+                MenuItem::submenu(Menu {
+                    name: "Recent".into(),
+                    items: recent_items,
+                }),
+                MenuItem::separator(),
+                MenuItem::action("Run Query", RunQuery),
+            ],
+        },
+        Menu {
+            name: "File".into(),
+            items: vec![
+                MenuItem::action("New", NewFile),
+                MenuItem::action("Open…", OpenFile),
+                MenuItem::action("Save", SaveFile),
+                MenuItem::separator(),
+                MenuItem::action("Close Tab", CloseTab),
+                MenuItem::action("Next Tab", NextTab),
+                MenuItem::action("Previous Tab", PrevTab),
+            ],
+        },
+        Menu {
+            name: "Edit".into(),
+            items: vec![
+                MenuItem::action("Format", FormatScript),
+                MenuItem::action("Snippets", OpenSnippets),
+                MenuItem::action("AI Complete", AiComplete),
+                MenuItem::separator(),
+                MenuItem::action("Toggle Comment", ToggleComment),
+            ],
+        },
+        Menu {
+            name: "View".into(),
+            items: vec![
+                MenuItem::action("Zoom In", ZoomIn),
+                MenuItem::action("Zoom Out", ZoomOut),
+                MenuItem::action("Actual Size", ZoomReset),
+            ],
+        },
+        Menu {
+            name: "About".into(),
+            items: vec![
+                MenuItem::action("pg-gui on GitHub", OpenGitHub),
+                MenuItem::action("Keyboard Shortcuts", ShowHelp),
+            ],
+        },
+    ]
 }
 
 /// A file's last modification time, or `None` when it's missing or can't be
@@ -174,7 +265,6 @@ struct EditorTab {
 }
 
 pub struct PgGuiApp {
-    conn_input: Entity<InputState>,
     tabs: Vec<EditorTab>,
     active_tab: usize,
     results: Entity<TableState<ResultsDelegate>>,
@@ -193,12 +283,6 @@ pub struct PgGuiApp {
     base_font_size: Pixels,
     base_mono_font_size: Pixels,
     save_generation: usize,
-    /// Count of programmatic swaps of the connection field (between its
-    /// real and credential-masked value) whose Change events are still
-    /// undelivered. GPUI emits those events after the swap call returns,
-    /// so a "currently swapping" flag would already be reset; each event
-    /// consumes one count instead of being taken as user input.
-    pending_conn_syncs: usize,
     lsp: Option<lsp::Client>,
     _subscriptions: Vec<Subscription>,
 }
@@ -218,6 +302,9 @@ impl PgGuiApp {
         } else if config.connection_string.is_empty() {
             config.connection_string = default_conn();
         }
+        // Keep the active connection at the head of the recent list so
+        // Connection ▸ Recent always offers to reconnect to it.
+        record_recent(&mut config.recent_connections, &config.connection_string);
 
         if config.tabs.is_empty() {
             config.tabs.push(config::ScriptTab::default());
@@ -230,14 +317,6 @@ impl PgGuiApp {
                 tab.file = None;
             }
         }
-
-        let conn_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("postgres://user:password@host:5432/database")
-                // The field shows masked credentials until focused; the real
-                // value lives in `config.connection_string`.
-                .default_value(mask_credentials(&config.connection_string))
-        });
 
         let tabs: Vec<EditorTab> = config
             .tabs
@@ -255,7 +334,6 @@ impl PgGuiApp {
             .update(cx, |state, cx| state.focus(window, cx));
 
         let subscriptions = vec![
-            cx.subscribe_in(&conn_input, window, Self::on_conn_input_event),
             // Flush any debounced (not yet written) changes on quit,
             // and stop the language server.
             cx.on_app_quit(|this, _| {
@@ -268,7 +346,6 @@ impl PgGuiApp {
         ];
 
         let mut this = Self {
-            conn_input,
             tabs,
             active_tab,
             results,
@@ -281,11 +358,11 @@ impl PgGuiApp {
             base_font_size: cx.theme().font_size,
             base_mono_font_size: cx.theme().mono_font_size,
             save_generation: 0,
-            pending_conn_syncs: 0,
             lsp: None,
             _subscriptions: subscriptions,
         };
         this.update_window_title(window);
+        this.refresh_menus(cx);
         this.start_lsp(cx);
         Self::watch_files(window, cx);
         this.apply_zoom(cx);
@@ -639,7 +716,11 @@ impl PgGuiApp {
         }
 
         if self.config.connection_string != old.connection_string {
-            self.sync_conn_input(mask_credentials(&self.config.connection_string), window, cx);
+            record_recent(
+                &mut self.config.recent_connections,
+                &self.config.connection_string,
+            );
+            self.refresh_menus(cx);
         }
 
         // The language server reads all of these from its generated
@@ -781,43 +862,6 @@ impl PgGuiApp {
             });
         }
         self.start_lsp(cx);
-    }
-
-    fn on_conn_input_event(
-        &mut self,
-        state: &Entity<InputState>,
-        event: &InputEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match event {
-            InputEvent::Change => {
-                if self.pending_conn_syncs > 0 {
-                    self.pending_conn_syncs -= 1;
-                    return;
-                }
-                self.config.connection_string = state.read(cx).value().to_string();
-                self.schedule_save(cx);
-            }
-            // Reveal the real connection string while editing, mask the
-            // credentials the rest of the time.
-            InputEvent::Focus => {
-                self.sync_conn_input(self.config.connection_string.clone(), window, cx);
-            }
-            InputEvent::Blur => {
-                self.sync_conn_input(mask_credentials(&self.config.connection_string), window, cx);
-            }
-            InputEvent::PressEnter { .. } => {}
-        }
-    }
-
-    fn sync_conn_input(&mut self, value: String, window: &mut Window, cx: &mut Context<Self>) {
-        // set_value emits exactly one Change event, delivered after this
-        // returns.
-        self.pending_conn_syncs += 1;
-        self.conn_input.update(cx, |state, cx| {
-            state.set_value(value, window, cx);
-        });
     }
 
     fn on_editor_event(
@@ -1049,62 +1093,99 @@ impl PgGuiApp {
         });
     }
 
-    /// Toolbar with the connection string and action buttons; hidden and
-    /// shown with cmd-b.
-    fn render_toolbar(
-        &self,
-        ai_available: bool,
+    /// Rebuild the application menu bar, e.g. after the recent-connections
+    /// list changes. `set_menus` is on `App`, reached through `Context`.
+    fn refresh_menus(&self, cx: &mut Context<Self>) {
+        cx.set_menus(build_menus(&self.config.recent_connections));
+    }
+
+    /// Connection ▸ New Connection…: prompt for a connection string, then
+    /// reconnect to it. Seeded with the current connection so it can be
+    /// tweaked rather than retyped.
+    pub fn new_connection(
+        &mut self,
+        _: &NewConnection,
+        window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        h_flex()
-            .gap_2()
-            .p_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(div().flex_1().child(Input::new(&self.conn_input)))
-            .child(
-                Button::new("run")
-                    .primary()
-                    .label(if self.running { "Running…" } else { "Run" })
-                    .disabled(self.running)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.run_query(&RunQuery, window, cx);
-                    })),
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("postgres://user:password@host:5432/database")
+                .default_value(self.config.connection_string.clone())
+        });
+        let app = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let input = input.clone();
+            let connect = {
+                let (app, input) = (app.clone(), input.clone());
+                move |window: &mut Window, cx: &mut App| {
+                    let url = input.read(cx).value().trim().to_string();
+                    window.close_dialog(cx);
+                    if !url.is_empty() {
+                        app.update(cx, |this, cx| this.apply_connection(&url, cx))
+                            .ok();
+                    }
+                }
+            };
+            dialog.title("New connection").w(px(520.)).child(
+                v_flex()
+                    .gap_4()
+                    .pb_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Enter a PostgreSQL connection string:"),
+                    )
+                    .child(Input::new(&input))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(Button::new("cancel").label("Cancel").on_click(
+                                |_, window, cx| {
+                                    window.close_dialog(cx);
+                                },
+                            ))
+                            .child(
+                                Button::new("connect")
+                                    .primary()
+                                    .label("Connect")
+                                    .on_click(move |_, window, cx| connect(window, cx)),
+                            ),
+                    ),
             )
-            .child(
-                Button::new("ai")
-                    .label(if self.ai_running {
-                        "AI…"
-                    } else {
-                        "AI Complete"
-                    })
-                    .disabled(self.ai_running || !ai_available)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.ai_complete(&AiComplete, window, cx);
-                    })),
-            )
-            .child(
-                Button::new("snippets")
-                    .label("Snippets")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_snippet_picker(&OpenSnippets, window, cx);
-                    })),
-            )
-            .child(
-                Button::new("new").label("New").on_click(
-                    cx.listener(|this, _, window, cx| this.new_file(&NewFile, window, cx)),
-                ),
-            )
-            .child(
-                Button::new("open").label("Open").on_click(
-                    cx.listener(|this, _, window, cx| this.open_file(&OpenFile, window, cx)),
-                ),
-            )
-            .child(
-                Button::new("save").label("Save").on_click(
-                    cx.listener(|this, _, window, cx| this.save_file(&SaveFile, window, cx)),
-                ),
-            )
+        });
+    }
+
+    /// Connection ▸ Recent ▸ …: reconnect to a previously used string.
+    pub fn connect_recent(&mut self, action: &Connect, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_connection(&action.url, cx);
+    }
+
+    /// Switch to `url`: remember it, persist, and restart the language
+    /// server so completions follow the new database's schema.
+    fn apply_connection(&mut self, url: &str, cx: &mut Context<Self>) {
+        if url.is_empty() {
+            return;
+        }
+        let masked = mask_credentials(url);
+        self.config.connection_string = url.to_string();
+        record_recent(&mut self.config.recent_connections, url);
+        self.save_config();
+        self.refresh_menus(cx);
+        self.restart_lsp(cx);
+        self.set_status(format!("Connecting to {masked}"), cx);
+    }
+
+    /// About ▸ pg-gui on GitHub: open the project page in the browser.
+    // &mut self is imposed by the action listener signature.
+    #[allow(clippy::unused_self)]
+    pub fn open_github(&mut self, _: &OpenGitHub, _: &mut Window, cx: &mut Context<Self>) {
+        cx.open_url(REPO_URL);
     }
 
     /// The "Prev / Next / Page x of y" bar under the results table; `None`
@@ -1344,12 +1425,6 @@ impl PgGuiApp {
                         })),
                 )
         });
-    }
-
-    pub fn toggle_toolbar(&mut self, _: &ToggleToolbar, _: &mut Window, cx: &mut Context<Self>) {
-        self.config.toolbar_visible = !self.config.toolbar_visible;
-        self.schedule_save(cx);
-        cx.notify();
     }
 
     pub fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
@@ -1776,6 +1851,8 @@ impl Render for PgGuiApp {
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::ai_complete))
+            .on_action(cx.listener(Self::new_connection))
+            .on_action(cx.listener(Self::connect_recent))
             .on_action(cx.listener(Self::new_file))
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::next_tab))
@@ -1784,18 +1861,13 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::save_file))
             .on_action(cx.listener(Self::open_snippet_picker))
             .on_action(cx.listener(Self::open_config))
-            .on_action(cx.listener(Self::toggle_toolbar))
             .on_action(cx.listener(Self::format_script))
             .on_action(cx.listener(Self::toggle_comment))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
             .on_action(cx.listener(Self::show_help))
-            .children(
-                self.config
-                    .toolbar_visible
-                    .then(|| self.render_toolbar(ai_available, cx)),
-            )
+            .on_action(cx.listener(Self::open_github))
             .child(
                 // Editor over results, split by a draggable divider. The
                 // split position is persisted to the config on drag and

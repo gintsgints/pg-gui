@@ -34,6 +34,10 @@ impl Eq for ScriptTab {}
 pub struct Config {
     #[serde(default)]
     pub connection_string: String,
+    /// Previously used connection strings, most recent first, shown in the
+    /// Connection ▸ Recent application menu.
+    #[serde(default)]
+    pub recent_connections: Vec<String>,
     /// Pre-tabs single-script fields; read once to seed `tabs` in
     /// [`try_load`] and no longer written.
     #[serde(default, skip_serializing)]
@@ -50,9 +54,6 @@ pub struct Config {
     /// is first dragged (both panels then split the window evenly).
     #[serde(default)]
     pub editor_height: Option<f32>,
-    /// Whether the toolbar (connection string and action buttons) is shown.
-    #[serde(default = "default_true")]
-    pub toolbar_visible: bool,
     /// Rows shown per results page.
     #[serde(default = "default_page_size")]
     pub page_size: usize,
@@ -90,12 +91,12 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             connection_string: String::new(),
+            recent_connections: Vec::new(),
             script: String::new(),
             script_file: None,
             tabs: Vec::new(),
             active_tab: 0,
             editor_height: None,
-            toolbar_visible: true,
             page_size: default_page_size(),
             ai_api_key: String::new(),
             format_on_save: false,
@@ -108,10 +109,6 @@ impl Default for Config {
 
 fn default_zoom() -> f32 {
     1.0
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_page_size() -> usize {
