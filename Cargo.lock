@@ -4668,7 +4668,7 @@ dependencies = [
 
 [[package]]
 name = "pg-gui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
