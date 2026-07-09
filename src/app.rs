@@ -48,7 +48,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cmd-shift-f", "Format the script"),
     ("cmd-/", "Comment or uncomment the line / selection"),
     ("cmd-p", "Insert a snippet"),
-    ("cmd-n", "New script tab"),
+    ("cmd-t", "New script tab"),
     ("cmd-w", "Close the tab"),
     ("ctrl-tab / ctrl-shift-tab", "Next / previous tab"),
     ("cmd-o", "Open a SQL script"),
@@ -69,7 +69,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("ctrl-shift-f", "Format the script"),
     ("ctrl-/", "Comment or uncomment the line / selection"),
     ("ctrl-p", "Insert a snippet"),
-    ("ctrl-n", "New script tab"),
+    ("ctrl-t", "New script tab"),
     ("ctrl-w", "Close the tab"),
     ("ctrl-tab / ctrl-shift-tab", "Next / previous tab"),
     ("ctrl-o", "Open a SQL script"),
@@ -186,10 +186,10 @@ fn build_menus(recents: &[config::RecentConnection], theme: config::ThemeSelecti
             name: "File".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("New", NewFile),
                 MenuItem::action("Open…", OpenFile),
                 MenuItem::action("Save", SaveFile),
                 MenuItem::separator(),
+                MenuItem::action("New Tab", NewFile),
                 MenuItem::action("Close Tab", CloseTab),
                 MenuItem::action("Next Tab", NextTab),
                 MenuItem::action("Previous Tab", PrevTab),
@@ -1767,8 +1767,8 @@ impl PgGuiApp {
         .detach();
     }
 
-    /// Start a fresh script in a new tab (cmd-n); cmd-s prompts for its
-    /// location.
+    /// Start a fresh script in a new tab (cmd-t, or the tab bar's "+");
+    /// cmd-s prompts for its location.
     pub fn new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<Self>) {
         let ix = self.add_tab(String::new(), None, window, cx);
         self.activate_tab(ix, window, cx);

@@ -98,7 +98,7 @@ fn main() {
             KeyBinding::new("ctrl-enter", RunQuery, None),
             KeyBinding::new("secondary-i", AiComplete, None),
             KeyBinding::new("ctrl-space", AiComplete, None),
-            KeyBinding::new("secondary-n", NewFile, None),
+            KeyBinding::new("secondary-t", NewFile, None),
             KeyBinding::new("secondary-w", CloseTab, None),
             KeyBinding::new("ctrl-tab", NextTab, None),
             KeyBinding::new("ctrl-shift-tab", PrevTab, None),
