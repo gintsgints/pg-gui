@@ -8,8 +8,8 @@ mod snippets;
 mod statement;
 
 use gpui::{
-    Action, App, AppContext as _, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds,
-    WindowOptions, actions, px, size,
+    Action, App, AppContext as _, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
+    actions, px, size,
 };
 use gpui_component::Root;
 
@@ -50,7 +50,7 @@ pub struct Connect {
 }
 
 fn main() {
-    let app = Application::new();
+    let app = gpui_platform::application();
 
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
@@ -86,7 +86,7 @@ fn main() {
             KeyBinding::new("secondary-q", Quit, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _window_id| {
             if cx.windows().is_empty() {
                 cx.quit();
             }

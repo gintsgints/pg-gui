@@ -18,7 +18,7 @@ use gpui_component::{
     list::{List, ListEvent, ListState},
     resizable::{ResizableState, resizable_panel, v_resizable},
     tab::{Tab, TabBar},
-    table::{Table, TableState},
+    table::{DataTable, TableState},
     v_flex,
 };
 
@@ -148,6 +148,7 @@ fn build_menus(recents: &[config::RecentConnection]) -> Vec<Menu> {
     vec![
         Menu {
             name: "pg-gui".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("Preferences…", OpenConfig),
                 MenuItem::separator(),
@@ -156,11 +157,13 @@ fn build_menus(recents: &[config::RecentConnection]) -> Vec<Menu> {
         },
         Menu {
             name: "Connection".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("New Connection…", NewConnection),
                 MenuItem::action("Edit Connection…", EditConnection),
                 MenuItem::submenu(Menu {
                     name: "Recent".into(),
+                    disabled: false,
                     items: recent_items,
                 }),
                 MenuItem::separator(),
@@ -169,6 +172,7 @@ fn build_menus(recents: &[config::RecentConnection]) -> Vec<Menu> {
         },
         Menu {
             name: "File".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("New", NewFile),
                 MenuItem::action("Open…", OpenFile),
@@ -181,6 +185,7 @@ fn build_menus(recents: &[config::RecentConnection]) -> Vec<Menu> {
         },
         Menu {
             name: "Edit".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("Format", FormatScript),
                 MenuItem::action("Snippets", OpenSnippets),
@@ -191,6 +196,7 @@ fn build_menus(recents: &[config::RecentConnection]) -> Vec<Menu> {
         },
         Menu {
             name: "View".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("Zoom In", ZoomIn),
                 MenuItem::action("Zoom Out", ZoomOut),
@@ -199,6 +205,7 @@ fn build_menus(recents: &[config::RecentConnection]) -> Vec<Menu> {
         },
         Menu {
             name: "About".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("pg-gui on GitHub", OpenGitHub),
                 MenuItem::action("Keyboard Shortcuts", ShowHelp),
@@ -1540,21 +1547,19 @@ impl PgGuiApp {
             let result = cx
                 .background_spawn(async move { db::test_connection(&url) })
                 .await;
-            status
-                .update(cx, |status, cx| {
-                    *status = match result {
-                        Ok(()) => ConnectionTest::Ok,
-                        Err(err) => ConnectionTest::Failed(
-                            format!(
-                                "Connection failed: {}",
-                                err.lines().next().unwrap_or_default()
-                            )
-                            .into(),
-                        ),
-                    };
-                    cx.notify();
-                })
-                .ok();
+            status.update(cx, |status, cx| {
+                *status = match result {
+                    Ok(()) => ConnectionTest::Ok,
+                    Err(err) => ConnectionTest::Failed(
+                        format!(
+                            "Connection failed: {}",
+                            err.lines().next().unwrap_or_default()
+                        )
+                        .into(),
+                    ),
+                };
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -2313,7 +2318,7 @@ impl Render for PgGuiApp {
                                         div()
                                             .flex_1()
                                             .min_h(px(0.))
-                                            .child(Table::new(&self.results)),
+                                            .child(DataTable::new(&self.results)),
                                     )
                                     .children(self.render_results_pager(cx)),
                             ),
