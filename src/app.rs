@@ -1246,11 +1246,16 @@ impl PgGuiApp {
         let (sql, scope) = if let Some(sql) = selection {
             (sql, "selection")
         } else {
-            let state = self.editor().read(cx);
-            let text = state.value();
-            let sql = statement::at(&text, state.cursor())
-                .map(|range| text[range].to_string())
-                .unwrap_or_default();
+            // Select the statement in the editor so it's clear which one ran.
+            let sql = self.editor().update(cx, |state, cx| {
+                let text = state.value();
+                let Some(range) = statement::at(&text, state.cursor()) else {
+                    return String::new();
+                };
+                let sql = text[range.clone()].to_string();
+                state.set_selected_range(range, cx);
+                sql
+            });
             (sql, "statement")
         };
         if sql.trim().is_empty() {
