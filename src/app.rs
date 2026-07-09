@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
@@ -15,6 +16,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState, RopeExt as _, TabSize},
     list::{List, ListEvent, ListState},
+    notification::Notification,
     resizable::{ResizableState, resizable_panel, v_resizable},
     tab::{Tab, TabBar},
     table::{Table, TableState},
@@ -209,6 +211,161 @@ fn mask_credentials(conn: &str) -> String {
         .join(" ")
 }
 
+/// Marker type keying the Test Connection notification, so the "testing…"
+/// toast is replaced in place by its success/failure result rather than
+/// stacking.
+struct TestConnectionNotice;
+
+/// The individual pieces of a `PostgreSQL` connection, edited as separate
+/// fields in the New Connection dialog and recombined into a URL.
+#[derive(Default)]
+struct ConnectionParts {
+    host: String,
+    port: String,
+    database: String,
+    user: String,
+    password: String,
+}
+
+/// The five text inputs of the New Connection dialog, grouped so their
+/// current values can be read back into [`ConnectionParts`] in one place.
+#[derive(Clone)]
+struct ConnectionFields {
+    host: Entity<InputState>,
+    port: Entity<InputState>,
+    database: Entity<InputState>,
+    user: Entity<InputState>,
+    password: Entity<InputState>,
+}
+
+impl ConnectionFields {
+    fn as_array(&self) -> [Entity<InputState>; 5] {
+        [
+            self.host.clone(),
+            self.port.clone(),
+            self.database.clone(),
+            self.user.clone(),
+            self.password.clone(),
+        ]
+    }
+
+    /// Snapshot the fields; everything but the password is trimmed (a
+    /// password may legitimately contain leading/trailing spaces).
+    fn read(&self, cx: &App) -> ConnectionParts {
+        ConnectionParts {
+            host: self.host.read(cx).value().trim().to_string(),
+            port: self.port.read(cx).value().trim().to_string(),
+            database: self.database.read(cx).value().trim().to_string(),
+            user: self.user.read(cx).value().trim().to_string(),
+            password: self.password.read(cx).value().to_string(),
+        }
+    }
+}
+
+/// Percent-decode the reserved characters we encode in [`ConnectionParts::to_url`];
+/// leaves any other `%`-sequence (or a lone `%`) untouched.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 3 <= bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Percent-encode the characters that would otherwise be read as URL
+/// delimiters, so a username/password/database containing `@`, `:`, `/`,
+/// etc. round-trips through the connection string.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '%' | ':' | '@' | '/' | '?' | '#' | '[' | ']' | ' ' => {
+                // Writing to a String cannot fail.
+                let _ = write!(out, "%{:02X}", ch as u8);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+impl ConnectionParts {
+    /// Split a `postgres://user:password@host:port/database` URL into its
+    /// fields. A string that is not in URL form (e.g. key-value) yields
+    /// empty fields, leaving the dialog for the user to fill in.
+    fn parse(conn: &str) -> Self {
+        let Some((_, rest)) = conn.split_once("://") else {
+            return Self::default();
+        };
+        let (authority, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i + 1..]),
+            None => (rest, ""),
+        };
+
+        let mut parts = Self {
+            database: percent_decode(path.split(['?', '#']).next().unwrap_or("")),
+            ..Self::default()
+        };
+
+        let (userinfo, hostport) = match authority.rfind('@') {
+            Some(i) => (Some(&authority[..i]), &authority[i + 1..]),
+            None => (None, authority),
+        };
+        if let Some(userinfo) = userinfo {
+            match userinfo.split_once(':') {
+                Some((user, password)) => {
+                    parts.user = percent_decode(user);
+                    parts.password = percent_decode(password);
+                }
+                None => parts.user = percent_decode(userinfo),
+            }
+        }
+        // A bracketed IPv6 host keeps its own colons; only a trailing
+        // `:port` after the closing bracket (or on a bare host) is the port.
+        match hostport.rsplit_once(':') {
+            Some((host, port)) if !host.ends_with(']') => {
+                parts.host = host.to_string();
+                parts.port = port.to_string();
+            }
+            _ => parts.host = hostport.to_string(),
+        }
+        parts
+    }
+
+    /// Recombine the fields into a `postgres://` URL, percent-encoding the
+    /// credential and database segments.
+    fn to_url(&self) -> String {
+        let mut url = String::from("postgres://");
+        if !self.user.is_empty() {
+            url.push_str(&percent_encode(&self.user));
+            if !self.password.is_empty() {
+                url.push(':');
+                url.push_str(&percent_encode(&self.password));
+            }
+            url.push('@');
+        }
+        url.push_str(&self.host);
+        if !self.port.is_empty() {
+            url.push(':');
+            url.push_str(&self.port);
+        }
+        url.push('/');
+        url.push_str(&percent_encode(&self.database));
+        url
+    }
+}
+
 /// Toggle `--` line comments on a block of full lines: when every
 /// non-blank line is already commented the prefix is removed, otherwise
 /// `-- ` is inserted after each line's leading whitespace (blank lines
@@ -285,6 +442,12 @@ pub struct PgGuiApp {
     save_generation: usize,
     lsp: Option<lsp::Client>,
     _subscriptions: Vec<Subscription>,
+    /// Kept alive for the lifetime of the open New Connection dialog: one
+    /// subscription per field input that recomputes the connection-string
+    /// preview. Replaced (dropping the previous set) each time the dialog
+    /// opens; only ever written, never read.
+    #[allow(dead_code)]
+    connection_dialog_subs: Vec<Subscription>,
 }
 
 impl PgGuiApp {
@@ -360,6 +523,7 @@ impl PgGuiApp {
             save_generation: 0,
             lsp: None,
             _subscriptions: subscriptions,
+            connection_dialog_subs: Vec::new(),
         };
         this.update_window_title(window);
         this.refresh_menus(cx);
@@ -1099,9 +1263,10 @@ impl PgGuiApp {
         cx.set_menus(build_menus(&self.config.recent_connections));
     }
 
-    /// Connection ▸ New Connection…: prompt for a connection string, then
-    /// reconnect to it. Seeded with the current connection so it can be
-    /// tweaked rather than retyped.
+    /// Connection ▸ New Connection…: prompt for the connection's fields
+    /// (host, port, database, user, password), showing the assembled
+    /// connection string live, then reconnect. Seeded with the current
+    /// connection so it can be tweaked rather than retyped.
     pub fn new_connection(
         &mut self,
         _: &NewConnection,
@@ -1111,36 +1276,124 @@ impl PgGuiApp {
         if window.has_active_dialog(cx) {
             return;
         }
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("postgres://user:password@host:5432/database")
-                .default_value(self.config.connection_string.clone())
+        let parts = ConnectionParts::parse(&self.config.connection_string);
+        let mut field = |value: String, placeholder: &str, cx: &mut Context<Self>| {
+            let placeholder = placeholder.to_string();
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(placeholder)
+                    .default_value(value)
+            })
+        };
+        let fields = ConnectionFields {
+            host: field(parts.host, "localhost", cx),
+            port: field(parts.port, "5432", cx),
+            database: field(parts.database, "postgres", cx),
+            user: field(parts.user, "postgres", cx),
+            password: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .masked(true)
+                    .default_value(parts.password)
+            }),
+        };
+        let preview = cx.new(|cx| {
+            InputState::new(window, cx).default_value(self.config.connection_string.clone())
         });
+
+        // Recompute the previewed connection string whenever any field
+        // changes. The subscriptions live in `self` so they outlast this
+        // method but are dropped the next time the dialog opens.
+        let recompute = {
+            let (fields, preview) = (fields.clone(), preview.clone());
+            move |window: &mut Window, cx: &mut App| {
+                let url = fields.read(cx).to_url();
+                preview.update(cx, |state, cx| state.set_value(url, window, cx));
+            }
+        };
+        self.connection_dialog_subs = fields
+            .as_array()
+            .iter()
+            .map(|input| {
+                let recompute = recompute.clone();
+                cx.subscribe_in(
+                    input,
+                    window,
+                    move |_, _, event: &InputEvent, window, cx| {
+                        if matches!(event, InputEvent::Change) {
+                            recompute(window, cx);
+                        }
+                    },
+                )
+            })
+            .collect();
+
+        Self::open_connection_dialog(fields, preview, window, cx);
+    }
+
+    /// Build and show the New Connection dialog for the given field inputs
+    /// and live connection-string preview.
+    fn open_connection_dialog(
+        fields: ConnectionFields,
+        preview: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let app = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, cx| {
-            let input = input.clone();
+            let (fields, preview) = (fields.clone(), preview.clone());
             let connect = {
-                let (app, input) = (app.clone(), input.clone());
+                let (app, fields) = (app.clone(), fields.clone());
                 move |window: &mut Window, cx: &mut App| {
-                    let url = input.read(cx).value().trim().to_string();
+                    let url = fields.read(cx).to_url();
                     window.close_dialog(cx);
-                    if !url.is_empty() {
-                        app.update(cx, |this, cx| this.apply_connection(&url, cx))
-                            .ok();
-                    }
+                    app.update(cx, |this, cx| this.apply_connection(&url, cx))
+                        .ok();
                 }
             };
+            let test = {
+                let (app, fields) = (app.clone(), fields.clone());
+                move |window: &mut Window, cx: &mut App| {
+                    let url = fields.read(cx).to_url();
+                    app.update(cx, |_, cx| Self::run_connection_test(url, window, cx))
+                        .ok();
+                }
+            };
+            let labeled = |label: &str, input: &Entity<InputState>, cx: &mut App| {
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(label.to_string()),
+                    )
+                    .child(Input::new(input))
+            };
+
             dialog.title("New connection").w(px(520.)).child(
                 v_flex()
                     .gap_4()
                     .pb_2()
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Enter a PostgreSQL connection string:"),
+                        h_flex()
+                            .gap_3()
+                            .child(div().flex_1().child(labeled("Host", &fields.host, cx)))
+                            .child(div().w(px(120.)).child(labeled("Port", &fields.port, cx))),
                     )
-                    .child(Input::new(&input))
+                    .child(labeled("Database", &fields.database, cx))
+                    .child(labeled("Username", &fields.user, cx))
+                    .child(labeled("Password", &fields.password, cx))
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Connection string"),
+                            )
+                            .child(Input::new(&preview).disabled(true)),
+                    )
                     .child(
                         h_flex()
                             .gap_2()
@@ -1151,6 +1404,12 @@ impl PgGuiApp {
                                 },
                             ))
                             .child(
+                                Button::new("test")
+                                    .outline()
+                                    .label("Test Connection")
+                                    .on_click(move |_, window, cx| test(window, cx)),
+                            )
+                            .child(
                                 Button::new("connect")
                                     .primary()
                                     .label("Connect")
@@ -1159,6 +1418,38 @@ impl PgGuiApp {
                     ),
             )
         });
+    }
+
+    /// Try to open a connection with `url` in the background and report the
+    /// outcome as a notification, so the New Connection dialog's Test
+    /// Connection button gives feedback without leaving the dialog.
+    fn run_connection_test(url: String, window: &mut Window, cx: &mut Context<Self>) {
+        window.push_notification(
+            Notification::info("Testing connection…")
+                .id::<TestConnectionNotice>()
+                .autohide(false),
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { db::test_connection(&url) })
+                .await;
+            this.update_in(cx, |_, window, cx| {
+                let note = match result {
+                    Ok(()) => {
+                        Notification::success("Connection succeeded").id::<TestConnectionNotice>()
+                    }
+                    Err(err) => Notification::error(format!(
+                        "Connection failed: {}",
+                        err.lines().next().unwrap_or_default()
+                    ))
+                    .id::<TestConnectionNotice>(),
+                };
+                window.push_notification(note, cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Connection ▸ Recent ▸ …: reconnect to a previously used string.

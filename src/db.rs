@@ -50,6 +50,15 @@ pub struct QueryOutcome {
     pub messages: Vec<String>,
 }
 
+/// Open (and immediately drop) a connection to check that the connection
+/// string points at a reachable server that accepts the credentials. Used
+/// by the New Connection dialog's Test Connection button.
+pub fn test_connection(conn_str: &str) -> Result<(), String> {
+    Client::connect(conn_str, NoTls)
+        .map(|_| ())
+        .map_err(|e| describe(&e))
+}
+
 /// Execute a SQL script (one or more statements) using the simple query protocol,
 /// which returns every value as text and supports multi-statement scripts.
 pub fn run_script(conn_str: &str, sql: &str) -> Result<QueryOutcome, String> {
