@@ -616,6 +616,22 @@ impl PgGuiApp {
             }),
         ];
 
+        // The window's close button funnels through the same unsaved-edits
+        // confirmation as cmd-q: veto the close and prompt instead.
+        let weak_this = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            weak_this
+                .update(cx, |this, cx| {
+                    if this.has_unsaved_tabs() {
+                        this.prompt_quit(window, cx);
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .unwrap_or(true)
+        });
+
         let mut this = Self {
             tabs,
             active_tab,
@@ -838,6 +854,63 @@ impl PgGuiApp {
                                         this.save_tab_then_close(ix, window, cx);
                                     })
                                     .ok();
+                                },
+                            )),
+                    ),
+            )
+        });
+    }
+
+    /// Quit, but confirm first when any tab has unsaved edits. cmd-q and
+    /// the window's close button both funnel here.
+    pub fn request_quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_unsaved_tabs() {
+            self.prompt_quit(window, cx);
+        } else {
+            cx.quit();
+        }
+    }
+
+    fn has_unsaved_tabs(&self) -> bool {
+        self.tabs.iter().any(|tab| tab.dirty)
+    }
+
+    /// Ask for confirmation before quitting with unsaved edits. The
+    /// buffers themselves survive a quit (they're restored from
+    /// config.json on the next launch); it's the tabs' files on disk that
+    /// would be left stale.
+    fn prompt_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let dirty: Vec<String> = (0..self.tabs.len())
+            .filter(|&ix| self.tabs[ix].dirty)
+            .map(|ix| self.tab_label(ix))
+            .collect();
+        let message = if let [name] = dirty.as_slice() {
+            format!("“{name}” has unsaved changes. Quit anyway?")
+        } else {
+            format!("{} tabs have unsaved changes. Quit anyway?", dirty.len())
+        };
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title("Unsaved changes").w(px(420.)).child(
+                v_flex()
+                    .gap_4()
+                    .pb_2()
+                    .child(div().text_sm().child(message.clone()))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(Button::new("cancel").label("Cancel").on_click(
+                                |_, window, cx| {
+                                    window.close_dialog(cx);
+                                },
+                            ))
+                            .child(Button::new("quit").danger().label("Quit").on_click(
+                                |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    cx.quit();
                                 },
                             )),
                     ),
@@ -2356,6 +2429,7 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::set_theme))
             .on_action(cx.listener(Self::show_help))
             .on_action(cx.listener(Self::open_github))
+            .on_action(cx.listener(Self::request_quit))
             .child(
                 // Editor over results, split by a draggable divider. The
                 // split position is persisted to the config on drag and

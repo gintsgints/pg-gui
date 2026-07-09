@@ -115,6 +115,10 @@ fn main() {
             KeyBinding::new(help_key, ShowHelp, None),
             KeyBinding::new("secondary-q", Quit, None),
         ]);
+        // Global handlers run only when nothing in the window handled the
+        // action, so this is the fallback for when the app view (which
+        // confirms unsaved edits first) isn't in the dispatch path, e.g.
+        // while a dialog holds focus.
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_window_closed(|cx, _window_id| {
             if cx.windows().is_empty() {
