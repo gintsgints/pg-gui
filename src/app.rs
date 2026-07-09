@@ -259,7 +259,9 @@ impl Render for ConnectionTest {
             ConnectionTest::Ok => ("Connection succeeded".into(), cx.theme().green),
             ConnectionTest::Failed(message) => (message.clone(), cx.theme().red),
         };
-        div().text_sm().text_color(color).child(text)
+        // `w_full` keeps a long failure message wrapping within the dialog
+        // instead of stretching it wider than the window.
+        div().w_full().text_sm().text_color(color).child(text)
     }
 }
 
@@ -1498,12 +1500,11 @@ impl PgGuiApp {
                             )
                             .child(Input::new(&preview).disabled(true)),
                     )
+                    .child(test_status)
                     .child(
                         h_flex()
                             .gap_2()
-                            .items_center()
-                            .child(test_status)
-                            .child(div().flex_1())
+                            .justify_end()
                             .child(Button::new("cancel").label("Cancel").on_click(
                                 |_, window, cx| {
                                     window.close_dialog(cx);
