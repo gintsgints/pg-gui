@@ -11,7 +11,7 @@ use gpui::{
     SharedString, Styled as _, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Root, Sizable as _, Theme, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Root, Sizable as _, Theme, ThemeMode, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, RopeExt as _, TabSize},
@@ -25,8 +25,8 @@ use gpui_component::{
 use crate::results::ResultsDelegate;
 use crate::{
     AiComplete, CloseTab, Connect, EditConnection, FormatScript, NewConnection, NewFile, NextTab,
-    OpenConfig, OpenFile, OpenGitHub, OpenSnippets, PrevTab, Quit, RunQuery, SaveFile, ShowHelp,
-    ToggleComment, ZoomIn, ZoomOut, ZoomReset, ai, config, db, lsp, snippets, statement,
+    OpenConfig, OpenFile, OpenGitHub, OpenSnippets, PrevTab, Quit, RunQuery, SaveFile, SetTheme,
+    ShowHelp, ToggleComment, ZoomIn, ZoomOut, ZoomReset, ai, config, db, lsp, snippets, statement,
 };
 
 /// The project's GitHub page, opened from the About application menu.
@@ -116,13 +116,25 @@ fn record_recent(recents: &mut Vec<config::RecentConnection>, url: &str, name: &
     recents.truncate(MAX_RECENT_CONNECTIONS);
 }
 
+/// One View ▸ Theme entry. Native menu items have no checked state
+/// reachable from here, so the selected theme is marked with a check-mark
+/// prefix and the menu is rebuilt whenever the selection changes.
+fn theme_menu_item(theme: config::ThemeSelection, current: config::ThemeSelection) -> MenuItem {
+    let label = if theme == current {
+        format!("✓ {}", theme.label())
+    } else {
+        theme.label().to_string()
+    };
+    MenuItem::action(label, SetTheme(theme))
+}
+
 /// The application menu bar. Every command lives here now that the toolbar
 /// is gone; the OS fills in each item's shortcut from the keybindings in
 /// `main.rs`. `recents` becomes the Connection ▸ Recent submenu, each entry
 /// carrying its (unmasked) connection string in a [`Connect`] action while
 /// showing the user-given name (or the masked connection string when
-/// unnamed).
-fn build_menus(recents: &[config::RecentConnection]) -> Vec<Menu> {
+/// unnamed). `theme` marks the selected View ▸ Theme entry.
+fn build_menus(recents: &[config::RecentConnection], theme: config::ThemeSelection) -> Vec<Menu> {
     let recent_items = if recents.is_empty() {
         vec![MenuItem::action("No recent connections", NoAction)]
     } else {
@@ -201,6 +213,16 @@ fn build_menus(recents: &[config::RecentConnection]) -> Vec<Menu> {
                 MenuItem::action("Zoom In", ZoomIn),
                 MenuItem::action("Zoom Out", ZoomOut),
                 MenuItem::action("Actual Size", ZoomReset),
+                MenuItem::separator(),
+                MenuItem::submenu(Menu {
+                    name: "Theme".into(),
+                    disabled: false,
+                    items: vec![
+                        theme_menu_item(config::ThemeSelection::Light, theme),
+                        theme_menu_item(config::ThemeSelection::Dark, theme),
+                        theme_menu_item(config::ThemeSelection::System, theme),
+                    ],
+                }),
             ],
         },
         Menu {
@@ -212,6 +234,16 @@ fn build_menus(recents: &[config::RecentConnection]) -> Vec<Menu> {
             ],
         },
     ]
+}
+
+/// Point the global theme at the configured selection: a fixed light/dark
+/// mode, or whatever the OS appearance currently is.
+fn apply_theme_selection(theme: config::ThemeSelection, window: &mut Window, cx: &mut App) {
+    match theme {
+        config::ThemeSelection::Light => Theme::change(ThemeMode::Light, Some(window), cx),
+        config::ThemeSelection::Dark => Theme::change(ThemeMode::Dark, Some(window), cx),
+        config::ThemeSelection::System => Theme::sync_system_appearance(Some(window), cx),
+    }
 }
 
 /// A file's last modification time, or `None` when it's missing or can't be
@@ -541,6 +573,10 @@ impl PgGuiApp {
             }
         }
 
+        // Set the theme before anything reads it: the editors pick up
+        // highlighting from it and the base font sizes below come from it.
+        apply_theme_selection(config.theme, window, cx);
+
         let tabs: Vec<EditorTab> = config
             .tabs
             .iter()
@@ -556,6 +592,7 @@ impl PgGuiApp {
             .editor
             .update(cx, |state, cx| state.focus(window, cx));
 
+        let weak_this = cx.weak_entity();
         let subscriptions = vec![
             // Flush any debounced (not yet written) changes on quit,
             // and stop the language server.
@@ -565,6 +602,17 @@ impl PgGuiApp {
                     client.shutdown();
                 }
                 async {}
+            }),
+            // Follow OS light/dark switches while the theme is "System".
+            window.observe_window_appearance(move |window, cx| {
+                weak_this
+                    .update(cx, |this, cx| {
+                        if this.config.theme == config::ThemeSelection::System {
+                            Theme::sync_system_appearance(Some(window), cx);
+                            this.apply_zoom(cx);
+                        }
+                    })
+                    .ok();
             }),
         ];
 
@@ -969,6 +1017,10 @@ impl PgGuiApp {
             self.apply_zoom(cx);
         }
 
+        if self.config.theme != old.theme {
+            self.apply_theme(window, cx);
+        }
+
         self.set_status("Reloaded config.json", cx);
         cx.notify();
     }
@@ -1326,7 +1378,10 @@ impl PgGuiApp {
     /// Rebuild the application menu bar, e.g. after the recent-connections
     /// list changes. `set_menus` is on `App`, reached through `Context`.
     fn refresh_menus(&self, cx: &mut Context<Self>) {
-        cx.set_menus(build_menus(&self.config.recent_connections));
+        cx.set_menus(build_menus(
+            &self.config.recent_connections,
+            self.config.theme,
+        ));
     }
 
     /// Connection ▸ New Connection…: open the connection form on a fresh
@@ -1852,6 +1907,24 @@ impl PgGuiApp {
         self.set_zoom(1.0, cx);
     }
 
+    pub fn set_theme(&mut self, action: &SetTheme, window: &mut Window, cx: &mut Context<Self>) {
+        if self.config.theme == action.0 {
+            return;
+        }
+        self.config.theme = action.0;
+        self.apply_theme(window, cx);
+        self.set_status(format!("Theme: {}", action.0.label()), cx);
+        self.schedule_save(cx);
+    }
+
+    /// Apply the configured theme, restore the zoomed font sizes it may
+    /// have reset, and re-mark the selected View ▸ Theme entry.
+    fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        apply_theme_selection(self.config.theme, window, cx);
+        self.apply_zoom(cx);
+        self.refresh_menus(cx);
+    }
+
     fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
         // Snap to the step grid so repeated f32 steps don't accumulate drift.
         self.config.zoom = (zoom / ZOOM_STEP).round() * ZOOM_STEP;
@@ -2280,6 +2353,7 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
+            .on_action(cx.listener(Self::set_theme))
             .on_action(cx.listener(Self::show_help))
             .on_action(cx.listener(Self::open_github))
             .child(

@@ -49,6 +49,12 @@ pub struct Connect {
     pub name: String,
 }
 
+/// Switch to a specific color theme; carried by the View ▸ Theme menu
+/// items.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = pg_gui, no_json)]
+pub struct SetTheme(pub config::ThemeSelection);
+
 fn main() {
     let app = gpui_platform::application();
 

@@ -111,6 +111,32 @@ pub struct Config {
     /// UI zoom factor (cmd +/-, cmd-0 to reset); 1.0 means 100%.
     #[serde(default = "default_zoom")]
     pub zoom: f32,
+    /// Color theme, selected from the View ▸ Theme menu.
+    #[serde(default)]
+    pub theme: ThemeSelection,
+}
+
+/// Which color theme the app uses; stored in config.json as `"light"`,
+/// `"dark"`, or `"system"`.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeSelection {
+    Light,
+    Dark,
+    /// Follow the OS appearance, switching live when it changes.
+    #[default]
+    System,
+}
+
+impl ThemeSelection {
+    /// The menu / status-message label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+            Self::System => "System",
+        }
+    }
 }
 
 /// Casing style used by the language-server formatter; stored in
@@ -140,6 +166,7 @@ impl Default for Config {
             keyword_case: CaseStyle::default(),
             constant_case: CaseStyle::default(),
             zoom: default_zoom(),
+            theme: ThemeSelection::default(),
         }
     }
 }
