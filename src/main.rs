@@ -11,7 +11,7 @@ use gpui::{
     Action, App, AppContext as _, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
     actions, px, size,
 };
-use gpui_component::Root;
+use gpui_component::{Root, Theme, ThemeRegistry};
 
 actions!(
     pg_gui,
@@ -55,11 +55,35 @@ pub struct Connect {
 #[action(namespace = pg_gui, no_json)]
 pub struct SetTheme(pub config::ThemeSelection);
 
+/// Register the vendored Catppuccin theme set (from gpui-component's
+/// themes gallery) and make Mocha the app's dark theme and Latte its
+/// light one; View ▸ Theme picks which of the two is active. The
+/// gpui-component defaults stay in place if the JSON ever fails to parse.
+fn load_catppuccin(cx: &mut App) {
+    if let Err(err) = ThemeRegistry::global_mut(cx)
+        .load_themes_from_str(include_str!("../themes/catppuccin.json"))
+    {
+        eprintln!("pg-gui: failed to load Catppuccin themes: {err}");
+        return;
+    }
+    let registry = ThemeRegistry::global(cx);
+    let light = registry.themes().get("Catppuccin Latte").cloned();
+    let dark = registry.themes().get("Catppuccin Mocha").cloned();
+    let theme = Theme::global_mut(cx);
+    if let Some(light) = light {
+        theme.light_theme = light;
+    }
+    if let Some(dark) = dark {
+        theme.dark_theme = dark;
+    }
+}
+
 fn main() {
     let app = gpui_platform::application();
 
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
+        load_catppuccin(cx);
 
         // `secondary` is cmd on macOS and ctrl elsewhere. cmd-h is taken by
         // "hide app" conventions outside macOS (and ctrl-h by backspace in
