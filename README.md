@@ -4,6 +4,8 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
 [GPUI](https://www.gpui.rs) (Zed's UI framework) and
 [gpui-component](https://github.com/longbridge/gpui-component).
 
+![pg-gui editing a SQL script](assets/screen1.png)
+
 ## Features
 
 - **SQL editor** with tree-sitter syntax highlighting, line numbers, and a monospace theme
