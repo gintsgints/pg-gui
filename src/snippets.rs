@@ -10,8 +10,16 @@
 //! Snippets are written to run unedited; where they filter on a name they
 //! use `ILIKE '%%'` (match everything), and on insert the caret is placed
 //! between the two `%` so typing narrows the filter.
+//!
+//! Snippets may also carry numbered tab stops — `$1`, `${2}` or
+//! `${3:placeholder}` — visited in numeric order with the tab key after
+//! insertion (`$0` last, per LSP convention). At each stop the marker is
+//! replaced by its placeholder text (empty for the bare forms), left
+//! selected so typing overwrites it. User `.sql` snippet files can use the
+//! same markers.
 
 use std::collections::HashSet;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -33,18 +41,102 @@ pub struct Snippet {
 
 impl Snippet {
     fn new(name: String, sql: String) -> Self {
-        let preview = sql
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty() && !line.starts_with("--"))
-            .unwrap_or_default()
-            .to_string();
+        let preview = strip_tab_stops(
+            sql.lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with("--"))
+                .unwrap_or_default(),
+        );
         Self {
             name: name.into(),
             sql: sql.into(),
             preview: preview.into(),
         }
     }
+}
+
+/// A `$n` / `${n}` / `${n:placeholder}` tab-stop marker found in snippet
+/// text.
+pub struct TabStop {
+    /// Byte range of the whole marker.
+    pub range: Range<usize>,
+    /// Text left (selected) in place of the marker; empty for the bare
+    /// forms.
+    pub placeholder: String,
+    number: u32,
+}
+
+/// All tab-stop markers in `text`, in text order. `$` not followed by a
+/// digit or `{n…}` is left alone, so Postgres dollar quoting (`$$…$$`)
+/// never reads as a marker.
+fn tab_stops(text: &str) -> Vec<TabStop> {
+    let mut stops = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = text[from..].find('$') {
+        let start = from + offset;
+        from = start + 1;
+        let rest = &text[start + 1..];
+        let (body, braced) = match rest.strip_prefix('{') {
+            Some(body) => (body, true),
+            None => (rest, false),
+        };
+        let digits = body
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(body.len());
+        let Ok(number) = body[..digits].parse::<u32>() else {
+            continue;
+        };
+        let (placeholder, len) = if braced {
+            match body[digits..].split_once('}') {
+                // ${n}
+                Some(("", _)) => (String::new(), 2 + digits + 1),
+                // ${n:placeholder}
+                Some((rest, _)) if rest.starts_with(':') => {
+                    (rest[1..].to_string(), 2 + digits + rest.len() + 1)
+                }
+                _ => continue,
+            }
+        } else {
+            (String::new(), 1 + digits)
+        };
+        stops.push(TabStop {
+            range: start..start + len,
+            placeholder,
+            number,
+        });
+        from = start + len;
+    }
+    stops
+}
+
+/// The next tab stop to visit: lowest number first (`$0` last, per LSP
+/// convention), leftmost on a tie.
+pub fn next_tab_stop(text: &str) -> Option<TabStop> {
+    tab_stops(text).into_iter().min_by_key(|stop| {
+        let order = if stop.number == 0 {
+            u32::MAX
+        } else {
+            stop.number
+        };
+        (order, stop.range.start)
+    })
+}
+
+pub fn has_tab_stops(text: &str) -> bool {
+    !tab_stops(text).is_empty()
+}
+
+/// Replace every marker with its placeholder text, for picker previews.
+fn strip_tab_stops(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for stop in tab_stops(text) {
+        out.push_str(&text[last..stop.range.start]);
+        out.push_str(&stop.placeholder);
+        last = stop.range.end;
+    }
+    out.push_str(&text[last..]);
+    out
 }
 
 pub struct Library {
@@ -135,14 +227,20 @@ impl PickerDelegate {
     }
 
     fn filter(&mut self, query: &str) {
+        // Every whitespace-separated word must appear in the name, so
+        // "new table" finds "New: table" despite the colon.
         let query = query.to_lowercase();
+        let words: Vec<&str> = query.split_whitespace().collect();
         self.filtered = self
             .sections
             .iter()
             .map(|(label, snippets)| {
                 let matched = snippets
                     .iter()
-                    .filter(|snippet| snippet.name.to_lowercase().contains(&query))
+                    .filter(|snippet| {
+                        let name = snippet.name.to_lowercase();
+                        words.iter().all(|word| name.contains(word))
+                    })
                     .cloned()
                     .collect::<Vec<_>>();
                 (label.clone(), matched)
@@ -243,8 +341,52 @@ impl ListDelegate for PickerDelegate {
 /// Curated queries shipped with the app. Category-prefixed names make the
 /// picker's search double as category navigation. Every query runs
 /// unedited: name filters default to `ILIKE '%%'` (match all), and
-/// destructive templates default to a no-row predicate.
+/// destructive templates default to a no-row predicate. The `New:` DDL
+/// templates use `${n:placeholder}` tab stops (see [`tab_stops`]), so every
+/// blank has a valid default and tab walks through them.
 const BUILTINS: &[(&str, &str)] = &[
+    (
+        "New: table",
+        "CREATE TABLE ${1:table_name} (\n    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n    ${2:name} ${3:text} NOT NULL,\n    created_at timestamptz NOT NULL DEFAULT now()\n);",
+    ),
+    (
+        "New: view",
+        "CREATE OR REPLACE VIEW ${1:view_name} AS\nSELECT ${2:*}\nFROM ${3:table_name};",
+    ),
+    (
+        "New: materialized view",
+        "CREATE MATERIALIZED VIEW ${1:view_name} AS\nSELECT ${2:*}\nFROM ${3:table_name}\nWITH DATA;",
+    ),
+    (
+        "New: index",
+        "CREATE INDEX ${1:index_name} ON ${2:table_name} (${3:column_name});",
+    ),
+    (
+        "New: function",
+        "CREATE OR REPLACE FUNCTION ${1:function_name}(${2})\nRETURNS ${3:integer}\nLANGUAGE plpgsql\nAS $$\nBEGIN\n    ${4:RETURN 0;}\nEND;\n$$;",
+    ),
+    (
+        "New: trigger",
+        "CREATE OR REPLACE FUNCTION ${1:trigger_fn}()\nRETURNS trigger\nLANGUAGE plpgsql\nAS $$\nBEGIN\n    -- Adjust NEW before it is written.\n    RETURN NEW;\nEND;\n$$;\n\nCREATE TRIGGER ${2:trigger_name}\n    BEFORE INSERT OR UPDATE ON ${3:table_name}\n    FOR EACH ROW\n    EXECUTE FUNCTION ${4:trigger_fn}();",
+    ),
+    (
+        "New: sequence",
+        "CREATE SEQUENCE ${1:sequence_name}\n    START WITH ${2:1}\n    INCREMENT BY ${3:1};",
+    ),
+    (
+        "New: enum type",
+        "CREATE TYPE ${1:type_name} AS ENUM (${2:'value1', 'value2'});",
+    ),
+    ("New: schema", "CREATE SCHEMA ${1:schema_name};"),
+    (
+        "New: role",
+        "CREATE ROLE ${1:role_name} WITH LOGIN PASSWORD '${2:changeme}';",
+    ),
+    ("New: database", "CREATE DATABASE ${1:database_name};"),
+    (
+        "New: extension",
+        "CREATE EXTENSION IF NOT EXISTS ${1:pg_stat_statements};",
+    ),
     (
         "Size: database",
         "SELECT current_database() AS database,\n       pg_size_pretty(pg_database_size(current_database())) AS size;",
@@ -386,3 +528,63 @@ const BUILTINS: &[(&str, &str)] = &[
         "SELECT grantee, table_schema, table_name, privilege_type\nFROM information_schema.table_privileges\nWHERE table_schema NOT IN ('pg_catalog', 'information_schema')\n  AND grantee ILIKE '%%'\nORDER BY grantee, table_schema, table_name;",
     ),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{BUILTINS, has_tab_stops, next_tab_stop, strip_tab_stops, tab_stops};
+
+    #[test]
+    fn parses_all_marker_forms() {
+        let text = "a $1 b ${2} c ${3:placeholder} d";
+        let stops = tab_stops(text);
+        assert_eq!(stops.len(), 3);
+        assert_eq!(&text[stops[0].range.clone()], "$1");
+        assert_eq!(stops[0].placeholder, "");
+        assert_eq!(&text[stops[1].range.clone()], "${2}");
+        assert_eq!(stops[1].placeholder, "");
+        assert_eq!(&text[stops[2].range.clone()], "${3:placeholder}");
+        assert_eq!(stops[2].placeholder, "placeholder");
+    }
+
+    #[test]
+    fn ignores_dollar_quoting_and_plain_dollars() {
+        assert!(!has_tab_stops("AS $$ BEGIN RETURN NEW; END; $$"));
+        assert!(!has_tab_stops("AS $body$ ... $body$"));
+        assert!(!has_tab_stops("price > 100$ and ${x} and ${1x}"));
+    }
+
+    #[test]
+    fn visits_lowest_number_first_and_zero_last() {
+        let stop = next_tab_stop("${2:b} then ${1:a}").unwrap();
+        assert_eq!(stop.placeholder, "a");
+        let stop = next_tab_stop("${0:last} then ${3:first}").unwrap();
+        assert_eq!(stop.placeholder, "first");
+    }
+
+    #[test]
+    fn leftmost_wins_a_number_tie() {
+        let text = "${1:left} then ${1:right}";
+        let stop = next_tab_stop(text).unwrap();
+        assert_eq!(stop.range.start, 0);
+    }
+
+    #[test]
+    fn strips_markers_to_placeholders() {
+        assert_eq!(
+            strip_tab_stops("CREATE TABLE ${1:table_name} ($2)"),
+            "CREATE TABLE table_name ()"
+        );
+    }
+
+    #[test]
+    fn new_templates_have_stops_and_valid_defaults() {
+        for (name, sql) in BUILTINS.iter().filter(|(n, _)| n.starts_with("New:")) {
+            assert!(has_tab_stops(sql), "{name} has no tab stops");
+            // Substituting every placeholder must leave no marker behind.
+            assert!(
+                !has_tab_stops(&strip_tab_stops(sql)),
+                "{name} leaves a marker after substitution"
+            );
+        }
+    }
+}

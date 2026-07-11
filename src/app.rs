@@ -6,15 +6,17 @@ use std::time::{Duration, SystemTime};
 use futures::StreamExt as _;
 use gpui::Subscription;
 use gpui::{
-    App, AppContext as _, Context, Entity, EntityInputHandler as _, Hsla, InteractiveElement as _,
-    IntoElement, Menu, MenuItem, NoAction, ParentElement as _, PathPromptOptions, Pixels, Render,
-    SharedString, Styled as _, Window, div, px,
+    App, AppContext as _, Context, Entity, EntityInputHandler as _, Focusable as _, Hsla,
+    InteractiveElement as _, IntoElement, Menu, MenuItem, NoAction, ParentElement as _,
+    PathPromptOptions, Pixels, Render, SharedString, Styled as _, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Root, Sizable as _, Theme, ThemeMode, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputEvent, InputState, RopeExt as _, TabSize},
+    input::{
+        Escape as InputEscape, IndentInline, Input, InputEvent, InputState, RopeExt as _, TabSize,
+    },
     list::{List, ListEvent, ListState},
     resizable::{ResizableState, resizable_panel, v_resizable},
     tab::{Tab, TabBar},
@@ -506,6 +508,11 @@ struct EditorTab {
     /// a plain reload would clobber one side or the other. Shown with a
     /// distinct tab glyph and enforced with a prompt before overwriting.
     diverged: bool,
+    /// Set after inserting a snippet with tab-stop markers: tab visits the
+    /// next `$n` marker in the buffer instead of indenting. Cleared by
+    /// escape or once no markers remain, so a stray `$1` in hand-written
+    /// SQL never hijacks the tab key.
+    snippet_mode: bool,
     _subscription: Subscription,
 }
 
@@ -694,6 +701,7 @@ impl PgGuiApp {
             dirty,
             saved,
             diverged,
+            snippet_mode: false,
             _subscription: subscription,
         }
     }
@@ -1311,15 +1319,17 @@ impl PgGuiApp {
         list.update(cx, |state, cx| state.focus(window, cx));
     }
 
-    /// Insert a snippet at the cursor as its own statement. When the
-    /// snippet contains a `%%` filter placeholder, the caret is placed
-    /// between the two `%` so typing narrows the filter.
+    /// Insert a snippet at the cursor as its own statement. A snippet with
+    /// `$n` tab stops enters snippet mode and jumps to the first stop;
+    /// otherwise, when it contains a `%%` filter placeholder, the caret is
+    /// placed between the two `%` so typing narrows the filter.
     fn insert_snippet(
         &mut self,
         snippet: &snippets::Snippet,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let has_stops = snippets::has_tab_stops(&snippet.sql);
         self.editor().update(cx, |state, cx| {
             let sql = snippet.sql.trim();
             let text = state.value();
@@ -1337,7 +1347,7 @@ impl PgGuiApp {
                 inserted.push('\n');
             }
 
-            let placeholder = inserted.find("%%");
+            let placeholder = inserted.find("%%").filter(|_| !has_stops);
             state.insert(inserted.clone(), window, cx);
             if let Some(pos) = placeholder {
                 let target = state.cursor() - inserted.len() + pos + 1;
@@ -1347,7 +1357,49 @@ impl PgGuiApp {
                 state.focus(window, cx);
             }
         });
+        if has_stops {
+            self.tabs[self.active_tab].snippet_mode = true;
+            self.next_snippet_stop(window, cx);
+        }
         self.set_status(format!("Inserted “{}”", snippet.name), cx);
+    }
+
+    /// Jump to the buffer's next `$n` tab stop: the marker is replaced by
+    /// its placeholder text, which is left selected so typing overwrites
+    /// it. Returns false when no marker remains.
+    fn next_snippet_stop(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.editor().update(cx, |state, cx| {
+            let Some(stop) = snippets::next_tab_stop(&state.value()) else {
+                return false;
+            };
+            state.set_selected_range(stop.range, cx);
+            state.replace(stop.placeholder.clone(), window, cx);
+            let end = state.cursor();
+            state.set_selected_range(end - stop.placeholder.len()..end, cx);
+            state.focus(window, cx);
+            true
+        })
+    }
+
+    /// Capture-phase tab handler: while the active tab is in snippet mode
+    /// (and the editor is focused), tab visits the next tab stop instead of
+    /// indenting. Once no stops remain the mode ends and tab indents again.
+    fn on_editor_tab(&mut self, _: &IndentInline, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tabs[self.active_tab].snippet_mode
+            || !self.editor().focus_handle(cx).is_focused(window)
+        {
+            return;
+        }
+        if self.next_snippet_stop(window, cx) {
+            cx.stop_propagation();
+        } else {
+            self.tabs[self.active_tab].snippet_mode = false;
+        }
+    }
+
+    /// Escape ends snippet mode (and still bubbles on to the editor).
+    fn on_editor_escape(&mut self, _: &InputEscape, _: &mut Window, _: &mut Context<Self>) {
+        self.tabs[self.active_tab].snippet_mode = false;
     }
 
     pub fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
@@ -2408,6 +2460,10 @@ impl Render for PgGuiApp {
             .relative()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            // Capture-phase, so they run before the editor's own handlers
+            // and can service snippet tab stops.
+            .capture_action(cx.listener(Self::on_editor_tab))
+            .capture_action(cx.listener(Self::on_editor_escape))
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::ai_complete))
             .on_action(cx.listener(Self::new_connection))

@@ -26,8 +26,11 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
   each open script in its own editor tab; a tab with unsaved edits is marked
   with a `•` and prompts to save before it's closed (and before quitting),
   and an open script that changes on disk offers to reload
-- **Snippets** (`cmd-p`): a searchable picker of built-in queries, extendable
-  with your own `.sql` files in the config directory's `snippets/` folder
+- **Snippets** (`cmd-p`): a searchable picker of built-in queries — including
+  `New:` templates for tables, views, triggers, sequences and more — extendable
+  with your own `.sql` files in the config directory's `snippets/` folder.
+  Snippets can carry numbered tab stops (`$1`, `${2:placeholder}`); after
+  inserting, `tab` visits each stop in order with its placeholder selected
 - **Themes**: Catppuccin Mocha (dark) and Latte (light), switchable from
   View ▸ Theme (light / dark / follow the system)
 - **AI completion** (optional): completes the SQL at the cursor using the Claude API
