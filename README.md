@@ -19,6 +19,11 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
   selected so you can see what ran). Multi-statement selections are supported
   via the simple query protocol, and the last result set is shown in a
   virtualized table (handles large result sets)
+- **Export results** to a file (Connection ▸ Export as CSV… / Export as
+  INSERT…): re-runs the selection or the statement at the cursor and writes
+  every row — CSV is produced server-side via `COPY (…) TO STDOUT` so the
+  server does the quoting, INSERT generates a runnable SQL script. The save
+  dialog suggests `<table>_<date>` from the query's `FROM` table
 - **Connection manager**: create and edit connections in a per-field dialog
   with an inline Test Connection check, give them names, and reconnect from
   the Connection ▸ Recent menu
@@ -126,6 +131,7 @@ or `F1` (Linux) in the app to see this list in a dialog. On Linux, `cmd` is
 - `src/config.rs` — `config.json` load/save (connections, tabs, options)
 - `src/db.rs` — Postgres execution (blocking `postgres` client on a background thread)
 - `src/lsp.rs` — embedded Postgres Language Server (completions, hover, diagnostics, formatting)
+- `src/export.rs` — rendering results for export (CSV via `COPY`, INSERT scripts)
 - `src/results.rs` — table delegate rendering the result set
 - `src/statement.rs` — locating the SQL statement under the cursor
 - `src/snippets.rs` — built-in and user snippet library
