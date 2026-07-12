@@ -12,6 +12,8 @@ osx_minimum_system_version = "11.0"
 
 [dependencies]
 anyhow = "1"
+# Already in the tree via gpui; used for the date in export file names.
+chrono = "0.4"
 dirs = "6"
 futures = "0.3"
 # gpui-component's tree-sitter-0.26 line lives only on git `main` (0.5.2), which

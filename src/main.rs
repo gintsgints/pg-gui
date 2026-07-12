@@ -2,6 +2,7 @@ mod ai;
 mod app;
 mod config;
 mod db;
+mod export;
 mod lsp;
 mod results;
 mod snippets;
@@ -17,6 +18,8 @@ actions!(
     pg_gui,
     [
         RunQuery,
+        ExportCsv,
+        ExportInserts,
         AiComplete,
         NewFile,
         CloseTab,

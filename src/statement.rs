@@ -4,8 +4,9 @@ use std::ops::Range;
 
 /// Byte ranges of the top-level statements in `text`: split on semicolons
 /// that sit outside strings, comments, and dollar-quoted blocks, then
-/// trimmed of surrounding whitespace. Empty segments are dropped.
-fn ranges(text: &str) -> Vec<Range<usize>> {
+/// trimmed of surrounding whitespace. Empty segments are dropped. Also
+/// used by `export` to reject multi-statement selections.
+pub fn ranges(text: &str) -> Vec<Range<usize>> {
     let bytes = text.as_bytes();
     let mut ranges = Vec::new();
     let mut start = 0;

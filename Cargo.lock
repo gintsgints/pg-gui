@@ -5183,6 +5183,7 @@ name = "pg-gui"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs 6.0.0",
  "futures",
  "gpui",

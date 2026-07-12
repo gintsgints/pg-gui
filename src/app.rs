@@ -26,9 +26,10 @@ use gpui_component::{
 
 use crate::results::ResultsDelegate;
 use crate::{
-    AiComplete, CloseTab, Connect, EditConnection, FormatScript, NewConnection, NewFile, NextTab,
-    OpenConfig, OpenFile, OpenGitHub, OpenSnippets, PrevTab, Quit, RunQuery, SaveFile, SetTheme,
-    ShowHelp, ToggleComment, ZoomIn, ZoomOut, ZoomReset, ai, config, db, lsp, snippets, statement,
+    AiComplete, CloseTab, Connect, EditConnection, ExportCsv, ExportInserts, FormatScript,
+    NewConnection, NewFile, NextTab, OpenConfig, OpenFile, OpenGitHub, OpenSnippets, PrevTab, Quit,
+    RunQuery, SaveFile, SetTheme, ShowHelp, ToggleComment, ZoomIn, ZoomOut, ZoomReset, ai, config,
+    db, export, lsp, snippets, statement,
 };
 
 /// The project's GitHub page, opened from the About application menu.
@@ -37,6 +38,14 @@ const REPO_URL: &str = "https://github.com/gintsgints/pg-gui";
 const ZOOM_STEP: f32 = 0.1;
 const ZOOM_MIN: f32 = 0.5;
 const ZOOM_MAX: f32 = 2.0;
+
+/// Which export the Connection ▸ Export menu items requested; maps onto
+/// `db::export_csv` / `db::export_inserts`.
+#[derive(Clone, Copy)]
+enum ExportFormat {
+    Csv,
+    Inserts,
+}
 
 /// Every command with its keybinding(s), shown in the help dialog
 /// (cmd-h on macOS, F1 elsewhere). Must mirror the bindings in main.rs.
@@ -136,7 +145,7 @@ fn theme_menu_item(theme: config::ThemeSelection, current: config::ThemeSelectio
 /// carrying its (unmasked) connection string in a [`Connect`] action while
 /// showing the user-given name (or the masked connection string when
 /// unnamed). `theme` marks the selected View ▸ Theme entry.
-fn build_menus(recents: &[config::RecentConnection], theme: config::ThemeSelection) -> Vec<Menu> {
+fn connection_menu(recents: &[config::RecentConnection]) -> Menu {
     let recent_items = if recents.is_empty() {
         vec![MenuItem::action("No recent connections", NoAction)]
     } else {
@@ -159,6 +168,27 @@ fn build_menus(recents: &[config::RecentConnection], theme: config::ThemeSelecti
             .collect()
     };
 
+    Menu {
+        name: "Connection".into(),
+        disabled: false,
+        items: vec![
+            MenuItem::action("New Connection…", NewConnection),
+            MenuItem::action("Edit Connection…", EditConnection),
+            MenuItem::submenu(Menu {
+                name: "Recent".into(),
+                disabled: false,
+                items: recent_items,
+            }),
+            MenuItem::separator(),
+            MenuItem::action("Run Query", RunQuery),
+            MenuItem::separator(),
+            MenuItem::action("Export as CSV…", ExportCsv),
+            MenuItem::action("Export as INSERT…", ExportInserts),
+        ],
+    }
+}
+
+fn build_menus(recents: &[config::RecentConnection], theme: config::ThemeSelection) -> Vec<Menu> {
     vec![
         Menu {
             name: "pg-gui".into(),
@@ -169,21 +199,7 @@ fn build_menus(recents: &[config::RecentConnection], theme: config::ThemeSelecti
                 MenuItem::action("Quit", Quit),
             ],
         },
-        Menu {
-            name: "Connection".into(),
-            disabled: false,
-            items: vec![
-                MenuItem::action("New Connection…", NewConnection),
-                MenuItem::action("Edit Connection…", EditConnection),
-                MenuItem::submenu(Menu {
-                    name: "Recent".into(),
-                    disabled: false,
-                    items: recent_items,
-                }),
-                MenuItem::separator(),
-                MenuItem::action("Run Query", RunQuery),
-            ],
-        },
+        connection_menu(recents),
         Menu {
             name: "File".into(),
             disabled: false,
@@ -1430,6 +1446,36 @@ impl PgGuiApp {
         self.tabs[self.active_tab].snippet_mode = false;
     }
 
+    /// The SQL an action should operate on, with a scope label for status
+    /// messages: the selected block when there is a selection, otherwise
+    /// the statement the cursor is on (or, when the cursor sits after a
+    /// statement, the one to its left), which gets selected so it's clear
+    /// which one was used.
+    fn sql_under_cursor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(String, &'static str)> {
+        let selection = self.editor().update(cx, |state, cx| {
+            state
+                .selected_text_range(false, window, cx)
+                .filter(|sel| !sel.range.is_empty())
+                .and_then(|sel| state.text_for_range(sel.range, &mut None, window, cx))
+                .filter(|text| !text.trim().is_empty())
+        });
+        if let Some(sql) = selection {
+            return Some((sql, "selection"));
+        }
+        let sql = self.editor().update(cx, |state, cx| {
+            let text = state.value();
+            let range = statement::at(&text, state.cursor())?;
+            let sql = text[range.clone()].to_string();
+            state.set_selected_range(range, cx);
+            Some(sql)
+        })?;
+        Some((sql, "statement"))
+    }
+
     pub fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
         if self.running {
             return;
@@ -1438,35 +1484,10 @@ impl PgGuiApp {
         // holds the real connection string.
         let conn = self.config.connection_string.clone();
 
-        // Run the selected block when there is a selection, otherwise the
-        // statement the cursor is on (or, when the cursor sits after a
-        // statement, the one to its left).
-        let selection = self.editor().update(cx, |state, cx| {
-            state
-                .selected_text_range(false, window, cx)
-                .filter(|sel| !sel.range.is_empty())
-                .and_then(|sel| state.text_for_range(sel.range, &mut None, window, cx))
-                .filter(|text| !text.trim().is_empty())
-        });
-        let (sql, scope) = if let Some(sql) = selection {
-            (sql, "selection")
-        } else {
-            // Select the statement in the editor so it's clear which one ran.
-            let sql = self.editor().update(cx, |state, cx| {
-                let text = state.value();
-                let Some(range) = statement::at(&text, state.cursor()) else {
-                    return String::new();
-                };
-                let sql = text[range.clone()].to_string();
-                state.set_selected_range(range, cx);
-                sql
-            });
-            (sql, "statement")
-        };
-        if sql.trim().is_empty() {
+        let Some((sql, scope)) = self.sql_under_cursor(window, cx) else {
             self.set_status("Nothing to run", cx);
             return;
-        }
+        };
 
         self.running = true;
         self.set_status(format!("Running {scope}…"), cx);
@@ -1502,6 +1523,82 @@ impl PgGuiApp {
                         });
                         this.show_query_error(&err, window, cx);
                     }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn export_csv(&mut self, _: &ExportCsv, window: &mut Window, cx: &mut Context<Self>) {
+        self.export_results(ExportFormat::Csv, window, cx);
+    }
+
+    fn export_inserts(&mut self, _: &ExportInserts, window: &mut Window, cx: &mut Context<Self>) {
+        self.export_results(ExportFormat::Inserts, window, cx);
+    }
+
+    /// Prompt for a destination file, then re-run the selection or the
+    /// statement at the cursor in the background and stream its result
+    /// there — CSV via server-side `COPY TO STDOUT`, or as generated
+    /// INSERT statements.
+    fn export_results(
+        &mut self,
+        format: ExportFormat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.running {
+            return;
+        }
+        let conn = self.config.connection_string.clone();
+        let Some((sql, scope)) = self.sql_under_cursor(window, cx) else {
+            self.set_status("Nothing to export", cx);
+            return;
+        };
+
+        let default_name = export::default_file_name(
+            &sql,
+            match format {
+                ExportFormat::Csv => "csv",
+                ExportFormat::Inserts => "sql",
+            },
+        );
+        let dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let rx = cx.prompt_for_new_path(&dir, Some(&default_name));
+
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(path))) = rx.await else { return };
+            this.update(cx, |this, cx| {
+                this.running = true;
+                this.set_status(format!("Exporting {scope}…"), cx);
+            })
+            .ok();
+
+            let started = std::time::Instant::now();
+            let result = cx
+                .background_spawn({
+                    let path = path.clone();
+                    async move {
+                        match format {
+                            ExportFormat::Csv => db::export_csv(&conn, &sql, &path)
+                                .map(|bytes| format!("{bytes} byte(s)")),
+                            ExportFormat::Inserts => db::export_inserts(&conn, &sql, &path)
+                                .map(|rows| format!("{rows} row(s)")),
+                        }
+                    }
+                })
+                .await;
+            let elapsed = started.elapsed();
+
+            this.update_in(cx, |this, window, cx| {
+                this.running = false;
+                match result {
+                    Ok(detail) => this.set_status(
+                        format!("Exported {detail} to {} in {elapsed:.0?}", path.display()),
+                        cx,
+                    ),
+                    Err(err) => this.show_query_error(&err, window, cx),
                 }
             })
             .ok();
@@ -2493,6 +2590,8 @@ impl Render for PgGuiApp {
             .capture_action(cx.listener(Self::on_editor_tab))
             .capture_action(cx.listener(Self::on_editor_escape))
             .on_action(cx.listener(Self::run_query))
+            .on_action(cx.listener(Self::export_csv))
+            .on_action(cx.listener(Self::export_inserts))
             .on_action(cx.listener(Self::ai_complete))
             .on_action(cx.listener(Self::new_connection))
             .on_action(cx.listener(Self::edit_connection))
