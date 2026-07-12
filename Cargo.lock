@@ -209,7 +209,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -220,7 +220,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -719,7 +719,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -739,7 +739,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -1774,7 +1774,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1983,7 +1983,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4518,7 +4518,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5205,7 +5205,7 @@ dependencies = [
 [[package]]
 name = "pgls_analyse"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "enumflags2",
  "pgls_console",
@@ -5220,7 +5220,7 @@ dependencies = [
 [[package]]
 name = "pgls_analyser"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "pgls_analyse",
  "pgls_console",
@@ -5236,7 +5236,7 @@ dependencies = [
 [[package]]
 name = "pgls_completions"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "fuzzy-matcher",
  "pgls_schema_cache",
@@ -5252,7 +5252,7 @@ dependencies = [
 [[package]]
 name = "pgls_configuration"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "bpaf",
  "indexmap",
@@ -5274,7 +5274,7 @@ dependencies = [
 [[package]]
 name = "pgls_configuration_macros"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "proc-macro-error",
  "proc-macro2",
@@ -5285,7 +5285,7 @@ dependencies = [
 [[package]]
 name = "pgls_console"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "pgls_markup",
  "pgls_text_size",
@@ -5298,7 +5298,7 @@ dependencies = [
 [[package]]
 name = "pgls_diagnostics"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "backtrace",
  "bpaf",
@@ -5318,7 +5318,7 @@ dependencies = [
 [[package]]
 name = "pgls_diagnostics_categories"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "pgls_env",
  "quote",
@@ -5328,7 +5328,7 @@ dependencies = [
 [[package]]
 name = "pgls_diagnostics_macros"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "proc-macro-error",
  "proc-macro2",
@@ -5339,7 +5339,7 @@ dependencies = [
 [[package]]
 name = "pgls_env"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "pgls_console",
 ]
@@ -5347,7 +5347,7 @@ dependencies = [
 [[package]]
 name = "pgls_fs"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "crossbeam",
  "directories",
@@ -5365,7 +5365,7 @@ dependencies = [
 [[package]]
 name = "pgls_hover"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "humansize",
  "pgls_query",
@@ -5382,7 +5382,7 @@ dependencies = [
 [[package]]
 name = "pgls_lexer"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "pgls_diagnostics",
  "pgls_lexer_codegen",
@@ -5393,7 +5393,7 @@ dependencies = [
 [[package]]
 name = "pgls_lexer_codegen"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "anyhow",
  "convert_case 0.6.0",
@@ -5407,7 +5407,7 @@ dependencies = [
 [[package]]
 name = "pgls_markup"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "proc-macro-error",
  "proc-macro2",
@@ -5417,7 +5417,7 @@ dependencies = [
 [[package]]
 name = "pgls_matcher"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "pgls_console",
  "pgls_diagnostics",
@@ -5427,7 +5427,7 @@ dependencies = [
 [[package]]
 name = "pgls_pglinter"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "pgls_analyse",
  "pgls_diagnostics",
@@ -5443,7 +5443,7 @@ dependencies = [
 [[package]]
 name = "pgls_plpgsql_check"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "pgls_console",
  "pgls_diagnostics",
@@ -5461,7 +5461,7 @@ dependencies = [
 [[package]]
 name = "pgls_pretty_print"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "pgls_pretty_print_codegen",
  "pgls_query",
@@ -5471,7 +5471,7 @@ dependencies = [
 [[package]]
 name = "pgls_pretty_print_codegen"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "anyhow",
  "convert_case 0.6.0",
@@ -5485,7 +5485,7 @@ dependencies = [
 [[package]]
 name = "pgls_query"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "bindgen 0.72.1",
  "cc",
@@ -5501,7 +5501,7 @@ dependencies = [
 [[package]]
 name = "pgls_query_ext"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "pgls_diagnostics",
  "pgls_query",
@@ -5511,7 +5511,7 @@ dependencies = [
 [[package]]
 name = "pgls_query_macros"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "convert_case 0.6.0",
  "proc-macro2",
@@ -5524,7 +5524,7 @@ dependencies = [
 [[package]]
 name = "pgls_schema_cache"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "anyhow",
  "async-std",
@@ -5541,7 +5541,7 @@ dependencies = [
 [[package]]
 name = "pgls_splinter"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "pgls_analyse",
  "pgls_configuration",
@@ -5557,7 +5557,7 @@ dependencies = [
 [[package]]
 name = "pgls_statement_splitter"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "pgls_diagnostics",
  "pgls_lexer",
@@ -5569,7 +5569,7 @@ dependencies = [
 [[package]]
 name = "pgls_suppressions"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "pgls_analyse",
  "pgls_diagnostics",
@@ -5580,7 +5580,7 @@ dependencies = [
 [[package]]
 name = "pgls_text_edit"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "pgls_text_size",
  "serde",
@@ -5590,7 +5590,7 @@ dependencies = [
 [[package]]
 name = "pgls_text_size"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "serde",
 ]
@@ -5598,12 +5598,12 @@ dependencies = [
 [[package]]
 name = "pgls_tokenizer"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 
 [[package]]
 name = "pgls_treesitter"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "clap",
  "pgls_schema_cache",
@@ -5615,7 +5615,7 @@ dependencies = [
 [[package]]
 name = "pgls_treesitter_grammar"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -5625,7 +5625,7 @@ dependencies = [
 [[package]]
 name = "pgls_typecheck"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "globset",
  "itertools 0.14.0",
@@ -5647,7 +5647,7 @@ dependencies = [
 [[package]]
 name = "pgls_workspace"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "futures",
  "globset",
@@ -5695,7 +5695,7 @@ dependencies = [
 [[package]]
 name = "pgls_workspace_macros"
 version = "0.0.0"
-source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#c7533b71486d9249b9d08219047da75222b16269"
+source = "git+https://github.com/gintsgints/postgres-language-server?branch=bump_treesitter#32c1f6e5f41fd1043c0e8d3ca3f217d56402c3c1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6155,8 +6155,8 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.11.0",
+ "heck 0.4.1",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "once_cell",
@@ -6176,7 +6176,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -6331,7 +6331,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.4",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6891,7 +6891,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6904,7 +6904,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7485,7 +7485,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7734,7 +7734,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8101,7 +8101,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8930,7 +8930,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9753,7 +9753,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10129,15 +10129,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.60.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2f500e4d28234f72040990ec9d39e3a6b950f9f22d3dba18416c35882612bcb"
-dependencies = [
- "windows-targets 0.53.5",
 ]
 
 [[package]]
