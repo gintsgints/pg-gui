@@ -17,6 +17,10 @@
 //! replaced by its placeholder text (empty for the bare forms), left
 //! selected so typing overwrites it. User `.sql` snippet files can use the
 //! same markers.
+//!
+//! Besides the cmd-p picker, snippets surface in the editor's completion
+//! menu: typing words of a snippet's name or the leading words of its SQL
+//! suggests it (see [`suggestions`]).
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -64,6 +68,10 @@ pub struct TabStop {
     /// forms.
     pub placeholder: String,
     number: u32,
+    /// Whether the marker is one of the braced forms. Only those are
+    /// serviced outside snippet mode, so a hand-written Postgres
+    /// parameter (`$1`) never captures the tab key.
+    braced: bool,
 }
 
 /// All tab-stop markers in `text`, in text order. `$` not followed by a
@@ -103,6 +111,7 @@ fn tab_stops(text: &str) -> Vec<TabStop> {
             range: start..start + len,
             placeholder,
             number,
+            braced,
         });
         from = start + len;
     }
@@ -110,20 +119,120 @@ fn tab_stops(text: &str) -> Vec<TabStop> {
 }
 
 /// The next tab stop to visit: lowest number first (`$0` last, per LSP
-/// convention), leftmost on a tie.
-pub fn next_tab_stop(text: &str) -> Option<TabStop> {
-    tab_stops(text).into_iter().min_by_key(|stop| {
-        let order = if stop.number == 0 {
-            u32::MAX
-        } else {
-            stop.number
-        };
-        (order, stop.range.start)
-    })
+/// convention), leftmost on a tie. With `braced_only`, bare `$n` markers
+/// are ignored.
+pub fn next_tab_stop(text: &str, braced_only: bool) -> Option<TabStop> {
+    tab_stops(text)
+        .into_iter()
+        .filter(|stop| stop.braced || !braced_only)
+        .min_by_key(|stop| {
+            let order = if stop.number == 0 {
+                u32::MAX
+            } else {
+                stop.number
+            };
+            (order, stop.range.start)
+        })
 }
 
 pub fn has_tab_stops(text: &str) -> bool {
     !tab_stops(text).is_empty()
+}
+
+/// A snippet whose name or leading SQL matches the words typed before
+/// the cursor, offered by the editor's completion menu.
+pub struct Suggestion {
+    pub name: SharedString,
+    pub sql: SharedString,
+    /// How many bytes immediately before the cursor the completion
+    /// replaces: the matched words plus any trailing whitespace.
+    pub replace_len: usize,
+}
+
+/// Snippets matching the last one or two words of `line` (the text before
+/// the cursor). A snippet matches when each typed word prefixes a word of
+/// its name ("new tab" → "New: table") or when the typed words are the
+/// leading words of its SQL ("create seq" → the sequence template). A
+/// two-word match replaces both words, otherwise just the last one.
+/// Queries under two characters suggest nothing.
+pub fn suggestions(line: &str) -> Vec<Suggestion> {
+    library_suggestions(&load(), line)
+}
+
+fn library_suggestions(library: &Library, line: &str) -> Vec<Suggestion> {
+    let trimmed = line.trim_end();
+    let Some(last_start) = last_word_start(trimmed) else {
+        return Vec::new();
+    };
+    let last = trimmed[last_start..].to_lowercase();
+    let earlier = trimmed[..last_start].trim_end();
+    let prev = last_word_start(earlier).map(|start| (start, earlier[start..].to_lowercase()));
+
+    let mut out = Vec::new();
+    for snippet in library.user.iter().chain(&library.builtin) {
+        let name = snippet.name.to_lowercase();
+        let sql = snippet.sql.to_lowercase();
+        let matches = |words: &[&str]| name_matches(&name, words) || sql_matches(&sql, words);
+        let start = if let Some((start, prev_word)) = &prev
+            && matches(&[prev_word, &last])
+        {
+            Some(*start)
+        } else if matches(&[&last]) {
+            Some(last_start)
+        } else {
+            None
+        };
+        let Some(start) = start else { continue };
+        if trimmed.len() - start < 2 {
+            continue;
+        }
+        out.push(Suggestion {
+            name: snippet.name.clone(),
+            sql: snippet.sql.clone(),
+            replace_len: line.len() - start,
+        });
+    }
+    // Two-word matches are more specific than last-word-only ones; rank
+    // them first.
+    out.sort_by_key(|suggestion| std::cmp::Reverse(suggestion.replace_len));
+    out
+}
+
+/// Byte offset where the last whitespace-separated word of `text` starts;
+/// `None` when there is none. `text` must not end with whitespace.
+fn last_word_start(text: &str) -> Option<usize> {
+    if text.is_empty() {
+        return None;
+    }
+    let start = text.rfind(char::is_whitespace).map_or(0, |ws| {
+        ws + text[ws..].chars().next().map_or(1, char::len_utf8)
+    });
+    Some(start)
+}
+
+/// Every typed word is a prefix of some word of the snippet name.
+fn name_matches(name_lower: &str, words: &[&str]) -> bool {
+    words.iter().all(|word| {
+        !word.is_empty()
+            && name_lower
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|part| part.starts_with(word))
+    })
+}
+
+/// The typed words are the snippet's leading SQL words, the last possibly
+/// partial ("create seq" matches "CREATE SEQUENCE …").
+fn sql_matches(sql_lower: &str, words: &[&str]) -> bool {
+    let mut sql_words = sql_lower.split_whitespace();
+    words.iter().enumerate().all(|(ix, word)| {
+        sql_words.next().is_some_and(|sql_word| {
+            if ix + 1 == words.len() {
+                !word.is_empty() && sql_word.starts_with(word)
+            } else {
+                sql_word == *word
+            }
+        })
+    })
 }
 
 /// Replace every marker with its placeholder text, for picker previews.
@@ -555,17 +664,25 @@ mod tests {
 
     #[test]
     fn visits_lowest_number_first_and_zero_last() {
-        let stop = next_tab_stop("${2:b} then ${1:a}").unwrap();
+        let stop = next_tab_stop("${2:b} then ${1:a}", false).unwrap();
         assert_eq!(stop.placeholder, "a");
-        let stop = next_tab_stop("${0:last} then ${3:first}").unwrap();
+        let stop = next_tab_stop("${0:last} then ${3:first}", false).unwrap();
         assert_eq!(stop.placeholder, "first");
     }
 
     #[test]
     fn leftmost_wins_a_number_tie() {
         let text = "${1:left} then ${1:right}";
-        let stop = next_tab_stop(text).unwrap();
+        let stop = next_tab_stop(text, false).unwrap();
         assert_eq!(stop.range.start, 0);
+    }
+
+    #[test]
+    fn braced_only_skips_bare_markers() {
+        let text = "WHERE id = $1 AND name = ${2:name}";
+        let stop = next_tab_stop(text, true).unwrap();
+        assert_eq!(stop.placeholder, "name");
+        assert!(next_tab_stop("WHERE id = $1", true).is_none());
     }
 
     #[test]
@@ -574,6 +691,62 @@ mod tests {
             strip_tab_stops("CREATE TABLE ${1:table_name} ($2)"),
             "CREATE TABLE table_name ()"
         );
+    }
+
+    fn test_library() -> super::Library {
+        let builtin = super::BUILTINS
+            .iter()
+            .map(|(name, sql)| {
+                std::rc::Rc::new(super::Snippet::new((*name).to_string(), (*sql).to_string()))
+            })
+            .collect();
+        super::Library {
+            user: Vec::new(),
+            builtin,
+        }
+    }
+
+    #[test]
+    fn suggests_by_name_words() {
+        let library = test_library();
+        let found = super::library_suggestions(&library, "SELECT 1; new tab");
+        // The two-word match ranks first; single-word "tab" matches
+        // (e.g. "Schema: tables…") may follow.
+        assert_eq!(found[0].name.as_ref(), "New: table");
+        assert_eq!(found[0].replace_len, "new tab".len());
+    }
+
+    #[test]
+    fn suggests_by_leading_sql_words() {
+        let library = test_library();
+        let found = super::library_suggestions(&library, "create seq");
+        assert_eq!(found[0].name.as_ref(), "New: sequence");
+        assert_eq!(found[0].replace_len, "create seq".len());
+    }
+
+    #[test]
+    fn falls_back_to_the_last_word_alone() {
+        let library = test_library();
+        let found = super::library_suggestions(&library, "SELECT * FROM new");
+        assert!(!found.is_empty());
+        assert!(found.iter().all(|s| s.replace_len == "new".len()));
+    }
+
+    #[test]
+    fn replaces_trailing_whitespace_too() {
+        let library = test_library();
+        let found = super::library_suggestions(&library, "new  ");
+        assert!(!found.is_empty());
+        assert_eq!(found[0].replace_len, "new  ".len());
+    }
+
+    #[test]
+    fn short_or_unmatched_queries_suggest_nothing() {
+        let library = test_library();
+        assert!(super::library_suggestions(&library, "n").is_empty());
+        assert!(super::library_suggestions(&library, "banana").is_empty());
+        assert!(super::library_suggestions(&library, "   ").is_empty());
+        assert!(super::library_suggestions(&library, "").is_empty());
     }
 
     #[test]

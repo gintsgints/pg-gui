@@ -30,7 +30,9 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
   `New:` templates for tables, views, triggers, sequences and more — extendable
   with your own `.sql` files in the config directory's `snippets/` folder.
   Snippets can carry numbered tab stops (`$1`, `${2:placeholder}`); after
-  inserting, `tab` visits each stop in order with its placeholder selected
+  inserting, `tab` visits each stop in order with its placeholder selected.
+  Snippets also appear in the editor's completion menu: type words of the
+  name or the SQL's leading words ("create seq…") and accept the suggestion
 - **Themes**: Catppuccin Mocha (dark) and Latte (light), switchable from
   View ▸ Theme (light / dark / follow the system)
 - **AI completion** (optional): completes the SQL at the cursor using the Claude API

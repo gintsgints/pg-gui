@@ -47,6 +47,22 @@ use crate::config::CaseStyle;
 /// (potentially database-touching) diagnostics analysis.
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// Run a workspace call, containing any panic inside the `pgls_*` crates.
+/// The language server panics on some inputs (e.g. its tree-sitter scope
+/// tracker), and a panic unwinding into the background executor's
+/// `extern "C"` dispatch trampoline aborts the whole app — a language
+/// feature must never take the editor down with it.
+fn contain_panic<T>(f: impl FnOnce() -> T) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        anyhow!("language server panicked: {message}")
+    })
+}
+
 /// Diagnostics computed for the editor document.
 pub type DiagnosticsReceiver = mpsc::UnboundedReceiver<Vec<lsp_types::Diagnostic>>;
 
@@ -79,8 +95,17 @@ impl Client {
     /// # Errors
     ///
     /// Fails when the workspace directory cannot be prepared or the workspace
-    /// rejects the initial configuration or document.
+    /// rejects the initial configuration or document (or panics doing so).
     pub fn start(
+        connection_string: &str,
+        text: &str,
+        keyword_case: CaseStyle,
+        constant_case: CaseStyle,
+    ) -> Result<(Self, DiagnosticsReceiver)> {
+        contain_panic(|| Self::start_inner(connection_string, text, keyword_case, constant_case))?
+    }
+
+    fn start_inner(
         connection_string: &str,
         text: &str,
         keyword_case: CaseStyle,
@@ -157,14 +182,17 @@ impl Client {
     /// schedule a fresh diagnostics run.
     pub fn document_changed(&self, text: String) {
         let version = self.inner.version.fetch_add(1, Ordering::Relaxed) + 1;
-        self.inner
-            .workspace
-            .change_file(ChangeFileParams {
-                path: self.inner.path.clone(),
-                version,
-                content: text,
-            })
-            .ok();
+        contain_panic(|| {
+            self.inner
+                .workspace
+                .change_file(ChangeFileParams {
+                    path: self.inner.path.clone(),
+                    version,
+                    content: text,
+                })
+                .ok();
+        })
+        .ok();
         self.inner.diag_signal.send(()).ok();
     }
 
@@ -193,12 +221,15 @@ impl Client {
     /// Close the workspace document. The background worker stops once the last
     /// [`Client`] clone is dropped.
     pub fn shutdown(&self) {
-        self.inner
-            .workspace
-            .close_file(CloseFileParams {
-                path: self.inner.path.clone(),
-            })
-            .ok();
+        contain_panic(|| {
+            self.inner
+                .workspace
+                .close_file(CloseFileParams {
+                    path: self.inner.path.clone(),
+                })
+                .ok();
+        })
+        .ok();
     }
 }
 
@@ -220,7 +251,9 @@ fn diagnostics_worker(
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
-        let diagnostics = pull_diagnostics(workspace, path);
+        // A contained panic publishes nothing and keeps the worker alive
+        // for the next edit.
+        let diagnostics = contain_panic(|| pull_diagnostics(workspace, path)).unwrap_or_default();
         if diagnostics_tx.unbounded_send(diagnostics).is_err() {
             return;
         }
@@ -283,12 +316,13 @@ fn format_document(
     path: &PgLSPath,
     text: &str,
 ) -> Result<Option<String>> {
-    let result = workspace
-        .pull_file_formatting(PullFileFormattingParams {
+    let result = contain_panic(|| {
+        workspace.pull_file_formatting(PullFileFormattingParams {
             path: path.clone(),
             range: None,
         })
-        .map_err(|err| anyhow!("formatting failed: {err}"))?;
+    })?
+    .map_err(|err| anyhow!("formatting failed: {err}"))?;
     let formatted = result.formatted;
     // Formatting is disabled or the document did not parse: never blank the
     // buffer with an empty result.
@@ -326,19 +360,26 @@ impl CompletionProvider for Provider {
         let workspace = self.client.inner.workspace.clone();
         let path = self.client.inner.path.clone();
         let rope = text.clone();
+        let snippets = snippet_items(text, offset);
         cx.background_spawn(async move {
-            let result = match workspace.get_completions(GetCompletionsParams { path, position }) {
+            let result = contain_panic(|| {
+                workspace.get_completions(GetCompletionsParams { path, position })
+            })?;
+            let result = match result {
                 Ok(result) => result,
-                // The database is unreachable; offer nothing rather than error.
+                // The database is unreachable; offer the snippets alone
+                // rather than error.
                 Err(WorkspaceError::DatabaseConnectionError(_)) => {
-                    return Ok(CompletionResponse::Array(Vec::new()));
+                    return Ok(CompletionResponse::Array(snippets));
                 }
                 Err(err) => return Err(anyhow!("completion request failed: {err}")),
             };
-            let mut items: Vec<lsp_types::CompletionItem> = result
-                .into_iter()
-                .map(|item| completion_to_lsp(item, &rope))
-                .collect();
+            let mut items: Vec<lsp_types::CompletionItem> = snippets;
+            items.extend(
+                result
+                    .into_iter()
+                    .map(|item| completion_to_lsp(item, &rope)),
+            );
             clamp_filter_text(&mut items, &query);
             Ok(CompletionResponse::Array(items))
         })
@@ -350,13 +391,78 @@ impl CompletionProvider for Provider {
         new_text: &str,
         _: &mut Context<InputState>,
     ) -> bool {
-        // Word characters continue an existing completion; the rest are the
-        // trigger characters the server acts on.
-        new_text
-            .chars()
-            .next_back()
-            .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '.' | '"' | '(' | ' '))
+        is_trigger(new_text)
     }
+}
+
+/// Word characters continue an existing completion; the rest are the
+/// trigger characters the completion sources act on.
+fn is_trigger(new_text: &str) -> bool {
+    new_text
+        .chars()
+        .next_back()
+        .is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '.' | '"' | '(' | ' '))
+}
+
+/// Completion provider installed while the language server is offline:
+/// snippet suggestions only, so `New:` templates still complete without a
+/// database connection.
+pub struct SnippetCompletions;
+
+impl CompletionProvider for SnippetCompletions {
+    fn completions(
+        &self,
+        text: &Rope,
+        offset: usize,
+        trigger: CompletionContext,
+        _: &mut Window,
+        _: &mut Context<InputState>,
+    ) -> Task<Result<CompletionResponse>> {
+        let query = trigger.trigger_character.unwrap_or_default();
+        let mut items = snippet_items(text, offset);
+        clamp_filter_text(&mut items, &query);
+        Task::ready(Ok(CompletionResponse::Array(items)))
+    }
+
+    fn is_completion_trigger(
+        &self,
+        _offset: usize,
+        new_text: &str,
+        _: &mut Context<InputState>,
+    ) -> bool {
+        is_trigger(new_text)
+    }
+}
+
+/// Snippet suggestions for the words before the cursor (see
+/// [`snippets::suggestions`]), as completion items whose text edit
+/// replaces those words with the template. The `$n` markers land in the
+/// buffer verbatim; the app's tab handler then walks them.
+fn snippet_items(rope: &Rope, offset: usize) -> Vec<lsp_types::CompletionItem> {
+    let row = rope.offset_to_point(offset).row;
+    let line_start = rope.line_start_offset(row);
+    let line = rope.slice_line(row).to_string();
+    let before_cursor = &line[..offset - line_start];
+    crate::snippets::suggestions(before_cursor)
+        .into_iter()
+        .map(|suggestion| lsp_types::CompletionItem {
+            label: suggestion.name.to_string(),
+            kind: Some(lsp_types::CompletionItemKind::SNIPPET),
+            label_details: Some(CompletionItemLabelDetails {
+                description: Some("snippet".into()),
+                detail: None,
+            }),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                new_text: suggestion.sql.trim().to_string(),
+                range: Range {
+                    start: rope.offset_to_position(offset - suggestion.replace_len),
+                    end: rope.offset_to_position(offset),
+                },
+            })),
+            ..lsp_types::CompletionItem::default()
+        })
+        .collect()
 }
 
 impl HoverProvider for Provider {
@@ -371,7 +477,8 @@ impl HoverProvider for Provider {
         let workspace = self.client.inner.workspace.clone();
         let path = self.client.inner.path.clone();
         cx.background_spawn(async move {
-            let result = match workspace.on_hover(OnHoverParams { path, position }) {
+            let result = contain_panic(|| workspace.on_hover(OnHoverParams { path, position }))?;
+            let result = match result {
                 Ok(result) => result,
                 Err(WorkspaceError::DatabaseConnectionError(_)) => return Ok(None),
                 Err(err) => return Err(anyhow!("hover request failed: {err}")),
@@ -546,8 +653,9 @@ mod tests {
 
     use lsp_types::CompletionItem;
 
-    use super::{CaseStyle, Client, clamp_filter_text, to_text_size};
+    use super::{CaseStyle, Client, clamp_filter_text, contain_panic, to_text_size};
     use pgls_workspace::features::completions::GetCompletionsParams;
+    use pgls_workspace::features::on_hover::OnHoverParams;
 
     fn item(label: &str, filter_text: Option<&str>) -> CompletionItem {
         CompletionItem {
@@ -575,6 +683,61 @@ mod tests {
         assert_eq!(items[0].filter_text.as_deref(), Some("h"));
         // An existing filter_text longer than the label is clamped too.
         assert_eq!(items[1].filter_text.as_deref(), Some("ab"));
+    }
+
+    /// Hovering a buffer holding snippet tab-stop markers must never take
+    /// the app down: `pgls_treesitter`'s scope tracker panics on some such
+    /// inputs (SIGABRT'd the app in the wild on 2026-07-12), and
+    /// [`contain_panic`] — used by every provider call — has to absorb it.
+    /// No database needed: hover fails soft when the DB is unreachable.
+    #[test]
+    fn hover_survives_snippet_tab_stop_markers() {
+        let text = "CREATE SEQUENCE ${1:sequence_name}\n    START WITH ${2:1}\n    INCREMENT BY ${3:1};invoice_seqCREATE SEQUENCE 100\n    START WITH 1\n    INCREMENT BY ${3:1};invoice_seqcreate table\n";
+        let (client, _diagnostics) = Client::start(
+            "postgres://nobody:nope@127.0.0.1:1/none",
+            text,
+            CaseStyle::Lower,
+            CaseStyle::Lower,
+        )
+        .expect("client starts without a database");
+
+        for position in 0..text.len() {
+            // Contained panics come back as errors; only an uncontained
+            // panic (or abort) can fail this test.
+            let _ = contain_panic(|| {
+                client.inner.workspace.on_hover(OnHoverParams {
+                    path: client.inner.path.clone(),
+                    position: to_text_size(position),
+                })
+            });
+        }
+        client.shutdown();
+    }
+
+    /// The same probe with a real database: the workspace only builds the
+    /// tree-sitter hover context (where the panic lives) after loading the
+    /// schema cache, so the panic path needs a reachable Postgres.
+    #[test]
+    #[ignore = "requires the docker Postgres on localhost:5433"]
+    fn embedded_server_hover_survives_snippet_markers() {
+        let text = "CREATE SEQUENCE ${1:sequence_name}\n    START WITH ${2:1}\n    INCREMENT BY ${3:1};invoice_seqCREATE SEQUENCE 100\n    START WITH 1\n    INCREMENT BY ${3:1};invoice_seqcreate table\n";
+        let (client, _diagnostics) = Client::start(
+            "postgres://pgui:pgui@localhost:5433/pgui_test",
+            text,
+            CaseStyle::Lower,
+            CaseStyle::Lower,
+        )
+        .expect("client starts");
+
+        for position in 0..text.len() {
+            let _ = contain_panic(|| {
+                client.inner.workspace.on_hover(OnHoverParams {
+                    path: client.inner.path.clone(),
+                    position: to_text_size(position),
+                })
+            });
+        }
+        client.shutdown();
     }
 
     /// End-to-end check of the embedded language server against the local

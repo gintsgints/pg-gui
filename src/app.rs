@@ -685,6 +685,11 @@ impl PgGuiApp {
                 .placeholder("-- Write PostgreSQL here, then press cmd-enter to run")
                 .default_value(tab.script.clone())
         });
+        // Snippet suggestions work from the start; the language server's
+        // richer provider replaces this once (and whenever) it connects.
+        editor.update(cx, |state, _| {
+            state.lsp.completion_provider = Some(Rc::new(lsp::SnippetCompletions));
+        });
         let subscription = cx.subscribe_in(&editor, window, Self::on_editor_event);
         let disk_time = tab.file.as_deref().and_then(file_mtime);
         let dirty = tab.script != saved;
@@ -1215,7 +1220,9 @@ impl PgGuiApp {
         }
         for tab in &self.tabs {
             tab.editor.update(cx, |state, _| {
-                state.lsp.completion_provider = None;
+                // Fall back to snippets-only completions until the new
+                // server connects.
+                state.lsp.completion_provider = Some(Rc::new(lsp::SnippetCompletions));
                 state.lsp.hover_provider = None;
             });
         }
@@ -1226,7 +1233,7 @@ impl PgGuiApp {
         &mut self,
         state: &Entity<InputState>,
         event: &InputEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !matches!(event, InputEvent::Change) {
@@ -1236,6 +1243,18 @@ impl PgGuiApp {
             return;
         };
         let text = state.read(cx).value().to_string();
+        // A change that grows the buffer by more than one character and
+        // brings in braced tab-stop markers is a template landing (an
+        // accepted completion suggestion, or a paste) — never plain
+        // typing, which completes a marker one character at a time. Jump
+        // to its first stop, like the picker does. `config.tabs` still
+        // holds the pre-change text here; snippet mode means the picker
+        // already jumped.
+        let template_landed = ix == self.active_tab
+            && !self.tabs[ix].snippet_mode
+            && text.len() > self.config.tabs[ix].script.len() + 1
+            && snippets::next_tab_stop(&text, true).is_some()
+            && snippets::next_tab_stop(&self.config.tabs[ix].script, true).is_none();
         // The server tracks a single document: the active tab's.
         if ix == self.active_tab
             && let Some(client) = &self.lsp
@@ -1245,6 +1264,9 @@ impl PgGuiApp {
         self.config.tabs[ix].script = text;
         self.refresh_dirty(ix, cx);
         self.schedule_save(cx);
+        if template_landed {
+            self.next_snippet_stop(true, window, cx);
+        }
     }
 
     /// Persist the config after a short debounce, so typing in the editor
@@ -1359,7 +1381,7 @@ impl PgGuiApp {
         });
         if has_stops {
             self.tabs[self.active_tab].snippet_mode = true;
-            self.next_snippet_stop(window, cx);
+            self.next_snippet_stop(false, window, cx);
         }
         self.set_status(format!("Inserted “{}”", snippet.name), cx);
     }
@@ -1367,9 +1389,14 @@ impl PgGuiApp {
     /// Jump to the buffer's next `$n` tab stop: the marker is replaced by
     /// its placeholder text, which is left selected so typing overwrites
     /// it. Returns false when no marker remains.
-    fn next_snippet_stop(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn next_snippet_stop(
+        &mut self,
+        braced_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         self.editor().update(cx, |state, cx| {
-            let Some(stop) = snippets::next_tab_stop(&state.value()) else {
+            let Some(stop) = snippets::next_tab_stop(&state.value(), braced_only) else {
                 return false;
             };
             state.set_selected_range(stop.range, cx);
@@ -1381,18 +1408,19 @@ impl PgGuiApp {
         })
     }
 
-    /// Capture-phase tab handler: while the active tab is in snippet mode
-    /// (and the editor is focused), tab visits the next tab stop instead of
-    /// indenting. Once no stops remain the mode ends and tab indents again.
+    /// Capture-phase tab handler: tab visits the buffer's next tab stop
+    /// instead of indenting. In snippet mode (after a picker insertion)
+    /// every marker form is serviced; otherwise only the braced forms —
+    /// left by an accepted completion suggestion — so a hand-written
+    /// Postgres parameter (`$1`) never captures the tab key.
     fn on_editor_tab(&mut self, _: &IndentInline, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs[self.active_tab].snippet_mode
-            || !self.editor().focus_handle(cx).is_focused(window)
-        {
+        if !self.editor().focus_handle(cx).is_focused(window) {
             return;
         }
-        if self.next_snippet_stop(window, cx) {
+        let snippet_mode = self.tabs[self.active_tab].snippet_mode;
+        if self.next_snippet_stop(!snippet_mode, window, cx) {
             cx.stop_propagation();
-        } else {
+        } else if snippet_mode {
             self.tabs[self.active_tab].snippet_mode = false;
         }
     }
