@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*"
+  # Manual runs build the bundles (named after the branch) without publishing.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -11,9 +13,10 @@ permissions:
 jobs:
   macos:
     name: macOS bundle (universal)
-    runs-on: macos-latest
+    # Pinned: the macos-latest label is migrating to macOS 26 during 2026
+    runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -54,7 +57,7 @@ jobs:
             "target/aarch64-apple-darwin/release/bundle/osx/pg-gui.app" \
             "pg-gui-${GITHUB_REF_NAME}-macos-universal.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-bundle
           path: pg-gui-*.zip
@@ -65,7 +68,7 @@ jobs:
     # 22.04 keeps the glibc requirement low for older distros
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system dependencies
         run: |
@@ -104,22 +107,57 @@ jobs:
           cp README.md assets/icon.png "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-bundle
           path: pg-gui-*.tar.gz
           if-no-files-found: error
 
+  windows:
+    name: Windows bundle (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The embedded Postgres Language Server generates its tree-sitter
+      # grammar at build time and needs the CLI on PATH.
+      - name: Install tree-sitter CLI
+        uses: tree-sitter/setup-action/cli@v2
+        with:
+          tree-sitter-ref: v0.25.9
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $dir = "pg-gui-$env:GITHUB_REF_NAME-x86_64-windows"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item target/release/pg-gui.exe, README.md, assets/icon.png $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-bundle
+          path: pg-gui-*windows.zip
+          if-no-files-found: error
+
   release:
     name: Publish GitHub release
-    needs: [macos, linux]
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [macos, linux, windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             pg-gui-*.zip
