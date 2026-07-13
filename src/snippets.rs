@@ -475,6 +475,10 @@ const BUILTINS: &[(&str, &str)] = &[
         "CREATE OR REPLACE FUNCTION ${1:function_name}(${2})\nRETURNS ${3:integer}\nLANGUAGE plpgsql\nAS $$\nBEGIN\n    ${4:RETURN 0;}\nEND;\n$$;",
     ),
     (
+        "New: procedure",
+        "CREATE OR REPLACE PROCEDURE ${1:procedure_name}(${2})\nLANGUAGE plpgsql\nAS $$\nBEGIN\n    ${3:NULL;}\nEND;\n$$;",
+    ),
+    (
         "New: trigger",
         "CREATE OR REPLACE FUNCTION ${1:trigger_fn}()\nRETURNS trigger\nLANGUAGE plpgsql\nAS $$\nBEGIN\n    -- Adjust NEW before it is written.\n    RETURN NEW;\nEND;\n$$;\n\nCREATE TRIGGER ${2:trigger_name}\n    BEFORE INSERT OR UPDATE ON ${3:table_name}\n    FOR EACH ROW\n    EXECUTE FUNCTION ${4:trigger_fn}();",
     ),
