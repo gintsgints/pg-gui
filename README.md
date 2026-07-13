@@ -59,7 +59,8 @@ the next start, unsaved edits included. Each tab's `.sql` file path is remembere
 too, so `cmd-s` keeps writing to the same file after a restart. The config also
 holds the recent-connections list, the theme, the zoom level, and a few
 options: `format_on_save` (off by default), `keyword_case` / `constant_case`
-(`"lower"`/`"upper"`, used by the formatter), and `ai_api_key`.
+(`"lower"`/`"upper"`, used by the formatter), and the AI settings
+(`ai_api_key`, `ai_model`, `ai_prompt`).
 `cmd-,` (Preferences…) opens the file in the system editor.
 A `DATABASE_URL` environment variable, if set, overrides the saved connection
 string for that launch; with neither present the field defaults to
@@ -97,8 +98,12 @@ cargo run
 Place the cursor where you want a completion and press `cmd-i`. The model receives the
 text before and after the cursor and inserts the completion at the cursor.
 
-- Default model: `claude-opus-4-8` — override with `PG_GUI_AI_MODEL`
-  (e.g. `claude-haiku-4-5` for lower latency).
+- Default model: `claude-opus-4-8` — override with `ai_model` in `config.json`
+  or the `PG_GUI_AI_MODEL` environment variable (the config wins;
+  e.g. `claude-haiku-4-5` for lower latency).
+- `ai_prompt` in `config.json`, when set, is appended to the system prompt —
+  useful for schema hints or style preferences
+  (e.g. `"Prefer explicit JOINs and snake_case aliases."`).
 
 ## Keybindings
 

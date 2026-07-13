@@ -1981,6 +1981,9 @@ impl PgGuiApp {
             return;
         };
 
+        let model = ai::model(&self.config.ai_model);
+        let prompt_addition = self.config.ai_prompt.clone();
+
         let (before, after) = {
             let state = self.editor().read(cx);
             let text = state.value().to_string();
@@ -1996,7 +1999,9 @@ impl PgGuiApp {
 
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
-                .background_spawn(async move { ai::complete(&key, &before, &after) })
+                .background_spawn(async move {
+                    ai::complete(&key, &model, &prompt_addition, &before, &after)
+                })
                 .await;
 
             this.update_in(cx, |this, window, cx| {

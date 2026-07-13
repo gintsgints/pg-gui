@@ -98,6 +98,14 @@ pub struct Config {
     /// `ANTHROPIC_API_KEY` environment variable is used instead.
     #[serde(default)]
     pub ai_api_key: String,
+    /// Model used for AI completion; when empty, the `PG_GUI_AI_MODEL`
+    /// environment variable is used, falling back to the built-in default.
+    #[serde(default)]
+    pub ai_model: String,
+    /// Extra instructions appended to the AI completion system prompt,
+    /// e.g. schema hints or style preferences.
+    #[serde(default)]
+    pub ai_prompt: String,
     /// Whether cmd-s formats the script through the language server
     /// before writing it to disk. Needs postgrestools ≥ 0.22.
     #[serde(default)]
@@ -162,6 +170,8 @@ impl Default for Config {
             editor_height: None,
             page_size: default_page_size(),
             ai_api_key: String::new(),
+            ai_model: String::new(),
+            ai_prompt: String::new(),
             format_on_save: false,
             keyword_case: CaseStyle::default(),
             constant_case: CaseStyle::default(),

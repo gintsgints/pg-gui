@@ -1,8 +1,9 @@
 /// SQL completion via the Anthropic Messages API.
 ///
 /// The API key comes from the config's `ai_api_key`, falling back to
-/// `ANTHROPIC_API_KEY`; model can be overridden with `PG_GUI_AI_MODEL`
-/// (defaults to `claude-opus-4-8`).
+/// `ANTHROPIC_API_KEY`; the model from the config's `ai_model`, falling
+/// back to `PG_GUI_AI_MODEL` (defaults to `claude-opus-4-8`). The config's
+/// `ai_prompt` is appended to the system prompt when set.
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const DEFAULT_MODEL: &str = "claude-opus-4-8";
 
@@ -25,18 +26,43 @@ pub fn api_key(configured: &str) -> Option<String> {
         .filter(|k| !k.is_empty())
 }
 
-pub fn complete(api_key: &str, before: &str, after: &str) -> Result<String, String> {
-    let model = std::env::var("PG_GUI_AI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+/// The model to use for completions: the one configured in the app config,
+/// or `PG_GUI_AI_MODEL` from the environment, or the built-in default.
+/// The config wins so an app-specific model can override a globally set one.
+pub fn model(configured: &str) -> String {
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return configured.to_string();
+    }
+    std::env::var("PG_GUI_AI_MODEL")
+        .ok()
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+}
 
+pub fn complete(
+    api_key: &str,
+    model: &str,
+    prompt_addition: &str,
+    before: &str,
+    after: &str,
+) -> Result<String, String> {
     let user_message = format!(
         "<sql_before_cursor>{before}</sql_before_cursor>\n<sql_after_cursor>{after}</sql_after_cursor>\n\
          Provide the completion to insert at the cursor."
     );
 
+    let prompt_addition = prompt_addition.trim();
+    let system = if prompt_addition.is_empty() {
+        SYSTEM_PROMPT.to_string()
+    } else {
+        format!("{SYSTEM_PROMPT}\n\n{prompt_addition}")
+    };
+
     let body = serde_json::json!({
         "model": model,
         "max_tokens": 512,
-        "system": SYSTEM_PROMPT,
+        "system": system,
         "output_config": { "effort": "low" },
         "messages": [
             { "role": "user", "content": user_message }
