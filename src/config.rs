@@ -94,6 +94,11 @@ pub struct Config {
     /// Rows shown per results page.
     #[serde(default = "default_page_size")]
     pub page_size: usize,
+    /// Rows pulled from the server per fetch: a SELECT is run through a
+    /// server-side cursor and only this many rows are transferred at a
+    /// time; Fetch More pulls the next batch.
+    #[serde(default = "default_fetch_size")]
+    pub fetch_size: usize,
     /// Anthropic API key for AI completion; when empty, the
     /// `ANTHROPIC_API_KEY` environment variable is used instead.
     #[serde(default)]
@@ -169,6 +174,7 @@ impl Default for Config {
             active_tab: 0,
             editor_height: None,
             page_size: default_page_size(),
+            fetch_size: default_fetch_size(),
             ai_api_key: String::new(),
             ai_model: String::new(),
             ai_prompt: String::new(),
@@ -187,6 +193,10 @@ fn default_zoom() -> f32 {
 
 fn default_page_size() -> usize {
     100
+}
+
+fn default_fetch_size() -> usize {
+    500
 }
 
 /// Where the config file lives; `None` when the platform has no config

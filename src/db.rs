@@ -3,7 +3,7 @@ use std::io::Write as _;
 use std::path::Path;
 
 use postgres::error::ErrorPosition;
-use postgres::{Client, NoTls, SimpleQueryMessage};
+use postgres::{Client, NoTls, SimpleQueryMessage, SimpleQueryRow};
 
 use crate::export;
 
@@ -47,11 +47,114 @@ fn describe(error: &postgres::Error) -> String {
     out
 }
 
+/// Rows as returned by the simple query protocol: every value is text,
+/// NULL is `None`.
+pub type Rows = Vec<Vec<Option<String>>>;
+
 /// Result of executing a SQL script: the last result set plus per-statement messages.
 pub struct QueryOutcome {
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<Option<String>>>,
+    pub rows: Rows,
     pub messages: Vec<String>,
+}
+
+/// A server-side cursor held open between fetches so a large SELECT is
+/// pulled in batches instead of all at once. Owns its connection; dropping
+/// it closes the connection, which aborts the transaction and with it the
+/// cursor.
+pub struct Cursor {
+    client: Client,
+    batch_size: usize,
+}
+
+/// The first batch of a cursor-backed SELECT.
+pub struct CursorPage {
+    pub columns: Vec<String>,
+    pub rows: Rows,
+    /// `None` when the first batch already exhausted the result set.
+    pub cursor: Option<Cursor>,
+}
+
+/// Why [`open_cursor`] failed, so the caller knows whether re-running the
+/// statement without a cursor is safe.
+#[derive(Debug)]
+pub enum CursorError {
+    /// `DECLARE CURSOR` was rejected (e.g. a data-modifying CTE) — nothing
+    /// was executed, so the caller may retry via [`run_script`], which also
+    /// reports the error without the `DECLARE` prefix shifting its position.
+    Declare,
+    /// Connecting or fetching failed; retrying could execute the statement
+    /// a second time.
+    Fetch(String),
+}
+
+fn parse_row(row: &SimpleQueryRow) -> Vec<Option<String>> {
+    (0..row.len())
+        .map(|i| row.get(i).map(std::string::ToString::to_string))
+        .collect()
+}
+
+/// Open a cursor over a single SELECT-style statement (`sql` must not end
+/// with a semicolon) and pull the first `batch_size` rows.
+pub fn open_cursor(
+    conn_str: &str,
+    sql: &str,
+    batch_size: usize,
+) -> Result<CursorPage, CursorError> {
+    let mut client = Client::connect(conn_str, NoTls)
+        .map_err(|e| CursorError::Fetch(format!("connection failed: {}", describe(&e))))?;
+    // One batch so a DECLARE failure rolls the transaction back implicitly.
+    client
+        .batch_execute(&format!(
+            "BEGIN; DECLARE _pg_gui_results NO SCROLL CURSOR FOR {sql}"
+        ))
+        .map_err(|_| CursorError::Declare)?;
+    let mut cursor = Cursor { client, batch_size };
+    let (columns, rows) = cursor.fetch_batch().map_err(CursorError::Fetch)?;
+    let more = rows.len() == batch_size;
+    Ok(CursorPage {
+        columns,
+        rows,
+        cursor: more.then_some(cursor),
+    })
+}
+
+impl Cursor {
+    /// Pull the next batch, consuming the cursor. Returns the rows plus the
+    /// cursor when more rows may remain; once exhausted the cursor is
+    /// dropped, closing its connection.
+    pub fn fetch_more(mut self) -> Result<(Rows, Option<Self>), String> {
+        let (_, rows) = self.fetch_batch()?;
+        let more = rows.len() == self.batch_size;
+        Ok((rows, more.then_some(self)))
+    }
+
+    fn fetch_batch(&mut self) -> Result<(Vec<String>, Rows), String> {
+        let results = self
+            .client
+            .simple_query(&format!(
+                "FETCH FORWARD {} FROM _pg_gui_results",
+                self.batch_size
+            ))
+            .map_err(|e| describe(&e))?;
+        let mut columns = Vec::new();
+        let mut rows = Vec::new();
+        for msg in results {
+            match msg {
+                SimpleQueryMessage::RowDescription(cols) => {
+                    columns = cols.iter().map(|c| c.name().to_string()).collect();
+                }
+                SimpleQueryMessage::Row(row) => {
+                    if columns.is_empty() {
+                        columns = row.columns().iter().map(|c| c.name().to_string()).collect();
+                    }
+                    rows.push(parse_row(&row));
+                }
+                _ => {}
+            }
+        }
+        Ok((columns, rows))
+    }
 }
 
 /// Open (and immediately drop) a connection to check that the connection
@@ -90,11 +193,7 @@ pub fn run_script(conn_str: &str, sql: &str) -> Result<QueryOutcome, String> {
                 if current_cols.is_empty() {
                     current_cols = row.columns().iter().map(|c| c.name().to_string()).collect();
                 }
-                current_rows.push(
-                    (0..row.len())
-                        .map(|i| row.get(i).map(std::string::ToString::to_string))
-                        .collect(),
-                );
+                current_rows.push(parse_row(&row));
             }
             SimpleQueryMessage::CommandComplete(n) => {
                 outcome.messages.push(format!("ok ({n} rows)"));
@@ -150,7 +249,7 @@ pub fn export_inserts(conn_str: &str, sql: &str, path: &Path) -> Result<usize, S
 
 #[cfg(test)]
 mod tests {
-    use super::{export_csv, export_inserts};
+    use super::{CursorError, export_csv, export_inserts, open_cursor};
 
     const CONN: &str = "postgres://pgui:pgui@localhost:5433/pgui_test";
 
@@ -196,6 +295,47 @@ mod tests {
             content.lines().next().unwrap(),
             "INSERT INTO my_table (\"name\", \"note\") VALUES ('O''Brien', NULL);"
         );
+    }
+
+    #[test]
+    #[ignore = "requires the docker compose database on localhost:5433"]
+    fn cursor_fetches_in_batches() {
+        let page = open_cursor(CONN, "SELECT g FROM generate_series(1, 12) g", 5).unwrap();
+        assert_eq!(page.columns, vec!["g"]);
+        assert_eq!(page.rows.len(), 5);
+        assert_eq!(page.rows[0][0].as_deref(), Some("1"));
+
+        let (rows, cursor) = page.cursor.unwrap().fetch_more().unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0][0].as_deref(), Some("6"));
+
+        // The last, short batch exhausts the cursor.
+        let (rows, cursor) = cursor.unwrap().fetch_more().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1][0].as_deref(), Some("12"));
+        assert!(cursor.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires the docker compose database on localhost:5433"]
+    fn cursor_exact_multiple_ends_with_empty_fetch() {
+        let page = open_cursor(CONN, "SELECT g FROM generate_series(1, 4) g", 4).unwrap();
+        assert_eq!(page.rows.len(), 4);
+        // A full first batch keeps the cursor open; the next fetch is empty.
+        let (rows, cursor) = page.cursor.unwrap().fetch_more().unwrap();
+        assert!(rows.is_empty());
+        assert!(cursor.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires the docker compose database on localhost:5433"]
+    fn cursor_rejects_statements_declare_cannot_run() {
+        // SELECT INTO passes the first-word check but DECLARE refuses it;
+        // the caller falls back to run_script on this variant.
+        let Err(err) = open_cursor(CONN, "SELECT 1 INTO TEMP _pg_gui_t", 10) else {
+            panic!("expected DECLARE to reject SELECT INTO");
+        };
+        assert!(matches!(err, CursorError::Declare), "{err:?}");
     }
 
     #[test]

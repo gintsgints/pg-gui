@@ -18,7 +18,10 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
   selection runs, otherwise the statement under the cursor (which gets
   selected so you can see what ran). Multi-statement selections are supported
   via the simple query protocol, and the last result set is shown in a
-  virtualized table (handles large result sets)
+  virtualized table (handles large result sets). A single SELECT runs
+  through a server-side cursor: only the first batch of rows is
+  transferred (`fetch_size` in config.json, default 500) and a Fetch more
+  button under the table pulls the next batch on demand
 - **Export results** to a file (Connection ▸ Export as CSV… / Export as
   INSERT…): re-runs the selection or the statement at the cursor and writes
   every row — CSV is produced server-side via `COPY (…) TO STDOUT` so the

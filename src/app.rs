@@ -586,6 +586,10 @@ pub struct PgGuiApp {
     status: SharedString,
     running: bool,
     ai_running: bool,
+    /// Server-side cursor left open by the last SELECT; Fetch More pulls
+    /// the next batch from it. Dropped (closing its connection) when a new
+    /// query runs or the connection changes.
+    cursor: Option<db::Cursor>,
     config: config::Config,
     /// Mtime of the config file after our last read or write; a different
     /// mtime on disk means it was edited externally and should be reloaded.
@@ -713,6 +717,7 @@ impl PgGuiApp {
             status: "Ready".into(),
             running: false,
             ai_running: false,
+            cursor: None,
             config,
             config_disk_time: config::modified_time(),
             base_font_size: cx.theme().font_size,
@@ -1545,26 +1550,60 @@ impl PgGuiApp {
         self.running = true;
         self.set_status(format!("Running {scope}…"), cx);
 
+        // A single SELECT-style statement runs through a server-side cursor
+        // so only the first `fetch_size` rows are transferred (Fetch More
+        // pulls the rest); scripts and DML run directly. The previous
+        // cursor's connection is dropped off the main thread.
+        let batch_size = self.config.fetch_size.max(1);
+        let old_cursor = self.cursor.take();
+
         cx.spawn_in(window, async move |this, cx| {
             let started = std::time::Instant::now();
             let result = cx
-                .background_spawn(async move { db::run_script(&conn, &sql) })
+                .background_spawn(async move {
+                    drop(old_cursor);
+                    let Ok(select) = export::copyable(&sql).map(str::to_string) else {
+                        return db::run_script(&conn, &sql).map(|outcome| (outcome, None));
+                    };
+                    match db::open_cursor(&conn, &select, batch_size) {
+                        Ok(page) => {
+                            let outcome = db::QueryOutcome {
+                                messages: vec![format!("ok ({} rows)", page.rows.len())],
+                                columns: page.columns,
+                                rows: page.rows,
+                            };
+                            Ok((outcome, page.cursor))
+                        }
+                        // DECLARE was rejected (e.g. a data-modifying CTE):
+                        // nothing was executed, so the plain path is safe.
+                        Err(db::CursorError::Declare) => {
+                            db::run_script(&conn, &sql).map(|outcome| (outcome, None))
+                        }
+                        Err(db::CursorError::Fetch(err)) => Err(err),
+                    }
+                })
                 .await;
             let elapsed = started.elapsed();
 
             this.update_in(cx, |this, window, cx| {
                 this.running = false;
                 match result {
-                    Ok(outcome) => {
+                    Ok((outcome, cursor)) => {
                         let row_count = outcome.rows.len();
                         let statements = outcome.messages.len();
+                        let more = if cursor.is_some() {
+                            ", more available"
+                        } else {
+                            ""
+                        };
+                        this.cursor = cursor;
                         this.results.update(cx, |table, cx| {
                             table.delegate_mut().set_data(outcome.columns, outcome.rows);
                             table.refresh(cx);
                         });
                         this.set_status(
                             format!(
-                                "{scope}: {statements} statement(s) executed in {elapsed:.0?} — showing {row_count} row(s)"
+                                "{scope}: {statements} statement(s) executed in {elapsed:.0?} — showing {row_count} row(s){more}"
                             ),
                             cx,
                         );
@@ -2008,6 +2047,8 @@ impl PgGuiApp {
         if url.is_empty() {
             return;
         }
+        // The cursor's transaction belongs to the previous server; close it.
+        self.cursor = None;
         self.config.connection_string = url.to_string();
         record_recent(&mut self.config.recent_connections, url, name);
         self.save_config();
@@ -2038,7 +2079,8 @@ impl PgGuiApp {
             delegate.page_count(),
             delegate.total_rows(),
         );
-        if page_count <= 1 {
+        let has_more = self.cursor.is_some();
+        if page_count <= 1 && !has_more {
             return None;
         }
 
@@ -2065,16 +2107,77 @@ impl PgGuiApp {
                             this.change_results_page(true, cx);
                         })),
                 )
+                .children(has_more.then(|| {
+                    Button::new("fetch-more")
+                        .outline()
+                        .small()
+                        .label("Fetch more")
+                        .disabled(self.running)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.fetch_more_rows(window, cx);
+                        }))
+                }))
                 .child(
                     div()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
                         .child(format!(
-                            "Page {} of {page_count} · {total_rows} rows",
-                            page + 1
+                            "Page {} of {page_count} · {total_rows}{} rows",
+                            page + 1,
+                            if has_more { "+" } else { "" }
                         )),
                 ),
         )
+    }
+
+    /// Fetch More: pull the next batch from the open cursor and append it
+    /// to the results table.
+    fn fetch_more_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
+        let Some(cursor) = self.cursor.take() else {
+            return;
+        };
+        self.running = true;
+        self.set_status("Fetching more rows…", cx);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let started = std::time::Instant::now();
+            let result = cx
+                .background_spawn(async move { cursor.fetch_more() })
+                .await;
+            let elapsed = started.elapsed();
+
+            this.update_in(cx, |this, window, cx| {
+                this.running = false;
+                match result {
+                    Ok((rows, cursor)) => {
+                        let fetched = rows.len();
+                        let more = if cursor.is_some() {
+                            ", more available"
+                        } else {
+                            ""
+                        };
+                        this.cursor = cursor;
+                        this.results.update(cx, |table, cx| {
+                            table.delegate_mut().append_rows(rows);
+                            table.refresh(cx);
+                        });
+                        let total = this.results.read(cx).delegate().total_rows();
+                        this.set_status(
+                            format!(
+                                "Fetched {fetched} more row(s) in {elapsed:.0?} — {total} row(s) total{more}"
+                            ),
+                            cx,
+                        );
+                    }
+                    Err(err) => this.show_query_error(&err, window, cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn change_results_page(&mut self, forward: bool, cx: &mut Context<Self>) {

@@ -42,6 +42,12 @@ impl ResultsDelegate {
         self.page = 0;
     }
 
+    /// Append a fetched batch to the current result set, keeping the
+    /// current page so the user continues from where they were.
+    pub fn append_rows(&mut self, rows: Vec<Vec<Option<String>>>) {
+        self.rows.extend(rows);
+    }
+
     pub fn clear(&mut self) {
         self.columns.clear();
         self.rows.clear();
