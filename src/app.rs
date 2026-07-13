@@ -8,19 +8,24 @@ use gpui::Subscription;
 use gpui::{
     App, AppContext as _, Context, Entity, EntityInputHandler as _, Focusable as _, Hsla,
     InteractiveElement as _, IntoElement, Menu, MenuItem, NoAction, ParentElement as _,
-    PathPromptOptions, Pixels, Render, SharedString, Styled as _, Window, div, px,
+    PathPromptOptions, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Root, Sizable as _, Theme, ThemeMode, WindowExt as _,
+    ActiveTheme as _, Disableable as _, IndexPath, Root, Sizable as _, Theme, ThemeMode, TitleBar,
+    WindowExt as _,
     button::{Button, ButtonVariants as _},
+    combobox::{Combobox, ComboboxEvent, ComboboxState},
     h_flex,
     input::{
         Escape as InputEscape, IndentInline, Input, InputEvent, InputState, RopeExt as _, TabSize,
     },
     list::{List, ListEvent, ListState},
     resizable::{ResizableState, resizable_panel, v_resizable},
+    searchable_list::{SearchableListItem, SearchableVec},
     tab::{Tab, TabBar},
     table::{DataTable, TableState},
+    tooltip::Tooltip,
     v_flex,
 };
 
@@ -125,6 +130,45 @@ fn record_recent(recents: &mut Vec<config::RecentConnection>, url: &str, name: &
         },
     );
     recents.truncate(MAX_RECENT_CONNECTIONS);
+}
+
+/// One entry of the title-bar connection combobox: a recent connection,
+/// shown by its saved name (or masked url when unnamed) and identified by
+/// its unmasked url.
+#[derive(Clone)]
+struct ConnectionItem {
+    url: SharedString,
+    label: SharedString,
+}
+
+impl SearchableListItem for ConnectionItem {
+    type Value = SharedString;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &SharedString {
+        &self.url
+    }
+}
+
+/// The combobox items for the current recent-connections list, most recent
+/// first — the same order as the Connection ▸ Recent menu.
+fn connection_items(recents: &[config::RecentConnection]) -> SearchableVec<ConnectionItem> {
+    SearchableVec::new(
+        recents
+            .iter()
+            .map(|c| ConnectionItem {
+                url: c.url.clone().into(),
+                label: if c.name.is_empty() {
+                    mask_credentials(&c.url).into()
+                } else {
+                    c.name.clone().into()
+                },
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// One View ▸ Theme entry. Native menu items have no checked state
@@ -552,6 +596,9 @@ pub struct PgGuiApp {
     base_mono_font_size: Pixels,
     save_generation: usize,
     lsp: Option<lsp::Client>,
+    /// The title-bar connection picker, mirroring `config.recent_connections`
+    /// with the active connection selected.
+    connections: Entity<ComboboxState<SearchableVec<ConnectionItem>>>,
     _subscriptions: Vec<Subscription>,
     /// Kept alive for the lifetime of the open New Connection dialog: one
     /// subscription per field input that recomputes the connection-string
@@ -611,6 +658,8 @@ impl PgGuiApp {
             cx.new(|cx| TableState::new(ResultsDelegate::new(config.page_size), window, cx));
         let resizable_state = cx.new(|_| ResizableState::default());
 
+        let (connections, connections_sub) = Self::build_connection_combo(&config, window, cx);
+
         tabs[active_tab]
             .editor
             .update(cx, |state, cx| state.focus(window, cx));
@@ -626,6 +675,7 @@ impl PgGuiApp {
                 }
                 async {}
             }),
+            connections_sub,
             // Follow OS light/dark switches while the theme is "System".
             window.observe_window_appearance(move |window, cx| {
                 weak_this
@@ -669,6 +719,7 @@ impl PgGuiApp {
             base_mono_font_size: cx.theme().mono_font_size,
             save_generation: 0,
             lsp: None,
+            connections,
             _subscriptions: subscriptions,
             connection_dialog_subs: Vec::new(),
         };
@@ -1097,6 +1148,8 @@ impl PgGuiApp {
             );
             self.refresh_menus(cx);
         }
+        // Covers both a changed active connection and an edited recent list.
+        self.sync_connection_combo(window, cx);
 
         // The language server reads all of these from its generated
         // workspace config at startup, so a change means a restart.
@@ -1634,6 +1687,62 @@ impl PgGuiApp {
         ));
     }
 
+    /// Create the title-bar connection combobox, selecting the active
+    /// connection (at the head of the recent list), and the subscription
+    /// that connects to whatever gets picked from it.
+    fn build_connection_combo(
+        config: &config::Config,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (
+        Entity<ComboboxState<SearchableVec<ConnectionItem>>>,
+        Subscription,
+    ) {
+        let connections = cx.new(|cx| {
+            ComboboxState::new(
+                connection_items(&config.recent_connections),
+                vec![IndexPath::default()],
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
+        let subscription = cx.subscribe_in(
+            &connections,
+            window,
+            |this, _, event: &ComboboxEvent<SearchableVec<ConnectionItem>>, window, cx| {
+                if let ComboboxEvent::Confirm(values) = event
+                    && let Some(url) = values.first()
+                {
+                    let name = this
+                        .config
+                        .recent_connections
+                        .iter()
+                        .find(|c| c.url == url.as_ref())
+                        .map_or(String::new(), |c| c.name.clone());
+                    this.apply_connection(&url.clone(), &name, window, cx);
+                }
+            },
+        );
+        (connections, subscription)
+    }
+
+    /// Mirror `config.recent_connections` into the title-bar combobox and
+    /// mark the active connection selected.
+    fn sync_connection_combo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let items = connection_items(&self.config.recent_connections);
+        let selected = self
+            .config
+            .recent_connections
+            .iter()
+            .position(|c| c.url == self.config.connection_string)
+            .map(|row| IndexPath::default().row(row));
+        self.connections.update(cx, |state, cx| {
+            state.set_items(items, window, cx);
+            state.set_selected_indices(selected, window, cx);
+        });
+    }
+
     /// Connection ▸ New Connection…: open the connection form on a fresh
     /// default connection to fill in.
     pub fn new_connection(
@@ -1767,8 +1876,10 @@ impl PgGuiApp {
                     let url = fields.read(cx).to_url();
                     let name = name.read(cx).value().trim().to_string();
                     window.close_dialog(cx);
-                    app.update(cx, |this, cx| this.apply_connection(&url, &name, cx))
-                        .ok();
+                    app.update(cx, |this, cx| {
+                        this.apply_connection(&url, &name, window, cx);
+                    })
+                    .ok();
                 }
             };
             let test = {
@@ -1875,14 +1986,25 @@ impl PgGuiApp {
     }
 
     /// Connection ▸ Recent ▸ …: reconnect to a previously used connection.
-    pub fn connect_recent(&mut self, action: &Connect, _: &mut Window, cx: &mut Context<Self>) {
-        self.apply_connection(&action.url, &action.name, cx);
+    pub fn connect_recent(
+        &mut self,
+        action: &Connect,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_connection(&action.url, &action.name, window, cx);
     }
 
     /// Switch to `url` (saved under `name`, which may be empty): remember
     /// it, persist, and restart the language server so completions follow
     /// the new database's schema.
-    fn apply_connection(&mut self, url: &str, name: &str, cx: &mut Context<Self>) {
+    fn apply_connection(
+        &mut self,
+        url: &str,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if url.is_empty() {
             return;
         }
@@ -1890,6 +2012,7 @@ impl PgGuiApp {
         record_recent(&mut self.config.recent_connections, url, name);
         self.save_config();
         self.refresh_menus(cx);
+        self.sync_connection_combo(window, cx);
         self.restart_lsp(cx);
         let label = if name.is_empty() {
             mask_credentials(url)
@@ -2537,6 +2660,73 @@ impl PgGuiApp {
             )
     }
 
+    /// Custom title bar (the native one is transparent, see main.rs): the
+    /// app name, the connection picker, and the active tab's file path,
+    /// Zed style. `TitleBar` pads past the macOS traffic lights.
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let path = self.tabs[self.active_tab]
+            .path
+            .as_deref()
+            .map(|path| path.display().to_string());
+        TitleBar::new().child(
+            h_flex()
+                .gap_2()
+                .flex_1()
+                .min_w(px(0.))
+                .child(div().text_sm().child("pg-gui"))
+                .child(
+                    div()
+                        .id("connection-combo")
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Active connection — click to switch").build(window, cx)
+                        })
+                        .child(
+                            Combobox::new(&self.connections)
+                                .small()
+                                .w(px(320.))
+                                .menu_width(px(420.))
+                                .placeholder("Select connection…")
+                                .search_placeholder("Switch or search connections…"),
+                        ),
+                )
+                .children(path.map(|path| {
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .truncate()
+                        .child(path)
+                })),
+        )
+    }
+
+    /// The status line at the bottom: the latest message on the left, the
+    /// AI / language-server availability summary on the right.
+    fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let ai_available = ai::api_key(&self.config.ai_api_key).is_some();
+        h_flex()
+            .px_2()
+            .py_1()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(self.status.clone())
+            .child(div().flex_1())
+            .child(format!(
+                "{} · {} · cmd-h help",
+                if ai_available {
+                    "AI ready"
+                } else {
+                    "AI off — set ai_api_key or ANTHROPIC_API_KEY"
+                },
+                if self.lsp.is_some() {
+                    "SQL LSP connected"
+                } else {
+                    "SQL LSP offline"
+                },
+            ))
+    }
+
     /// One tab per open script, with a "×" close button each and a
     /// trailing "+" that opens a fresh one. A tab with unsaved edits is
     /// marked with a leading "•", or "⟳" when its file also changed on disk
@@ -2583,8 +2773,6 @@ impl PgGuiApp {
 
 impl Render for PgGuiApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let ai_available = ai::api_key(&self.config.ai_api_key).is_some();
-
         v_flex()
             .size_full()
             .relative()
@@ -2618,6 +2806,7 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::show_help))
             .on_action(cx.listener(Self::open_github))
             .on_action(cx.listener(Self::request_quit))
+            .child(self.render_title_bar(cx))
             .child(
                 // Editor over results, split by a draggable divider. The
                 // split position is persisted to the config on drag and
@@ -2666,31 +2855,7 @@ impl Render for PgGuiApp {
                         ),
                 ),
             )
-            .child(
-                // Status bar
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(self.status.clone())
-                    .child(div().flex_1())
-                    .child(format!(
-                        "{} · {} · cmd-h help",
-                        if ai_available {
-                            "AI ready"
-                        } else {
-                            "AI off — set ai_api_key or ANTHROPIC_API_KEY"
-                        },
-                        if self.lsp.is_some() {
-                            "SQL LSP connected"
-                        } else {
-                            "SQL LSP offline"
-                        },
-                    )),
-            )
+            .child(self.render_status_bar(cx))
             // Dialogs (e.g. the snippet picker) are drawn by the app's root
             // element; gpui-component's Root only stores them.
             .children(Root::render_dialog_layer(window, cx))

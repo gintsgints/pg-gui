@@ -12,10 +12,10 @@ mod snippets;
 mod statement;
 
 use gpui::{
-    Action, App, AppContext as _, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
-    actions, px, size,
+    Action, App, AppContext as _, Bounds, KeyBinding, WindowBounds, WindowOptions, actions, px,
+    size,
 };
-use gpui_component::{Root, Theme, ThemeRegistry};
+use gpui_component::{Root, Theme, ThemeRegistry, TitleBar};
 
 actions!(
     pg_gui,
@@ -85,7 +85,14 @@ fn load_catppuccin(cx: &mut App) {
 }
 
 fn main() {
-    let app = gpui_platform::application();
+    // AccessKit is force-disabled for now: gpui-component's Combobox tracks
+    // the same focus handle on both the trigger and the popover list while
+    // open (combobox.rs `focus_handle()` returns the list's handle when
+    // open; the List element tracks it too), which trips gpui's debug
+    // assertion "set_focus called more than once in a single frame" the
+    // moment an assistive technology activates the accessibility tree.
+    // Drop back to `gpui_platform::application()` once fixed upstream.
+    let app = gpui::Application::new_inaccessible(gpui_platform::current_platform(false));
 
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
@@ -137,10 +144,10 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions {
-                title: Some("pg-gui".into()),
-                ..Default::default()
-            }),
+            // Transparent native title bar: the app draws its own
+            // (`TitleBar` in `PgGuiApp::render`) with the connection
+            // combobox in it.
+            titlebar: Some(TitleBar::title_bar_options()),
             ..Default::default()
         };
 
