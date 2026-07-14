@@ -6,6 +6,7 @@ mod app;
 mod config;
 mod db;
 mod export;
+mod instance;
 mod lsp;
 mod results;
 mod snippets;
@@ -85,6 +86,14 @@ fn load_catppuccin(cx: &mut App) {
 }
 
 fn main() {
+    // Only one instance may run: two would race each other for
+    // config.json and swap each other's tabs in through the file watcher.
+    // A second launch raises the running instance's window and exits.
+    let Some(instance) = instance::acquire() else {
+        eprintln!("pg-gui is already running — activating its window");
+        return;
+    };
+
     // AccessKit is force-disabled for now: gpui-component's Combobox tracks
     // the same focus handle on both the trigger and the popover list while
     // open (combobox.rs `focus_handle()` returns the list's handle when
@@ -95,6 +104,7 @@ fn main() {
     let app = gpui::Application::new_inaccessible(gpui_platform::current_platform(false));
 
     app.run(move |cx: &mut App| {
+        instance.install(cx);
         gpui_component::init(cx);
         load_catppuccin(cx);
 

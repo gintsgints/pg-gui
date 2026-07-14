@@ -199,10 +199,17 @@ fn default_fetch_size() -> usize {
     500
 }
 
+/// The app's config directory (`~/Library/Application Support/pg-gui` on
+/// macOS); `None` when the platform has no config directory. Also hosts
+/// the single-instance socket (see [`crate::instance`]).
+pub fn dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("pg-gui"))
+}
+
 /// Where the config file lives; `None` when the platform has no config
 /// directory.
 pub fn path() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("pg-gui").join("config.json"))
+    dir().map(|dir| dir.join("config.json"))
 }
 
 pub fn load() -> Config {
@@ -234,15 +241,20 @@ pub fn modified_time() -> Option<std::time::SystemTime> {
 
 pub fn save(config: &Config) {
     let Some(path) = path() else { return };
+    // Write to a sibling temp file and rename it into place, so a crash
+    // mid-write can't leave a truncated config.json (which `try_load`
+    // would silently replace with defaults on the next launch).
+    let tmp = path.with_extension("json.tmp");
     let result = path
         .parent()
         .map_or(Ok(()), std::fs::create_dir_all)
         .and_then(|()| {
             std::fs::write(
-                &path,
+                &tmp,
                 serde_json::to_string_pretty(config).unwrap_or_default(),
             )
-        });
+        })
+        .and_then(|()| std::fs::rename(&tmp, &path));
     if let Err(err) = result {
         eprintln!("pg-gui: failed to save config to {}: {err}", path.display());
     }
