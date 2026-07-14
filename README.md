@@ -28,9 +28,10 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
   server does the quoting, INSERT generates a runnable SQL script. The save
   dialog suggests `<table>_<date>` from the query's `FROM` table
 - **Connection manager**: create and edit connections in a per-field dialog
-  with an inline Test Connection check, give them names, and reconnect from
-  the Connection ▸ Recent menu
-- **Open / save** `.sql` files with native file dialogs (`cmd-o` / `cmd-s`),
+  with an inline Test Connection check, give them names, and switch between
+  them from the combobox in the title bar or the Connection ▸ Recent menu
+- **Open / save** `.sql` files with native file dialogs (`cmd-o` / `cmd-s`)
+  that start in the last used directory,
   each open script in its own editor tab; a tab with unsaved edits is marked
   with a `•` and prompts to save before it's closed (and before quitting),
   and an open script that changes on disk offers to reload
@@ -69,6 +70,9 @@ A `DATABASE_URL` environment variable, if set, overrides the saved connection
 string for that launch; with neither present the field defaults to
 `postgres://$USER@localhost:5432/postgres`. TLS connections are not supported yet
 (the client connects with `NoTls`).
+
+Only one instance runs at a time (two would race for `config.json`): launching
+the app while it's already open just raises the running window.
 
 ## Test database
 
