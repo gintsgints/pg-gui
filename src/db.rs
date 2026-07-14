@@ -1,11 +1,24 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
+use std::time::Duration;
 
 use postgres::error::ErrorPosition;
 use postgres::{Client, NoTls, SimpleQueryMessage, SimpleQueryRow};
 
 use crate::export;
+
+/// How long a connection attempt may take before it fails, so an
+/// unreachable server errors out quickly instead of hanging on the
+/// OS-level TCP timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Connect with [`CONNECT_TIMEOUT`] applied.
+fn connect(conn_str: &str) -> Result<Client, postgres::Error> {
+    let mut config = conn_str.parse::<postgres::Config>()?;
+    config.connect_timeout(CONNECT_TIMEOUT);
+    config.connect(NoTls)
+}
 
 /// Render an error with its full cause. `postgres::Error`'s `Display` is
 /// just "db error" — the message, detail, and hint live in the underlying
@@ -101,7 +114,7 @@ pub fn open_cursor(
     sql: &str,
     batch_size: usize,
 ) -> Result<CursorPage, CursorError> {
-    let mut client = Client::connect(conn_str, NoTls)
+    let mut client = connect(conn_str)
         .map_err(|e| CursorError::Fetch(format!("connection failed: {}", describe(&e))))?;
     // One batch so a DECLARE failure rolls the transaction back implicitly.
     client
@@ -161,16 +174,14 @@ impl Cursor {
 /// string points at a reachable server that accepts the credentials. Used
 /// by the New Connection dialog's Test Connection button.
 pub fn test_connection(conn_str: &str) -> Result<(), String> {
-    Client::connect(conn_str, NoTls)
-        .map(|_| ())
-        .map_err(|e| describe(&e))
+    connect(conn_str).map(|_| ()).map_err(|e| describe(&e))
 }
 
 /// Execute a SQL script (one or more statements) using the simple query protocol,
 /// which returns every value as text and supports multi-statement scripts.
 pub fn run_script(conn_str: &str, sql: &str) -> Result<QueryOutcome, String> {
-    let mut client = Client::connect(conn_str, NoTls)
-        .map_err(|e| format!("connection failed: {}", describe(&e)))?;
+    let mut client =
+        connect(conn_str).map_err(|e| format!("connection failed: {}", describe(&e)))?;
 
     let results = client.simple_query(sql).map_err(|e| describe(&e))?;
 
@@ -216,8 +227,8 @@ pub fn run_script(conn_str: &str, sql: &str) -> Result<QueryOutcome, String> {
 /// of bytes written.
 pub fn export_csv(conn_str: &str, sql: &str, path: &Path) -> Result<u64, String> {
     let sql = export::copyable(sql)?;
-    let mut client = Client::connect(conn_str, NoTls)
-        .map_err(|e| format!("connection failed: {}", describe(&e)))?;
+    let mut client =
+        connect(conn_str).map_err(|e| format!("connection failed: {}", describe(&e)))?;
     let mut reader = client
         .copy_out(&format!("COPY ({sql}) TO STDOUT WITH (FORMAT csv, HEADER)"))
         .map_err(|e| describe(&e))?;
