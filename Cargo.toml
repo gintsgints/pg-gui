@@ -26,7 +26,7 @@ gpui = { git = "https://github.com/zed-industries/zed" }
 # gpui split the platform out into its own crate; `gpui_platform::application()`
 # replaces the old `Application::new()`. Features match gpui-component's own.
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "258791447ceb14888012d3dfabb6510524d3b53e", features = ["tree-sitter-languages"] }
+gpui-component = { git = "https://github.com/gintsgints/gpui-component", branch = "my_fixes", features = ["tree-sitter-languages"] }
 # Must stay in lockstep with the lsp-types version gpui-component uses,
 # so our provider impls and its editor traits share the same types.
 lsp-types = "0.97"
