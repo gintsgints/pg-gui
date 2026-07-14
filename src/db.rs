@@ -170,6 +170,25 @@ impl Cursor {
     }
 }
 
+/// The connection's effective schema search path (including what `ALTER
+/// ROLE/DATABASE … SET search_path` configured server-side), resolved to
+/// schemas that actually exist. `None` when the server is unreachable or
+/// the path could not be read.
+pub fn search_path(conn_str: &str) -> Option<Vec<String>> {
+    let mut client = connect(conn_str).ok()?;
+    let results = client
+        .simple_query("SELECT unnest(current_schemas(false))")
+        .ok()?;
+    let schemas: Vec<String> = results
+        .into_iter()
+        .filter_map(|msg| match msg {
+            SimpleQueryMessage::Row(row) => row.get(0).map(ToString::to_string),
+            _ => None,
+        })
+        .collect();
+    (!schemas.is_empty()).then_some(schemas)
+}
+
 /// Open (and immediately drop) a connection to check that the connection
 /// string points at a reachable server that accepts the credentials. Used
 /// by the New Connection dialog's Test Connection button.
@@ -260,7 +279,7 @@ pub fn export_inserts(conn_str: &str, sql: &str, path: &Path) -> Result<usize, S
 
 #[cfg(test)]
 mod tests {
-    use super::{CursorError, export_csv, export_inserts, open_cursor};
+    use super::{CursorError, export_csv, export_inserts, open_cursor, search_path};
 
     const CONN: &str = "postgres://pgui:pgui@localhost:5433/pgui_test";
 
@@ -347,6 +366,19 @@ mod tests {
             panic!("expected DECLARE to reject SELECT INTO");
         };
         assert!(matches!(err, CursorError::Declare), "{err:?}");
+    }
+
+    #[test]
+    #[ignore = "requires the docker compose database on localhost:5433"]
+    fn search_path_reflects_role_setting() {
+        // The docker role is configured with `SET search_path TO app, public`.
+        let schemas = search_path(CONN).unwrap();
+        assert_eq!(schemas, vec!["app", "public"]);
+    }
+
+    #[test]
+    fn search_path_is_none_when_unreachable() {
+        assert!(search_path("postgres://nobody:nope@127.0.0.1:1/none").is_none());
     }
 
     #[test]

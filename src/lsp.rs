@@ -25,9 +25,9 @@ use lsp_types::{
 
 use pgls_analyse::RuleCategories;
 use pgls_completions::CompletionItemKind as PgCompletionItemKind;
-use pgls_configuration::PartialConfiguration;
 use pgls_configuration::database::PartialDatabaseConfiguration;
 use pgls_configuration::format::{KeywordCase, PartialFormatConfiguration};
+use pgls_configuration::{PartialConfiguration, PartialTypecheckConfiguration};
 use pgls_diagnostics::{Diagnostic as _, PrintDescription, Severity};
 use pgls_fs::PgLSPath;
 use pgls_text_size::{TextRange, TextSize};
@@ -633,6 +633,16 @@ fn build_configuration(
         constant_case: Some(to_keyword_case(constant_case)),
         ..PartialFormatConfiguration::default()
     });
+    // Typecheck resolves unqualified table names against this list and
+    // defaults to just `public`, flagging tables that the connection's real
+    // search_path (e.g. set per role or database) would find. Mirror the
+    // server's effective search path so diagnostics match query execution.
+    if let Some(search_path) = crate::db::search_path(connection_string) {
+        config.typecheck = Some(PartialTypecheckConfiguration {
+            search_path: Some(search_path.into_iter().collect()),
+            ..PartialTypecheckConfiguration::default()
+        });
+    }
     config
 }
 
@@ -737,6 +747,52 @@ mod tests {
                 })
             });
         }
+        client.shutdown();
+    }
+
+    /// Diagnostics must resolve unqualified table names through the role's
+    /// `search_path` (`ALTER ROLE pgui SET search_path TO app, public` in the
+    /// docker seed), not just `public`: `feature_flags` lives in `app` and
+    /// must not be flagged, while a genuinely missing table still is.
+    #[test]
+    #[ignore = "requires the docker Postgres on localhost:5433"]
+    fn embedded_server_resolves_search_path_schemas() {
+        const CONN: &str = "postgres://pgui:pgui@localhost:5433/pgui_test";
+
+        let (client, mut diagnostics) = Client::start(
+            CONN,
+            "SELECT * FROM feature_flags;\nSELECT * FROM no_such_table_xyz;\n",
+            CaseStyle::Lower,
+            CaseStyle::Lower,
+        )
+        .expect("client starts");
+
+        // The initial batch includes db-backed typecheck results; loading
+        // the schema cache can take a while on the first run.
+        let mut batch = None;
+        for _ in 0..300 {
+            match diagnostics.try_recv() {
+                Ok(diags) => {
+                    batch = Some(diags);
+                    break;
+                }
+                Err(err) if err.is_closed() => break,
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+        let batch = batch.expect("diagnostics are published for the opened document");
+
+        assert!(
+            !batch.iter().any(|d| d.message.contains("feature_flags")),
+            "search_path table must not be flagged, got {batch:?}"
+        );
+        assert!(
+            batch
+                .iter()
+                .any(|d| d.message.contains("no_such_table_xyz")),
+            "missing table must still be flagged, got {batch:?}"
+        );
+
         client.shutdown();
     }
 

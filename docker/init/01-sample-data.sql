@@ -121,3 +121,20 @@ AS $$
     FROM orders
     WHERE customer_id = p_customer_id AND status <> 'cancelled';
 $$;
+
+-- A second schema reachable only through the role's search_path
+-- (`ALTER ROLE … SET search_path`), for testing that language-server
+-- diagnostics resolve unqualified table names the same way query
+-- execution does.
+CREATE SCHEMA app;
+
+CREATE TABLE app.feature_flags (
+    id serial PRIMARY KEY,
+    name text NOT NULL,
+    enabled boolean NOT NULL DEFAULT FALSE
+);
+
+INSERT INTO app.feature_flags (name, enabled)
+VALUES ('dark_mode', TRUE), ('beta_exports', FALSE);
+
+ALTER ROLE pgui SET search_path TO app, public;
