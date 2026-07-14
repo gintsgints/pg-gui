@@ -41,6 +41,10 @@ pgls_fs = { git = "https://github.com/gintsgints/postgres-language-server", bran
 pgls_text_size = { git = "https://github.com/gintsgints/postgres-language-server", branch = "bump_treesitter" }
 pgls_workspace = { git = "https://github.com/gintsgints/postgres-language-server", branch = "bump_treesitter" }
 postgres = "0.19"
+# Native file-open dialog with a controllable start directory; gpui's
+# `prompt_for_paths` can't set one (its Save panel counterpart can, so the
+# save/export dialogs stay on gpui).
+rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }

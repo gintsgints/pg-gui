@@ -121,6 +121,10 @@ pub struct Config {
     /// Casing the formatter applies to constants (NULL, TRUE, FALSE).
     #[serde(default)]
     pub constant_case: CaseStyle,
+    /// Directory the file dialogs (Open, Save As, Export) start in; set to
+    /// the parent of the last file chosen in any of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_dir: Option<PathBuf>,
     /// UI zoom factor (cmd +/-, cmd-0 to reset); 1.0 means 100%.
     #[serde(default = "default_zoom")]
     pub zoom: f32,
@@ -181,6 +185,7 @@ impl Default for Config {
             format_on_save: false,
             keyword_case: CaseStyle::default(),
             constant_case: CaseStyle::default(),
+            last_dir: None,
             zoom: default_zoom(),
             theme: ThemeSelection::default(),
         }

@@ -7,9 +7,8 @@ use futures::StreamExt as _;
 use gpui::Subscription;
 use gpui::{
     App, AppContext as _, Context, Entity, EntityInputHandler as _, Focusable as _, Hsla,
-    InteractiveElement as _, IntoElement, Menu, MenuItem, NoAction, ParentElement as _,
-    PathPromptOptions, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Window, div, px,
+    InteractiveElement as _, IntoElement, Menu, MenuItem, NoAction, ParentElement as _, Pixels,
+    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, IndexPath, Root, Sizable as _, Theme, ThemeMode, TitleBar,
@@ -312,6 +311,19 @@ fn apply_theme_selection(theme: config::ThemeSelection, window: &mut Window, cx:
 /// stat'd. Used to notice when a tab's file was edited outside the app.
 fn file_mtime(path: &Path) -> Option<SystemTime> {
     path.metadata().ok()?.modified().ok()
+}
+
+/// Where a file dialog (Open, Save As, Export) should start: the directory
+/// the last dialog picked a file in, then the active tab's file's directory,
+/// then home — the first of those that still exists on disk.
+fn dialog_start_dir(last_dir: Option<&Path>, tab_file: Option<&Path>) -> PathBuf {
+    last_dir
+        .filter(|dir| dir.is_dir())
+        .or_else(|| tab_file.and_then(Path::parent).filter(|dir| dir.is_dir()))
+        .map_or_else(
+            || dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
+            Path::to_path_buf,
+        )
 }
 
 /// Replace the username and password in a connection string with stars, for
@@ -1031,6 +1043,22 @@ impl PgGuiApp {
         self.config_disk_time = config::modified_time();
     }
 
+    /// Where the next file dialog should start (see [`dialog_start_dir`]).
+    fn start_dir(&self) -> PathBuf {
+        dialog_start_dir(
+            self.config.last_dir.as_deref(),
+            self.tabs
+                .get(self.active_tab)
+                .and_then(|tab| tab.path.as_deref()),
+        )
+    }
+
+    /// Adopt the directory of a file just chosen in a dialog as the start
+    /// directory for the next one. Callers persist it with `save_config`.
+    fn remember_dir(&mut self, path: &Path) {
+        self.config.last_dir = path.parent().map(Path::to_path_buf);
+    }
+
     /// Poll the config file and every open script file once a second, so
     /// external edits (config via cmd-,, scripts via another editor) are
     /// picked up live instead of being overwritten by our next save.
@@ -1656,8 +1684,7 @@ impl PgGuiApp {
                 ExportFormat::Inserts => "sql",
             },
         );
-        let dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let rx = cx.prompt_for_new_path(&dir, Some(&default_name));
+        let rx = cx.prompt_for_new_path(&self.start_dir(), Some(&default_name));
 
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = rx.await else { return };
@@ -1686,10 +1713,14 @@ impl PgGuiApp {
             this.update_in(cx, |this, window, cx| {
                 this.running = false;
                 match result {
-                    Ok(detail) => this.set_status(
-                        format!("Exported {detail} to {} in {elapsed:.0?}", path.display()),
-                        cx,
-                    ),
+                    Ok(detail) => {
+                        this.remember_dir(&path);
+                        this.save_config();
+                        this.set_status(
+                            format!("Exported {detail} to {} in {elapsed:.0?}", path.display()),
+                            cx,
+                        );
+                    }
                     Err(err) => this.show_query_error(&err, window, cx),
                 }
             })
@@ -2263,27 +2294,25 @@ impl PgGuiApp {
         self.tabs[ix].path.is_none() && self.tabs[ix].editor.read(cx).value().is_empty()
     }
 
-    // &mut self is imposed by the action listener signature.
-    #[allow(clippy::unused_self)]
     pub fn open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Open SQL script".into()),
-        });
+        // rfd instead of gpui's `prompt_for_paths`, which offers no way to
+        // pick the directory the panel opens in.
+        let dialog = rfd::AsyncFileDialog::new()
+            .set_directory(self.start_dir())
+            .set_title("Open SQL script")
+            .add_filter("SQL scripts", &["sql"])
+            .add_filter("All files", &["*"]);
 
         cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = rx.await else {
+            let Some(file) = dialog.pick_file().await else {
                 return;
             };
-            let Some(path) = paths.into_iter().next() else {
-                return;
-            };
+            let path = file.path().to_path_buf();
             let content = std::fs::read_to_string(&path);
 
             this.update_in(cx, |this, window, cx| match content {
                 Ok(content) => {
+                    this.remember_dir(&path);
                     // A file that is already open just gets its tab
                     // selected, keeping any unsaved edits in its buffer.
                     if let Some(ix) = this
@@ -2292,6 +2321,7 @@ impl PgGuiApp {
                         .position(|tab| tab.path.as_deref() == Some(path.as_path()))
                     {
                         this.activate_tab(ix, window, cx);
+                        this.save_config();
                         this.set_status(format!("{} was already open", path.display()), cx);
                         return;
                     }
@@ -2693,8 +2723,7 @@ impl PgGuiApp {
             return;
         }
 
-        let dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let rx = cx.prompt_for_new_path(&dir, Some("script.sql"));
+        let rx = cx.prompt_for_new_path(&self.start_dir(), Some("script.sql"));
 
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = rx.await else { return };
@@ -2702,6 +2731,7 @@ impl PgGuiApp {
 
             this.update_in(cx, |this, window, cx| match result {
                 Ok(()) => {
+                    this.remember_dir(&path);
                     this.set_status(format!("Saved {}", path.display()), cx);
                     this.set_tab_path(ix, path, window);
                     this.mark_saved(ix, content, cx);
@@ -2967,7 +2997,33 @@ impl Render for PgGuiApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{mask_credentials, toggle_line_comments};
+    use std::path::{Path, PathBuf};
+
+    use super::{dialog_start_dir, mask_credentials, toggle_line_comments};
+
+    #[test]
+    fn dialog_start_dir_prefers_existing_last_dir() {
+        let dir = std::env::temp_dir();
+        assert_eq!(dialog_start_dir(Some(&dir), None), dir);
+    }
+
+    #[test]
+    fn dialog_start_dir_skips_missing_last_dir() {
+        let missing = Path::new("/pg-gui-test-does-not-exist");
+        let tab_file = std::env::temp_dir().join("script.sql");
+        assert_eq!(
+            dialog_start_dir(Some(missing), Some(&tab_file)),
+            std::env::temp_dir()
+        );
+    }
+
+    #[test]
+    fn dialog_start_dir_falls_back_to_home() {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        assert_eq!(dialog_start_dir(None, None), home);
+        let missing_tab = Path::new("/pg-gui-test-does-not-exist/script.sql");
+        assert_eq!(dialog_start_dir(None, Some(missing_tab)), home);
+    }
 
     #[test]
     fn comments_a_single_line() {
