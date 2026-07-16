@@ -9,7 +9,6 @@
 //! what makes completions schema-aware.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::{Receiver as StdReceiver, RecvTimeoutError};
 use std::time::Duration;
 
@@ -67,7 +66,7 @@ fn contain_panic<T>(f: impl FnOnce() -> T) -> Result<T> {
 pub type DiagnosticsReceiver = mpsc::UnboundedReceiver<Vec<lsp_types::Diagnostic>>;
 
 /// A handle to an embedded language-server workspace. Cloning is cheap; the
-/// workspace and its background diagnostics worker are torn down once the last
+/// workspace and its background document worker are torn down once the last
 /// clone is dropped.
 #[derive(Clone)]
 pub struct Client {
@@ -80,10 +79,25 @@ struct Inner {
     connection_string: String,
     keyword_case: CaseStyle,
     constant_case: CaseStyle,
-    version: AtomicI32,
-    /// Wakes the diagnostics worker after the document changed. Dropping it
-    /// (with the last [`Client`] clone) signals the worker to exit.
-    diag_signal: std::sync::mpsc::Sender<()>,
+    /// Feeds the document worker. Every write to the workspace document
+    /// (change, format, close) goes through it, because workspace calls can
+    /// block for seconds waiting on an unreachable database and must never
+    /// run on the UI thread. Dropping it (with the last [`Client`] clone)
+    /// makes the worker close the document and exit.
+    doc_tx: std::sync::mpsc::Sender<DocEvent>,
+}
+
+/// Work items for the document worker thread.
+enum DocEvent {
+    /// The editor buffer changed (full-text sync).
+    Changed(String),
+    /// Format the workspace document and reply with the result.
+    Format {
+        text: String,
+        reply: oneshot::Sender<Result<Option<String>>>,
+    },
+    /// Close the workspace document and stop the worker.
+    Close,
 }
 
 impl Client {
@@ -141,17 +155,17 @@ impl Client {
             .map_err(|err| anyhow!("failed to open document: {err}"))?;
 
         let (diagnostics_tx, diagnostics_rx) = mpsc::unbounded();
-        let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+        let (doc_tx, doc_rx) = std::sync::mpsc::channel();
 
         let worker_workspace = workspace.clone();
         let worker_path = path.clone();
         std::thread::Builder::new()
-            .name("pg-lsp-diagnostics".into())
+            .name("pg-lsp-document".into())
             .spawn(move || {
-                diagnostics_worker(&worker_workspace, &worker_path, &signal_rx, &diagnostics_tx);
+                document_worker(&worker_workspace, &worker_path, &doc_rx, &diagnostics_tx);
             })?;
-        // Publish an initial set for the freshly opened document.
-        signal_tx.send(()).ok();
+        // Publish an initial diagnostics set for the freshly opened document.
+        doc_tx.send(DocEvent::Changed(text.to_string())).ok();
 
         let inner = Arc::new(Inner {
             workspace,
@@ -159,8 +173,7 @@ impl Client {
             connection_string: connection_string.to_string(),
             keyword_case,
             constant_case,
-            version: AtomicI32::new(0),
-            diag_signal: signal_tx,
+            doc_tx,
         });
         Ok((Self { inner }, diagnostics_rx))
     }
@@ -179,85 +192,113 @@ impl Client {
     }
 
     /// Tell the workspace the editor buffer changed (full-text sync) and
-    /// schedule a fresh diagnostics run.
+    /// schedule a fresh diagnostics run. Returns immediately: the change is
+    /// applied on the document worker thread, since workspace calls can block
+    /// on the database (e.g. a diagnostics run waiting out an unreachable
+    /// server holds the document lock) and this is called from the UI thread.
     pub fn document_changed(&self, text: String) {
-        let version = self.inner.version.fetch_add(1, Ordering::Relaxed) + 1;
-        contain_panic(|| {
-            self.inner
-                .workspace
-                .change_file(ChangeFileParams {
-                    path: self.inner.path.clone(),
-                    version,
-                    content: text,
-                })
-                .ok();
-        })
-        .ok();
-        self.inner.diag_signal.send(()).ok();
+        self.inner.doc_tx.send(DocEvent::Changed(text)).ok();
     }
 
     /// Format the whole document. The workspace formats its own copy (kept in
     /// sync via [`Self::document_changed`]); `text` is used only to decide
     /// whether anything changed. `None` when there is nothing to change —
     /// including when formatting is unavailable or the document does not
-    /// parse. Runs on a dedicated thread so the caller's executor is not
-    /// blocked.
+    /// parse. Runs on the document worker thread, ordered after any pending
+    /// buffer changes, so the caller's executor is not blocked.
     ///
     /// # Errors
     ///
     /// Fails when the workspace rejects the request.
     pub async fn format(&self, text: &str) -> Result<Option<String>> {
-        let workspace = self.inner.workspace.clone();
-        let path = self.inner.path.clone();
-        let text = text.to_string();
-        let (tx, rx) = oneshot::channel();
-        std::thread::spawn(move || {
-            tx.send(format_document(&workspace, &path, &text)).ok();
-        });
+        let (reply, rx) = oneshot::channel();
+        self.inner
+            .doc_tx
+            .send(DocEvent::Format {
+                text: text.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow!("language server is shut down"))?;
         rx.await
             .map_err(|_| anyhow!("formatting task was cancelled"))?
     }
 
-    /// Close the workspace document. The background worker stops once the last
-    /// [`Client`] clone is dropped.
+    /// Close the workspace document and stop the document worker. Returns
+    /// immediately; the worker closes the document on its own thread.
     pub fn shutdown(&self) {
-        contain_panic(|| {
-            self.inner
-                .workspace
-                .close_file(CloseFileParams {
-                    path: self.inner.path.clone(),
-                })
-                .ok();
-        })
-        .ok();
+        self.inner.doc_tx.send(DocEvent::Close).ok();
     }
 }
 
-/// Blocks on the workspace waiting for change signals, coalescing bursts and
-/// republishing diagnostics after each settled edit. Returns when the signal
-/// channel is dropped (i.e. the last [`Client`] is gone).
-fn diagnostics_worker(
+/// Owns every write to the workspace document. Applies buffer changes as they
+/// arrive, answers format requests in order, and republishes diagnostics once
+/// a burst of edits settles ([`DEBOUNCE`]). Workspace calls can block for
+/// seconds while the database is unreachable (diagnostics hold the document
+/// lock across connection attempts), which is why all of this runs on its own
+/// thread. Returns — closing the workspace document on the way out — when a
+/// [`DocEvent::Close`] arrives or the channel is dropped (i.e. the last
+/// [`Client`] is gone).
+fn document_worker(
     workspace: &Arc<dyn Workspace>,
     path: &PgLSPath,
-    signal: &StdReceiver<()>,
+    events: &StdReceiver<DocEvent>,
     diagnostics_tx: &mpsc::UnboundedSender<Vec<lsp_types::Diagnostic>>,
 ) {
-    while signal.recv().is_ok() {
-        // Coalesce a rapid-fire burst of edits into a single analysis run.
-        loop {
-            match signal.recv_timeout(DEBOUNCE) {
-                Ok(()) => {}
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(RecvTimeoutError::Disconnected) => return,
+    let mut version = 0;
+    // Set after a change; cleared once its diagnostics run has published.
+    let mut dirty = false;
+    loop {
+        // While a diagnostics run is pending, wait only DEBOUNCE for the
+        // next event, so a burst of edits coalesces into one analysis run.
+        let event = if dirty {
+            match events.recv_timeout(DEBOUNCE) {
+                Ok(event) => Some(event),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match events.recv() {
+                Ok(event) => Some(event),
+                Err(_) => break,
+            }
+        };
+        match event {
+            Some(DocEvent::Changed(content)) => {
+                version += 1;
+                contain_panic(|| {
+                    workspace
+                        .change_file(ChangeFileParams {
+                            path: path.clone(),
+                            version,
+                            content,
+                        })
+                        .ok();
+                })
+                .ok();
+                dirty = true;
+            }
+            Some(DocEvent::Format { text, reply }) => {
+                reply.send(format_document(workspace, path, &text)).ok();
+            }
+            Some(DocEvent::Close) => break,
+            None => {
+                // The burst settled. A contained panic publishes nothing and
+                // keeps the worker alive for the next edit.
+                let diagnostics =
+                    contain_panic(|| pull_diagnostics(workspace, path)).unwrap_or_default();
+                if diagnostics_tx.unbounded_send(diagnostics).is_err() {
+                    break;
+                }
+                dirty = false;
             }
         }
-        // A contained panic publishes nothing and keeps the worker alive
-        // for the next edit.
-        let diagnostics = contain_panic(|| pull_diagnostics(workspace, path)).unwrap_or_default();
-        if diagnostics_tx.unbounded_send(diagnostics).is_err() {
-            return;
-        }
     }
+    contain_panic(|| {
+        workspace
+            .close_file(CloseFileParams { path: path.clone() })
+            .ok();
+    })
+    .ok();
 }
 
 fn pull_diagnostics(workspace: &Arc<dyn Workspace>, path: &PgLSPath) -> Vec<lsp_types::Diagnostic> {
