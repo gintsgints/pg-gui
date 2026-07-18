@@ -125,6 +125,16 @@ pub struct Config {
     /// the parent of the last file chosen in any of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_dir: Option<PathBuf>,
+    /// Folder shown in the files side panel; set by File ▸ Open Folder….
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<PathBuf>,
+    /// Whether the files side panel is shown (toggled with cmd-shift-e).
+    #[serde(default = "default_true")]
+    pub files_panel_visible: bool,
+    /// Width of the files side panel in pixels; `None` until its divider
+    /// is first dragged.
+    #[serde(default)]
+    pub files_panel_width: Option<f32>,
     /// UI zoom factor (cmd +/-, cmd-0 to reset); 1.0 means 100%.
     #[serde(default = "default_zoom")]
     pub zoom: f32,
@@ -186,10 +196,17 @@ impl Default for Config {
             keyword_case: CaseStyle::default(),
             constant_case: CaseStyle::default(),
             last_dir: None,
+            working_dir: None,
+            files_panel_visible: default_true(),
+            files_panel_width: None,
             zoom: default_zoom(),
             theme: ThemeSelection::default(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_zoom() -> f32 {

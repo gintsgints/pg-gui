@@ -6,6 +6,7 @@ mod app;
 mod config;
 mod db;
 mod export;
+mod file_tree;
 mod instance;
 mod lsp;
 mod results;
@@ -30,6 +31,8 @@ actions!(
         NextTab,
         PrevTab,
         OpenFile,
+        OpenFolder,
+        ToggleFilesPanel,
         SaveFile,
         OpenSnippets,
         OpenConfig,
@@ -126,6 +129,7 @@ fn main() {
             KeyBinding::new("ctrl-tab", NextTab, None),
             KeyBinding::new("ctrl-shift-tab", PrevTab, None),
             KeyBinding::new("secondary-o", OpenFile, None),
+            KeyBinding::new("secondary-b", ToggleFilesPanel, None),
             KeyBinding::new("secondary-s", SaveFile, None),
             KeyBinding::new("secondary-p", OpenSnippets, None),
             KeyBinding::new("secondary-,", OpenConfig, None),

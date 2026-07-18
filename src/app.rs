@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -19,21 +20,22 @@ use gpui_component::{
     input::{
         Escape as InputEscape, IndentInline, Input, InputEvent, InputState, RopeExt as _, TabSize,
     },
-    list::{List, ListEvent, ListState},
-    resizable::{ResizableState, resizable_panel, v_resizable},
+    list::{List, ListEvent, ListItem, ListState},
+    resizable::{ResizableState, h_resizable, resizable_panel, v_resizable},
     searchable_list::{SearchableListItem, SearchableVec},
     tab::{Tab, TabBar},
     table::{DataTable, TableState},
     tooltip::Tooltip,
+    tree::{TreeEvent, TreeState, tree},
     v_flex,
 };
 
 use crate::results::ResultsDelegate;
 use crate::{
     AiComplete, CloseTab, Connect, EditConnection, ExportCsv, ExportInserts, FormatScript,
-    NewConnection, NewFile, NextTab, OpenConfig, OpenFile, OpenGitHub, OpenSnippets, PrevTab, Quit,
-    RunQuery, SaveFile, SetTheme, ShowHelp, ToggleComment, ZoomIn, ZoomOut, ZoomReset, ai, config,
-    db, export, lsp, snippets, statement,
+    NewConnection, NewFile, NextTab, OpenConfig, OpenFile, OpenFolder, OpenGitHub, OpenSnippets,
+    PrevTab, Quit, RunQuery, SaveFile, SetTheme, ShowHelp, ToggleComment, ToggleFilesPanel, ZoomIn,
+    ZoomOut, ZoomReset, ai, config, db, export, file_tree, lsp, snippets, statement,
 };
 
 /// The project's GitHub page, opened from the About application menu.
@@ -67,6 +69,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cmd-w", "Close the tab"),
     ("ctrl-tab / ctrl-shift-tab", "Next / previous tab"),
     ("cmd-o", "Open a SQL script"),
+    ("cmd-b", "Show or hide the files panel"),
     ("cmd-s", "Save the script"),
     ("cmd-,", "Open config.json in the system editor"),
     ("cmd-plus / cmd-minus", "Zoom in / out"),
@@ -88,6 +91,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("ctrl-w", "Close the tab"),
     ("ctrl-tab / ctrl-shift-tab", "Next / previous tab"),
     ("ctrl-o", "Open a SQL script"),
+    ("ctrl-b", "Show or hide the files panel"),
     ("ctrl-s", "Save the script"),
     ("ctrl-,", "Open config.json in the system editor"),
     ("ctrl-plus / ctrl-minus", "Zoom in / out"),
@@ -248,6 +252,7 @@ fn build_menus(recents: &[config::RecentConnection], theme: config::ThemeSelecti
             disabled: false,
             items: vec![
                 MenuItem::action("Open…", OpenFile),
+                MenuItem::action("Open Folder…", OpenFolder),
                 MenuItem::action("Save", SaveFile),
                 MenuItem::separator(),
                 MenuItem::action("New Tab", NewFile),
@@ -271,6 +276,8 @@ fn build_menus(recents: &[config::RecentConnection], theme: config::ThemeSelecti
             name: "View".into(),
             disabled: false,
             items: vec![
+                MenuItem::action("Toggle Files Panel", ToggleFilesPanel),
+                MenuItem::separator(),
                 MenuItem::action("Zoom In", ZoomIn),
                 MenuItem::action("Zoom Out", ZoomOut),
                 MenuItem::action("Actual Size", ZoomReset),
@@ -595,6 +602,20 @@ pub struct PgGuiApp {
     /// Split state of the editor/results panels; the editor height is
     /// persisted to the config whenever the divider is dragged.
     resizable_state: Entity<ResizableState>,
+    /// Split state of the files panel / editor area; the panel width is
+    /// persisted to the config whenever the divider is dragged.
+    sidebar_state: Entity<ResizableState>,
+    /// Items shown in the files panel, scanned from `config.working_dir`.
+    tree_state: Entity<TreeState>,
+    /// Ids (absolute paths) of the tree's expanded directories, re-applied
+    /// when the tree is rebuilt after a re-scan.
+    expanded_dirs: HashSet<SharedString>,
+    /// Ids of every directory in the tree. The tree's own `is_folder()` is
+    /// children-based, so empty directories need this to get a folder icon.
+    tree_dirs: Rc<HashSet<SharedString>>,
+    /// Hash of the last scan, so an unchanged re-scan skips the rebuild
+    /// (which would reset the tree's selection).
+    tree_signature: u64,
     status: SharedString,
     running: bool,
     ai_running: bool,
@@ -629,8 +650,11 @@ impl PgGuiApp {
         cx.new(|cx| Self::new(window, cx))
     }
 
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        snippets::ensure_dir();
+    /// Load the config and patch it up for this launch: resolve the
+    /// connection string (`DATABASE_URL` wins), keep it in the recent list,
+    /// guarantee at least one tab with a valid active index, and drop
+    /// remembered tab files that no longer exist (back to prompt-on-save).
+    fn launch_config() -> config::Config {
         let mut config = config::load();
         // DATABASE_URL (explicit at launch) wins over the saved config, which
         // holds whatever was last typed into the connection field.
@@ -651,13 +675,17 @@ impl PgGuiApp {
             config.tabs.push(config::ScriptTab::default());
         }
         config.active_tab = config.active_tab.min(config.tabs.len() - 1);
-        // A remembered path whose file is gone is dropped, back to
-        // prompt-on-save.
         for tab in &mut config.tabs {
             if tab.file.as_ref().is_some_and(|path| !path.exists()) {
                 tab.file = None;
             }
         }
+        config
+    }
+
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        snippets::ensure_dir();
+        let config = Self::launch_config();
 
         // Set the theme before anything reads it: the editors pick up
         // highlighting from it and the base font sizes below come from it.
@@ -673,6 +701,8 @@ impl PgGuiApp {
         let results =
             cx.new(|cx| TableState::new(ResultsDelegate::new(config.page_size), window, cx));
         let resizable_state = cx.new(|_| ResizableState::default());
+        let sidebar_state = cx.new(|_| ResizableState::default());
+        let tree_state = cx.new(|cx| TreeState::new(cx));
 
         let (connections, connections_sub) = Self::build_connection_combo(&config, window, cx);
 
@@ -692,6 +722,7 @@ impl PgGuiApp {
                 async {}
             }),
             connections_sub,
+            Self::track_expanded_dirs(&tree_state, cx),
             // Follow OS light/dark switches while the theme is "System".
             window.observe_window_appearance(move |window, cx| {
                 weak_this
@@ -726,6 +757,11 @@ impl PgGuiApp {
             active_tab,
             results,
             resizable_state,
+            sidebar_state,
+            tree_state,
+            expanded_dirs: HashSet::new(),
+            tree_dirs: Rc::new(HashSet::new()),
+            tree_signature: 0,
             status: "Ready".into(),
             running: false,
             ai_running: false,
@@ -743,6 +779,7 @@ impl PgGuiApp {
         this.update_window_title(window);
         this.refresh_menus(cx);
         this.start_lsp(cx);
+        this.load_tree(cx);
         Self::watch_files(window, cx);
         this.apply_zoom(cx);
         this
@@ -1062,18 +1099,75 @@ impl PgGuiApp {
     /// Poll the config file and every open script file once a second, so
     /// external edits (config via cmd-,, scripts via another editor) are
     /// picked up live instead of being overwritten by our next save.
+    /// Every third tick also re-scans the working directory for the files
+    /// panel; an unchanged scan is dropped by [`Self::load_tree`], so this
+    /// stays cheap.
     fn watch_files(window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
+            let mut tick: u32 = 0;
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
+                tick = tick.wrapping_add(1);
+                let refresh_tree = tick.is_multiple_of(3);
                 let alive = this.update_in(cx, |this, window, cx| {
                     this.check_config_file(window, cx);
                     this.check_tab_files(window, cx);
+                    if refresh_tree && this.config.files_panel_visible {
+                        this.load_tree(cx);
+                    }
                 });
                 if alive.is_err() {
                     break;
                 }
             }
+        })
+        .detach();
+    }
+
+    /// Track which directories the user has open in the files panel, so a
+    /// tree rebuild after a re-scan can restore them.
+    fn track_expanded_dirs(tree_state: &Entity<TreeState>, cx: &mut Context<Self>) -> Subscription {
+        cx.subscribe(tree_state, |this, _, event: &TreeEvent, _| match event {
+            TreeEvent::Expanded(id) => {
+                this.expanded_dirs.insert(id.clone());
+            }
+            TreeEvent::Collapsed(id) => {
+                this.expanded_dirs.remove(id);
+            }
+        })
+    }
+
+    /// Re-scan the working directory on the background executor and swap
+    /// the result into the files panel — unless nothing changed since the
+    /// last scan, since a rebuild resets the tree's selection. A no-op
+    /// without a working directory.
+    fn load_tree(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.config.working_dir.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            // The scan produces Send-able nodes; `TreeItem` itself is
+            // Rc-based and must be built on the UI thread below.
+            let (sig, nodes) = cx
+                .background_spawn(async move {
+                    let mut budget = file_tree::ENTRY_BUDGET;
+                    let nodes = file_tree::scan_dir(&root, file_tree::MAX_DEPTH, &mut budget);
+                    (file_tree::signature(&nodes), nodes)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if sig == this.tree_signature {
+                    return;
+                }
+                this.tree_signature = sig;
+                let mut dirs = HashSet::new();
+                let items = file_tree::to_tree_items(&nodes, &this.expanded_dirs, &mut dirs);
+                this.tree_dirs = Rc::new(dirs);
+                this.tree_state
+                    .update(cx, |state, cx| state.set_items(items, cx));
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -1207,6 +1301,12 @@ impl PgGuiApp {
 
         if self.config.theme != old.theme {
             self.apply_theme(window, cx);
+        }
+
+        if self.config.working_dir != old.working_dir {
+            self.expanded_dirs.clear();
+            self.tree_signature = 0;
+            self.load_tree(cx);
         }
 
         self.set_status("Reloaded config.json", cx);
@@ -2308,47 +2408,96 @@ impl PgGuiApp {
                 return;
             };
             let path = file.path().to_path_buf();
-            let content = std::fs::read_to_string(&path);
+            this.update_in(cx, |this, window, cx| this.open_path(&path, window, cx))
+                .ok();
+        })
+        .detach();
+    }
 
-            this.update_in(cx, |this, window, cx| match content {
-                Ok(content) => {
-                    this.remember_dir(&path);
-                    // A file that is already open just gets its tab
-                    // selected, keeping any unsaved edits in its buffer.
-                    if let Some(ix) = this
-                        .tabs
-                        .iter()
-                        .position(|tab| tab.path.as_deref() == Some(path.as_path()))
-                    {
-                        this.activate_tab(ix, window, cx);
-                        this.save_config();
-                        this.set_status(format!("{} was already open", path.display()), cx);
-                        return;
-                    }
-                    // Open into a new tab, except an untouched fresh tab
-                    // is filled in place.
-                    let ix = if this.tab_is_pristine(this.active_tab, cx) {
-                        let ix = this.active_tab;
-                        this.config.tabs[ix].script.clone_from(&content);
-                        this.tabs[ix].saved.clone_from(&content);
-                        this.tabs[ix].dirty = false;
-                        this.tabs[ix].editor.update(cx, |state, cx| {
-                            state.set_value(content, window, cx);
-                        });
-                        ix
-                    } else {
-                        this.add_tab(content, None, window, cx)
-                    };
-                    this.activate_tab(ix, window, cx);
-                    this.set_tab_path(ix, path.clone(), window);
-                    this.save_config();
-                    this.set_status(format!("Opened {}", path.display()), cx);
-                }
-                Err(err) => this.set_status(format!("Open failed: {err}"), cx),
+    /// Open a script file into a tab; shared by the Open… dialog and the
+    /// files panel.
+    fn open_path(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(err) => {
+                self.set_status(format!("Open failed: {err}"), cx);
+                return;
+            }
+        };
+        self.remember_dir(path);
+        // A file that is already open just gets its tab selected, keeping
+        // any unsaved edits in its buffer.
+        if let Some(ix) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.path.as_deref() == Some(path))
+        {
+            self.activate_tab(ix, window, cx);
+            self.save_config();
+            self.set_status(format!("{} was already open", path.display()), cx);
+            return;
+        }
+        // Open into a new tab, except an untouched fresh tab is filled in
+        // place.
+        let ix = if self.tab_is_pristine(self.active_tab, cx) {
+            let ix = self.active_tab;
+            self.config.tabs[ix].script.clone_from(&content);
+            self.tabs[ix].saved.clone_from(&content);
+            self.tabs[ix].dirty = false;
+            self.tabs[ix].editor.update(cx, |state, cx| {
+                state.set_value(content, window, cx);
+            });
+            ix
+        } else {
+            self.add_tab(content, None, window, cx)
+        };
+        self.activate_tab(ix, window, cx);
+        self.set_tab_path(ix, path.to_path_buf(), window);
+        self.save_config();
+        self.set_status(format!("Opened {}", path.display()), cx);
+    }
+
+    /// Pick the working directory shown in the files side panel.
+    pub fn open_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
+        let dialog = rfd::AsyncFileDialog::new()
+            .set_directory(self.start_dir())
+            .set_title("Open folder");
+
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(folder) = dialog.pick_folder().await else {
+                return;
+            };
+            // Canonicalize once here so every id derived from it (the tree
+            // items' paths) is consistent across scans.
+            let path = folder.path();
+            let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            this.update_in(cx, |this, _, cx| {
+                this.config.working_dir = Some(path);
+                this.config.files_panel_visible = true;
+                this.expanded_dirs.clear();
+                this.tree_signature = 0;
+                this.load_tree(cx);
+                this.save_config();
+                cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Show or hide the files side panel (cmd-shift-e).
+    pub fn toggle_files_panel(
+        &mut self,
+        _: &ToggleFilesPanel,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.config.files_panel_visible = !self.config.files_panel_visible;
+        if self.config.files_panel_visible {
+            self.load_tree(cx);
+        }
+        self.schedule_save(cx);
+        cx.notify();
     }
 
     /// Open the config file in the system default editor (cmd-,).
@@ -2860,6 +3009,146 @@ impl PgGuiApp {
             ))
     }
 
+    /// The editor (with its tab bar) over the results table, split by a
+    /// draggable divider; the split position is persisted to the config on
+    /// drag and restored on launch via the editor panel's initial size.
+    fn render_editor_results(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        v_resizable("editor-results")
+            .with_state(&self.resizable_state)
+            .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _, cx| {
+                if let Some(height) = state.read(cx).sizes().first() {
+                    this.config.editor_height = Some(f32::from(*height));
+                    this.schedule_save(cx);
+                }
+            }))
+            .child({
+                // Tab bar over the SQL editor
+                let mut panel = resizable_panel().child(
+                    v_flex().size_full().child(self.render_tab_bar(cx)).child(
+                        div().flex_1().min_h(px(0.)).p_2().child(
+                            Input::new(&self.editor())
+                                .h_full()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_size(cx.theme().mono_font_size),
+                        ),
+                    ),
+                );
+                if let Some(height) = self.config.editor_height {
+                    panel = panel.size(px(height));
+                }
+                panel
+            })
+            .child(
+                // Results table with pager
+                resizable_panel().child(
+                    v_flex()
+                        .size_full()
+                        .p_2()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h(px(0.))
+                                .child(DataTable::new(&self.results)),
+                        )
+                        .children(self.render_results_pager(cx)),
+                ),
+            )
+    }
+
+    /// The files side panel: the working directory's tree, or an "Open
+    /// Folder…" hint while none is set. Non-SQL files are disabled — shown
+    /// greyed out, with no click handlers.
+    fn render_files_panel(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let Some(root) = self.config.working_dir.clone() else {
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No folder open"),
+                )
+                .child(
+                    Button::new("open-folder")
+                        .outline()
+                        .small()
+                        .label("Open Folder…")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_folder(&OpenFolder, window, cx);
+                        })),
+                );
+        };
+
+        let folder_name = root.file_name().map_or_else(
+            || root.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let dirs = self.tree_dirs.clone();
+        let view = cx.entity();
+        v_flex()
+            .size_full()
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .truncate()
+                    .child(folder_name),
+            )
+            .child(div().flex_1().min_h(px(0.)).px_1().child(tree(
+                &self.tree_state,
+                move |ix, entry, _selected, _window, cx| {
+                    view.update(cx, |_, cx| {
+                        let item = entry.item();
+                        // The tree's own `is_folder()` is children-based
+                        // and misses empty directories.
+                        let is_dir = entry.is_folder() || dirs.contains(&item.id);
+                        // Text glyphs, like the tab bar: gpui-component
+                        // ships no icon assets, so `IconName` renders blank.
+                        let glyph = if !is_dir {
+                            ""
+                        } else if entry.is_expanded() {
+                            "▾"
+                        } else {
+                            "▸"
+                        };
+                        let list_item = ListItem::new(ix)
+                            .w_full()
+                            .rounded(cx.theme().radius)
+                            .px_2()
+                            .pl(px(14.) * entry.depth() + px(8.))
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .w_4()
+                                            .flex_none()
+                                            .text_center()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(glyph),
+                                    )
+                                    .child(item.label.clone()),
+                            );
+                        if is_dir {
+                            // Folders expand through the tree's own
+                            // click handling.
+                            list_item
+                        } else {
+                            let path = PathBuf::from(item.id.to_string());
+                            list_item.on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_path(&path, window, cx);
+                            }))
+                        }
+                    })
+                },
+            )))
+    }
+
     /// One tab per open script, with a "×" close button each and a
     /// trailing "+" that opens a fresh one. A tab with unsaved edits is
     /// marked with a leading "•", or "⟳" when its file also changed on disk
@@ -2927,6 +3216,8 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
             .on_action(cx.listener(Self::open_file))
+            .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(Self::toggle_files_panel))
             .on_action(cx.listener(Self::save_file))
             .on_action(cx.listener(Self::open_snippet_picker))
             .on_action(cx.listener(Self::open_config))
@@ -2941,52 +3232,35 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::request_quit))
             .child(self.render_title_bar(cx))
             .child(
-                // Editor over results, split by a draggable divider. The
-                // split position is persisted to the config on drag and
-                // restored on launch via the editor panel's initial size.
-                div().flex_1().min_h(px(0.)).child(
-                    v_resizable("editor-results")
-                        .with_state(&self.resizable_state)
-                        .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _, cx| {
-                            if let Some(height) = state.read(cx).sizes().first() {
-                                this.config.editor_height = Some(f32::from(*height));
-                                this.schedule_save(cx);
-                            }
-                        }))
-                        .child({
-                            // Tab bar over the SQL editor
-                            let mut panel = resizable_panel().child(
-                                v_flex().size_full().child(self.render_tab_bar(cx)).child(
-                                    div().flex_1().min_h(px(0.)).p_2().child(
-                                        Input::new(&self.editor())
-                                            .h_full()
-                                            .font_family(cx.theme().mono_font_family.clone())
-                                            .text_size(cx.theme().mono_font_size),
-                                    ),
-                                ),
-                            );
-                            if let Some(height) = self.config.editor_height {
-                                panel = panel.size(px(height));
-                            }
-                            panel
-                        })
-                        .child(
-                            // Results table with pager
-                            resizable_panel().child(
-                                v_flex()
-                                    .size_full()
-                                    .p_2()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_h(px(0.))
-                                            .child(DataTable::new(&self.results)),
-                                    )
-                                    .children(self.render_results_pager(cx)),
-                            ),
-                        ),
-                ),
+                // The files panel next to the editor area, both split by
+                // draggable dividers whose positions are persisted to the
+                // config on drag and restored on launch.
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(if self.config.files_panel_visible {
+                        h_resizable("editor-sidebar")
+                            .with_state(&self.sidebar_state)
+                            .on_resize(cx.listener(
+                                |this, state: &Entity<ResizableState>, _, cx| {
+                                    // The panel is the second (right) child.
+                                    if let Some(width) = state.read(cx).sizes().last() {
+                                        this.config.files_panel_width = Some(f32::from(*width));
+                                        this.schedule_save(cx);
+                                    }
+                                },
+                            ))
+                            .child(resizable_panel().child(self.render_editor_results(cx)))
+                            .child(
+                                resizable_panel()
+                                    .size(px(self.config.files_panel_width.unwrap_or(240.)))
+                                    .size_range(px(120.)..px(600.))
+                                    .child(self.render_files_panel(cx)),
+                            )
+                            .into_any_element()
+                    } else {
+                        self.render_editor_results(cx).into_any_element()
+                    }),
             )
             .child(self.render_status_bar(cx))
             // Dialogs (e.g. the snippet picker) are drawn by the app's root
