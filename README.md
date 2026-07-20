@@ -76,10 +76,13 @@ the app while it's already open just raises the running window.
 
 ## Test database
 
-A disposable Postgres with sample data (customers/orders) is included:
+A disposable Postgres with sample data (customers/orders) is included. It is a
+custom image (`docker/Dockerfile`) — `postgres:17` plus the
+[pldebugger](https://github.com/EnterpriseDB/pldebugger) extension compiled from
+source — so the first start builds the image:
 
 ```sh
-docker compose up -d --wait
+docker compose up -d --build --wait
 ```
 
 It listens on port **5433** (to avoid clashing with a local server on 5432).
@@ -89,8 +92,10 @@ Connect with:
 postgres://pgui:pgui@localhost:5433/pgui_test
 ```
 
-Seed scripts live in `docker/init/` and run on first start. `docker compose down -v`
-resets the data.
+Preloaded libraries: `pg_stat_statements` and `plugin_debugger`. Seed scripts
+live in `docker/init/` and run on first start — they enable the
+`pg_stat_statements` and `pldbgapi` extensions. `docker compose down -v` resets
+the data.
 
 ## AI completion
 

@@ -1,14 +1,18 @@
 services:
   postgres:
-    image: postgres:17
+    # Custom image: postgres:17 plus the pldebugger extension compiled from
+    # source (see docker/Dockerfile).
+    build:
+      context: ./docker
+    image: pg-gui-postgres:17
     container_name: pg-gui-test
     environment:
       POSTGRES_USER: pgui
       POSTGRES_PASSWORD: pgui
       POSTGRES_DB: pgui_test
-    # pg_stat_statements must be preloaded at server start; the extension
-    # itself is created in docker/init/02-pg-stat-statements.sql.
-    command: postgres -c shared_preload_libraries=pg_stat_statements
+    # pg_stat_statements and plugin_debugger (pldebugger) must be preloaded at
+    # server start; the extensions themselves are created in docker/init/.
+    command: postgres -c shared_preload_libraries=pg_stat_statements,plugin_debugger
     # 5433 on the host to avoid clashing with the locally running Postgres on 5432
     ports:
       - "5433:5432"
