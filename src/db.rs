@@ -23,7 +23,7 @@ fn connect(conn_str: &str) -> Result<Client, postgres::Error> {
 /// Render an error with its full cause. `postgres::Error`'s `Display` is
 /// just "db error" — the message, detail, and hint live in the underlying
 /// `DbError`, and connection failures bury the cause in the source chain.
-fn describe(error: &postgres::Error) -> String {
+pub(crate) fn describe(error: &postgres::Error) -> String {
     let Some(db) = error.as_db_error() else {
         let mut out = error.to_string();
         let mut source = std::error::Error::source(error);

@@ -5,6 +5,7 @@ mod ai;
 mod app;
 mod config;
 mod db;
+mod debug;
 mod export;
 mod file_tree;
 mod instance;
@@ -41,6 +42,11 @@ actions!(
         OpenGitHub,
         FormatScript,
         ToggleComment,
+        StartDebug,
+        DebugStepOver,
+        DebugStepInto,
+        DebugContinue,
+        DebugStop,
         ZoomIn,
         ZoomOut,
         ZoomReset,
@@ -135,6 +141,11 @@ fn main() {
             KeyBinding::new("secondary-,", OpenConfig, None),
             KeyBinding::new("secondary-shift-f", FormatScript, None),
             KeyBinding::new("secondary-/", ToggleComment, None),
+            KeyBinding::new("secondary-shift-d", StartDebug, None),
+            KeyBinding::new("f5", DebugContinue, None),
+            KeyBinding::new("f10", DebugStepOver, None),
+            KeyBinding::new("f11", DebugStepInto, None),
+            KeyBinding::new("shift-f5", DebugStop, None),
             KeyBinding::new("secondary-=", ZoomIn, None),
             KeyBinding::new("secondary-shift-=", ZoomIn, None),
             KeyBinding::new("secondary--", ZoomOut, None),

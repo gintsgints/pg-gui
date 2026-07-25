@@ -40,6 +40,10 @@ pgls_diagnostics = { git = "https://github.com/gintsgints/postgres-language-serv
 pgls_fs = { git = "https://github.com/gintsgints/postgres-language-server", branch = "bump_treesitter" }
 pgls_text_size = { git = "https://github.com/gintsgints/postgres-language-server", branch = "bump_treesitter" }
 pgls_workspace = { git = "https://github.com/gintsgints/postgres-language-server", branch = "bump_treesitter" }
+# PL/pgSQL step debugger over EnterpriseDB's pldebugger (`pldbg_*` proxy API),
+# embedded as a library (its `debugger::DebugSession`) rather than spawned as a
+# DAP server binary — same "library not binary" approach as the pgls fork above.
+pgdap = { git = "https://github.com/gintsgints/pgdap" }
 postgres = "0.19"
 # Native file-open dialog with a controllable start directory; gpui's
 # `prompt_for_paths` can't set one (its Save panel counterpart can, so the

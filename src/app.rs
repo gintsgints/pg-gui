@@ -8,13 +8,15 @@ use futures::StreamExt as _;
 use gpui::Subscription;
 use gpui::{
     App, AppContext as _, Context, Entity, EntityInputHandler as _, Focusable as _, Hsla,
-    InteractiveElement as _, IntoElement, Menu, MenuItem, NoAction, ParentElement as _, Pixels,
-    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    InteractiveElement as _, IntoElement, Menu, MenuItem, MouseButton, NoAction,
+    ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, IndexPath, Root, Sizable as _, Theme, ThemeMode, TitleBar,
-    WindowExt as _,
+    ActiveTheme as _, Disableable as _, IndexPath, Root, Sizable as _, StyledExt as _, Theme,
+    ThemeMode, TitleBar, WindowExt as _,
     button::{Button, ButtonVariants as _},
+    checkbox::Checkbox,
     combobox::{Combobox, ComboboxEvent, ComboboxState},
     h_flex,
     input::{
@@ -32,10 +34,11 @@ use gpui_component::{
 
 use crate::results::ResultsDelegate;
 use crate::{
-    AiComplete, CloseTab, Connect, EditConnection, ExportCsv, ExportInserts, FormatScript,
-    NewConnection, NewFile, NextTab, OpenConfig, OpenFile, OpenFolder, OpenGitHub, OpenSnippets,
-    PrevTab, Quit, RunQuery, SaveFile, SetTheme, ShowHelp, ToggleComment, ToggleFilesPanel, ZoomIn,
-    ZoomOut, ZoomReset, ai, config, db, export, file_tree, lsp, snippets, statement,
+    AiComplete, CloseTab, Connect, DebugContinue, DebugStepInto, DebugStepOver, DebugStop,
+    EditConnection, ExportCsv, ExportInserts, FormatScript, NewConnection, NewFile, NextTab,
+    OpenConfig, OpenFile, OpenFolder, OpenGitHub, OpenSnippets, PrevTab, Quit, RunQuery, SaveFile,
+    SetTheme, ShowHelp, StartDebug, ToggleComment, ToggleFilesPanel, ZoomIn, ZoomOut, ZoomReset,
+    ai, config, db, debug, export, file_tree, lsp, snippets, statement,
 };
 
 /// The project's GitHub page, opened from the About application menu.
@@ -273,6 +276,19 @@ fn build_menus(recents: &[config::RecentConnection], theme: config::ThemeSelecti
             ],
         },
         Menu {
+            name: "Debug".into(),
+            disabled: false,
+            items: vec![
+                MenuItem::action("Start Debug", StartDebug),
+                MenuItem::separator(),
+                MenuItem::action("Step Over", DebugStepOver),
+                MenuItem::action("Step Into", DebugStepInto),
+                MenuItem::action("Continue", DebugContinue),
+                MenuItem::separator(),
+                MenuItem::action("Stop", DebugStop),
+            ],
+        },
+        Menu {
             name: "View".into(),
             disabled: false,
             items: vec![
@@ -312,6 +328,71 @@ fn apply_theme_selection(theme: config::ThemeSelection, window: &mut Window, cx:
         config::ThemeSelection::Dark => Theme::change(ThemeMode::Dark, Some(window), cx),
         config::ThemeSelection::System => Theme::sync_system_appearance(Some(window), cx),
     }
+}
+
+/// Best-effort routine name from a `CREATE FUNCTION` / `CREATE PROCEDURE`
+/// statement, to prefill the debug launch dialog. Returns the (possibly
+/// schema-qualified) name up to its argument list; `None` when the statement is
+/// not a routine definition.
+///
+/// Comments are stripped first, and the `function`/`procedure` keyword only
+/// counts when the preceding word is `create`/`replace` — so prose like
+/// `-- function to add two numbers` does not masquerade as a definition.
+fn guess_signature(sql: &str) -> Option<String> {
+    let stripped = strip_sql_comments(sql);
+    let words: Vec<&str> = stripped.split_whitespace().collect();
+    for (i, word) in words.iter().enumerate() {
+        let keyword = word.to_ascii_lowercase();
+        if (keyword != "function" && keyword != "procedure") || i == 0 {
+            continue;
+        }
+        if !matches!(
+            words[i - 1].to_ascii_lowercase().as_str(),
+            "create" | "replace"
+        ) {
+            continue;
+        }
+        let Some(name) = words.get(i + 1) else {
+            continue;
+        };
+        let end = name.find('(').unwrap_or(name.len());
+        let name = name[..end].trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Strip `--` line comments and `/* */` block comments from SQL, so the words
+/// before a routine definition can be scanned without prose interfering.
+fn strip_sql_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '-' if chars.peek() == Some(&'-') => {
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = ' ';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// A file's last modification time, or `None` when it's missing or can't be
@@ -595,9 +676,29 @@ struct EditorTab {
     _subscription: Subscription,
 }
 
+/// Live state of a running debug session, shown in the debug panel that
+/// replaces the results table while active.
+struct DebugState {
+    session: debug::Session,
+    /// The most recent stop (source, current line, stack, variables). `None`
+    /// before the first stop.
+    stop: Option<debug::StopState>,
+    /// Breakpoint lines the user has toggled — body-relative to the debugged
+    /// source, matching `pldbg_get_source` line numbers. Drawn in the gutter
+    /// and mirrored to the session.
+    breakpoints: HashSet<i32>,
+    /// The debugged routine's result once it returns.
+    output: Option<String>,
+    /// Set once the session reports termination; the panel stays up (showing
+    /// the final output) until the user starts another or stops.
+    terminated: bool,
+}
+
 pub struct PgGuiApp {
     tabs: Vec<EditorTab>,
     active_tab: usize,
+    /// The active debug session, if any. Drives the debug panel.
+    debug: Option<DebugState>,
     results: Entity<TableState<ResultsDelegate>>,
     /// Split state of the editor/results panels; the editor height is
     /// persisted to the config whenever the divider is dragged.
@@ -755,6 +856,7 @@ impl PgGuiApp {
         let mut this = Self {
             tabs,
             active_tab,
+            debug: None,
             results,
             resizable_state,
             sidebar_state,
@@ -3039,8 +3141,11 @@ impl PgGuiApp {
                 panel
             })
             .child(
-                // Results table with pager
-                resizable_panel().child(
+                // Results table with pager — replaced by the debug panel while
+                // a debug session is active.
+                resizable_panel().child(if self.debug.is_some() {
+                    self.render_debug_panel(cx).into_any_element()
+                } else {
                     v_flex()
                         .size_full()
                         .p_2()
@@ -3051,8 +3156,9 @@ impl PgGuiApp {
                                 .min_h(px(0.))
                                 .child(DataTable::new(&self.results)),
                         )
-                        .children(self.render_results_pager(cx)),
-                ),
+                        .children(self.render_results_pager(cx))
+                        .into_any_element()
+                }),
             )
     }
 
@@ -3191,6 +3297,506 @@ impl PgGuiApp {
                 )
             }))
     }
+
+    // ===== PL/pgSQL step debugger =====
+
+    /// Start Debug (cmd-shift-d): guess the routine at the cursor and open the
+    /// launch dialog.
+    pub fn start_debug(&mut self, _: &StartDebug, window: &mut Window, cx: &mut Context<Self>) {
+        if self.debug.as_ref().is_some_and(|d| !d.terminated) {
+            self.set_status("A debug session is already running", cx);
+            return;
+        }
+        let guess = self.editor().read(cx).value().to_string();
+        let cursor = self.editor().read(cx).cursor();
+        let signature = statement::at(&guess, cursor)
+            .and_then(|range| guess_signature(&guess[range]))
+            .unwrap_or_default();
+        Self::open_debug_dialog(signature, window, cx);
+    }
+
+    /// The launch dialog: routine signature, an argument list spliced into the
+    /// call, and a stop-on-entry toggle.
+    fn open_debug_dialog(signature: String, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let sig = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("schema.routine or routine")
+                .default_value(signature)
+        });
+        let args = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. 1, 99.50"));
+        let stop_on_entry = cx.new(|_| true);
+        let app = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let (sig, args, stop_on_entry) = (sig.clone(), args.clone(), stop_on_entry.clone());
+            let start = {
+                let (app, sig, args, stop_on_entry) = (
+                    app.clone(),
+                    sig.clone(),
+                    args.clone(),
+                    stop_on_entry.clone(),
+                );
+                move |window: &mut Window, cx: &mut App| {
+                    let signature = sig.read(cx).value().trim().to_string();
+                    if signature.is_empty() {
+                        return;
+                    }
+                    let args = args.read(cx).value().trim().to_string();
+                    let stop = *stop_on_entry.read(cx);
+                    window.close_dialog(cx);
+                    app.update(cx, |this, cx| this.launch_debug(signature, args, stop, cx))
+                        .ok();
+                }
+            };
+            let labeled = |label: &str, input: &Entity<InputState>, cx: &mut App| {
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(label.to_string()),
+                    )
+                    .child(Input::new(input))
+            };
+            let checked = *stop_on_entry.read(cx);
+            let toggle = stop_on_entry.clone();
+            dialog.title("Debug routine").w(px(480.)).child(
+                v_flex()
+                    .gap_4()
+                    .pb_2()
+                    .child(labeled("Routine", &sig, cx))
+                    .child(labeled("Arguments", &args, cx))
+                    .child(
+                        Checkbox::new("stop-on-entry")
+                            .label("Stop on entry")
+                            .checked(checked)
+                            .on_click(move |checked, _, cx| {
+                                toggle.update(cx, |state, cx| {
+                                    *state = *checked;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(Button::new("cancel").label("Cancel").on_click(
+                                |_, window, cx| {
+                                    window.close_dialog(cx);
+                                },
+                            ))
+                            .child(
+                                Button::new("start")
+                                    .primary()
+                                    .label("Debug")
+                                    .on_click(move |_, window, cx| start(window, cx)),
+                            ),
+                    ),
+            )
+        });
+    }
+
+    /// Kick off the session on a background thread and attach on success.
+    fn launch_debug(
+        &mut self,
+        signature: String,
+        args: String,
+        stop_on_entry: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let conn = self.config.connection_string.clone();
+        self.set_status(format!("Starting debug: {signature}…"), cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    debug::Session::start(&conn, &signature, &args, &[], stop_on_entry)
+                })
+                .await;
+            this.update(cx, |this, cx| match result {
+                Ok((session, events)) => this.attach_debug(session, events, cx),
+                Err(err) => this.set_status(format!("Debug failed to start: {err:#}"), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Store the session and pump its events into the panel until it ends.
+    fn attach_debug(
+        &mut self,
+        session: debug::Session,
+        mut events: debug::DebugEventReceiver,
+        cx: &mut Context<Self>,
+    ) {
+        self.debug = Some(DebugState {
+            session,
+            stop: None,
+            breakpoints: HashSet::new(),
+            output: None,
+            terminated: false,
+        });
+        self.set_status("Debug session started", cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = events.next().await {
+                match this.update(cx, |this, cx| this.on_debug_event(event, cx)) {
+                    Ok(true) => {}
+                    _ => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Apply one debug event. Returns `false` once the session is over so the
+    /// event pump stops.
+    fn on_debug_event(&mut self, event: debug::DebugEvent, cx: &mut Context<Self>) -> bool {
+        let Some(dbg) = self.debug.as_mut() else {
+            return false;
+        };
+        let mut status = None;
+        let mut keep = true;
+        match event {
+            debug::DebugEvent::Stopped(stop) => dbg.stop = Some(stop),
+            debug::DebugEvent::Output(output) => dbg.output = Some(output),
+            debug::DebugEvent::Error(err) => {
+                dbg.output = Some(err.clone());
+                status = Some(format!("Debug error: {err}"));
+            }
+            debug::DebugEvent::Terminated => {
+                dbg.terminated = true;
+                status = Some("Debug finished".to_string());
+                keep = false;
+            }
+        }
+        if let Some(status) = status {
+            self.set_status(status, cx);
+        }
+        cx.notify();
+        keep
+    }
+
+    pub fn debug_step_over(&mut self, _: &DebugStepOver, _: &mut Window, _: &mut Context<Self>) {
+        if let Some(dbg) = self.debug.as_ref().filter(|d| !d.terminated) {
+            dbg.session.step_over();
+        }
+    }
+
+    pub fn debug_step_into(&mut self, _: &DebugStepInto, _: &mut Window, _: &mut Context<Self>) {
+        if let Some(dbg) = self.debug.as_ref().filter(|d| !d.terminated) {
+            dbg.session.step_into();
+        }
+    }
+
+    /// F5: continue a live session, or start one when idle.
+    pub fn debug_continue(
+        &mut self,
+        _: &DebugContinue,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.debug.as_ref() {
+            Some(dbg) if !dbg.terminated => dbg.session.continue_(),
+            _ => self.start_debug(&StartDebug, window, cx),
+        }
+    }
+
+    pub fn debug_stop(&mut self, _: &DebugStop, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dbg) = self.debug.take() {
+            dbg.session.stop();
+        }
+        self.set_status("Debug stopped", cx);
+        cx.notify();
+    }
+
+    /// Toggle a breakpoint on a body-relative source line from the gutter.
+    fn toggle_breakpoint(&mut self, line: i32, cx: &mut Context<Self>) {
+        if let Some(dbg) = self.debug.as_mut() {
+            if dbg.breakpoints.remove(&line) {
+                dbg.session.drop_breakpoint(line);
+            } else {
+                dbg.breakpoints.insert(line);
+                dbg.session.set_breakpoint(line);
+            }
+            cx.notify();
+        }
+    }
+
+    /// Edit a variable's value mid-execution (`pldbg_deposit_value`).
+    fn open_deposit_dialog(
+        name: String,
+        current: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let value = cx.new(|cx| InputState::new(window, cx).default_value(current));
+        let app = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (value, name, app) = (value.clone(), name.clone(), app.clone());
+            let submit = {
+                let (value, name, app) = (value.clone(), name.clone(), app.clone());
+                move |window: &mut Window, cx: &mut App| {
+                    let new_value = value.read(cx).value().to_string();
+                    window.close_dialog(cx);
+                    app.update(cx, |this, _| {
+                        if let Some(dbg) = this.debug.as_ref() {
+                            dbg.session.deposit(name.clone(), new_value.clone());
+                        }
+                    })
+                    .ok();
+                }
+            };
+            dialog.title(format!("Set {name}")).w(px(360.)).child(
+                v_flex().gap_4().pb_2().child(Input::new(&value)).child(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("cancel")
+                                .label("Cancel")
+                                .on_click(|_, window, cx| {
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("set")
+                                .primary()
+                                .label("Set")
+                                .on_click(move |_, window, cx| submit(window, cx)),
+                        ),
+                ),
+            )
+        });
+    }
+
+    /// The debug panel that replaces the results table while a session runs:
+    /// a toolbar, the stepped source, and a variables/stack sidebar.
+    fn render_debug_panel(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let Some(dbg) = self.debug.as_ref() else {
+            return div().into_any_element();
+        };
+        let running = !dbg.terminated;
+        let toolbar = h_flex()
+            .gap_2()
+            .p_2()
+            .items_center()
+            .child(
+                div()
+                    .font_semibold()
+                    .child(format!("Debug: {}", dbg.session.target)),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("dbg-step-over")
+                    .outline()
+                    .small()
+                    .label("Step Over")
+                    .disabled(!running)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.debug_step_over(&DebugStepOver, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("dbg-step-into")
+                    .outline()
+                    .small()
+                    .label("Step Into")
+                    .disabled(!running)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.debug_step_into(&DebugStepInto, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("dbg-continue")
+                    .outline()
+                    .small()
+                    .label("Continue")
+                    .disabled(!running)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.debug_continue(&DebugContinue, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("dbg-stop")
+                    .danger()
+                    .small()
+                    .label("Stop")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.debug_stop(&DebugStop, window, cx);
+                    })),
+            );
+        let body = h_flex()
+            .flex_1()
+            .min_h(px(0.))
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .child(self.render_debug_source(cx)),
+            )
+            .child(
+                div()
+                    .w(px(360.))
+                    .flex_none()
+                    .child(self.render_debug_sidebar(cx)),
+            );
+        let output = dbg.output.as_ref().map(|out| {
+            div()
+                .px_2()
+                .py_1()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("Result: {out}"))
+        });
+        v_flex()
+            .size_full()
+            .child(toolbar)
+            .child(body)
+            .children(output)
+            .into_any_element()
+    }
+
+    /// The stepped source with a line-number/breakpoint gutter and the current
+    /// line highlighted. Lines are body-relative, matching `pldbg_get_source`.
+    fn render_debug_source(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let Some(dbg) = self.debug.as_ref() else {
+            return div().into_any_element();
+        };
+        let Some(stop) = dbg.stop.as_ref() else {
+            return div()
+                .p_2()
+                .text_color(cx.theme().muted_foreground)
+                .child("Waiting for the target to stop…")
+                .into_any_element();
+        };
+        let current = stop.line;
+        let mut lines = v_flex()
+            .p_1()
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_size(cx.theme().mono_font_size);
+        for (index, text) in stop.source.lines().enumerate() {
+            let lineno = i32::try_from(index).unwrap_or(0) + 1;
+            let has_bp = dbg.breakpoints.contains(&lineno);
+            let mut row = h_flex().gap_2();
+            if lineno == current {
+                row = row.bg(cx.theme().list_active);
+            }
+            let gutter_color = if has_bp {
+                cx.theme().danger
+            } else {
+                cx.theme().muted_foreground
+            };
+            lines = lines.child(
+                row.child(
+                    div()
+                        .w(px(52.))
+                        .flex_none()
+                        .text_right()
+                        .pr_2()
+                        .cursor_pointer()
+                        .text_color(gutter_color)
+                        .child(if has_bp {
+                            format!("● {lineno}")
+                        } else {
+                            lineno.to_string()
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| this.toggle_breakpoint(lineno, cx)),
+                        ),
+                )
+                .child(div().whitespace_nowrap().child(text.to_string())),
+            );
+        }
+        div()
+            .id("dbg-source")
+            .size_full()
+            .overflow_scroll()
+            .child(lines)
+            .into_any_element()
+    }
+
+    /// Variables of the active frame (click to change) over the call stack
+    /// (click a frame to inspect it).
+    fn render_debug_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let Some(stop) = self.debug.as_ref().and_then(|d| d.stop.as_ref()) else {
+            return div().into_any_element();
+        };
+        let mut vars = v_flex()
+            .gap_0()
+            .child(div().font_semibold().px_1().py_1().child("Variables"));
+        for var in &stop.variables {
+            let (name, value) = (var.name.clone(), var.value.clone());
+            vars = vars.child(
+                h_flex()
+                    .gap_2()
+                    .px_1()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .w(px(130.))
+                            .flex_none()
+                            .truncate()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(var.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .child(var.value.clone()),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, window, cx| {
+                            Self::open_deposit_dialog(name.clone(), value.clone(), window, cx);
+                        }),
+                    ),
+            );
+        }
+        let mut stack = v_flex().gap_0().child(
+            div()
+                .font_semibold()
+                .px_1()
+                .py_1()
+                .mt_2()
+                .child("Call stack"),
+        );
+        for frame in &stop.stack {
+            let level = frame.level;
+            stack = stack.child(
+                div()
+                    .px_1()
+                    .cursor_pointer()
+                    .child(format!("{} :{}", frame.target_name, frame.line))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, _| {
+                            if let Some(dbg) = this.debug.as_ref() {
+                                dbg.session.select_frame(level);
+                            }
+                        }),
+                    ),
+            );
+        }
+        div()
+            .id("dbg-sidebar")
+            .size_full()
+            .overflow_scroll()
+            .text_size(cx.theme().mono_font_size)
+            .child(vars)
+            .child(stack)
+            .into_any_element()
+    }
 }
 
 impl Render for PgGuiApp {
@@ -3229,6 +3835,11 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::set_theme))
             .on_action(cx.listener(Self::show_help))
             .on_action(cx.listener(Self::open_github))
+            .on_action(cx.listener(Self::start_debug))
+            .on_action(cx.listener(Self::debug_step_over))
+            .on_action(cx.listener(Self::debug_step_into))
+            .on_action(cx.listener(Self::debug_continue))
+            .on_action(cx.listener(Self::debug_stop))
             .on_action(cx.listener(Self::request_quit))
             .child(self.render_title_bar(cx))
             .child(
