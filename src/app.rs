@@ -689,6 +689,9 @@ struct DebugState {
     breakpoints: HashSet<i32>,
     /// The debugged routine's result once it returns.
     output: Option<String>,
+    /// The latest progress note shown in the panel before the first stop
+    /// (connecting, waiting for the target to trap, …).
+    status: String,
     /// Set once the session reports termination; the panel stays up (showing
     /// the final output) until the user starts another or stops.
     terminated: bool,
@@ -901,6 +904,7 @@ impl PgGuiApp {
                 .code_editor("sql")
                 .multi_line(true)
                 .line_number(true)
+                .breakpoints_enabled(true)
                 .tab_size(TabSize {
                     tab_size: 2,
                     ..Default::default()
@@ -1540,6 +1544,12 @@ impl PgGuiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let InputEvent::BreakpointToggled(line) = event {
+            let set = state.read(cx).breakpoints().contains(line);
+            let verb = if set { "set" } else { "cleared" };
+            self.set_status(format!("Breakpoint {verb}: line {}", line + 1), cx);
+            return;
+        }
         if !matches!(event, InputEvent::Change) {
             return;
         }
@@ -3409,11 +3419,30 @@ impl PgGuiApp {
         cx: &mut Context<Self>,
     ) {
         let conn = self.config.connection_string.clone();
+        // Breakpoints set in the editor gutter (0-based buffer lines) plus the
+        // buffer itself, so the session can map them to pldbg body lines.
+        let (editor_text, breakpoints) = {
+            let editor = self.editor().read(cx);
+            let mut lines: Vec<i32> = editor
+                .breakpoints()
+                .iter()
+                .filter_map(|&line| i32::try_from(line).ok())
+                .collect();
+            lines.sort_unstable();
+            (editor.value().to_string(), lines)
+        };
         self.set_status(format!("Starting debug: {signature}…"), cx);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    debug::Session::start(&conn, &signature, &args, &[], stop_on_entry)
+                    debug::Session::start(
+                        &conn,
+                        &signature,
+                        &args,
+                        &breakpoints,
+                        &editor_text,
+                        stop_on_entry,
+                    )
                 })
                 .await;
             this.update(cx, |this, cx| match result {
@@ -3437,6 +3466,7 @@ impl PgGuiApp {
             stop: None,
             breakpoints: HashSet::new(),
             output: None,
+            status: "Starting…".to_string(),
             terminated: false,
         });
         self.set_status("Debug session started", cx);
@@ -3461,6 +3491,7 @@ impl PgGuiApp {
         let mut status = None;
         let mut keep = true;
         match event {
+            debug::DebugEvent::Status(note) => dbg.status = note,
             debug::DebugEvent::Stopped(stop) => dbg.stop = Some(stop),
             debug::DebugEvent::Output(output) => dbg.output = Some(output),
             debug::DebugEvent::Error(err) => {
@@ -3671,11 +3702,21 @@ impl PgGuiApp {
             return div().into_any_element();
         };
         let Some(stop) = dbg.stop.as_ref() else {
-            return div()
+            // No stop yet: show the live phase, plus any output/error so a
+            // failure or a target that never trapped is visible, not silent.
+            let mut pane = v_flex()
                 .p_2()
-                .text_color(cx.theme().muted_foreground)
-                .child("Waiting for the target to stop…")
-                .into_any_element();
+                .gap_2()
+                .text_color(cx.theme().muted_foreground);
+            pane = pane.child(if dbg.terminated {
+                format!("Session ended before stopping. {}", dbg.status)
+            } else {
+                format!("{}…", dbg.status.trim_end_matches('…'))
+            });
+            if let Some(output) = &dbg.output {
+                pane = pane.child(div().child(format!("Target: {output}")));
+            }
+            return pane.into_any_element();
         };
         let current = stop.line;
         let mut lines = v_flex()
