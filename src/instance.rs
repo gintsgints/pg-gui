@@ -9,6 +9,7 @@
 //! tabs in for the other's on every save.
 
 use gpui::App;
+#[cfg(unix)]
 use std::path::PathBuf;
 
 use crate::config;
@@ -22,6 +23,7 @@ pub struct InstanceSocket {
     listener: Option<std::os::unix::net::UnixListener>,
 }
 
+#[cfg(unix)]
 fn socket_path() -> Option<PathBuf> {
     config::dir().map(|dir| dir.join("instance.sock"))
 }
