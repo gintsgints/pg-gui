@@ -447,6 +447,24 @@ fn object_definition(
     }
 }
 
+/// Turn the definition file mask into a concrete filename proposed when a
+/// definition tab is saved: substitute the object name, then drop the `*`/`?`
+/// wildcards (a filename can't contain them) and any separator debris they
+/// leave at the front. Falls back to `<object>.sql` if nothing is left.
+fn suggested_name_from_mask(mask: &str, object: &str) -> String {
+    let name: String = mask
+        .replace("{object}", object)
+        .chars()
+        .filter(|&c| c != '*' && c != '?')
+        .collect();
+    let trimmed = name.trim_start_matches(['_', '-', '.', ' ']);
+    if trimmed.is_empty() {
+        format!("{object}.sql")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Match a filename glob supporting `*` (any run of characters) and `?` (any
 /// single character). `pattern` and `text` are expected already lowercased.
 fn glob_match(pattern: &str, text: &str) -> bool {
@@ -1613,6 +1631,8 @@ impl PgGuiApp {
             .definition_file_mask
             .replace("{object}", &stem)
             .to_ascii_lowercase();
+        // Filename proposed if the fetched definition is later saved.
+        let suggested = suggested_name_from_mask(&self.config.definition_file_mask, &stem);
 
         cx.spawn_in(window, async move |this, cx| {
             if let Some(dir) = working_dir {
@@ -1633,8 +1653,8 @@ impl PgGuiApp {
             this.update_in(cx, |this, window, cx| match definition {
                 Ok(sql) => {
                     let ix = this.add_tab(sql, None, window, cx);
-                    // Propose `<object>.sql` if this definition tab is saved.
-                    this.tabs[ix].suggested_name = Some(format!("{stem}.sql"));
+                    // Propose a save name derived from the file mask.
+                    this.tabs[ix].suggested_name = Some(suggested);
                     this.activate_tab(ix, window, cx);
                     this.save_config();
                     this.set_status(format!("Opened definition of {stem}"), cx);
@@ -4516,7 +4536,28 @@ impl Render for PgGuiApp {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{dialog_start_dir, glob_match, mask_credentials, toggle_line_comments};
+    use super::{
+        dialog_start_dir, glob_match, mask_credentials, suggested_name_from_mask,
+        toggle_line_comments,
+    };
+
+    #[test]
+    fn suggested_name_strips_wildcards_and_leading_separators() {
+        assert_eq!(
+            suggested_name_from_mask("*__{object}.sql", "place_order"),
+            "place_order.sql"
+        );
+        assert_eq!(
+            suggested_name_from_mask("create_{object}.sql", "orders"),
+            "create_orders.sql"
+        );
+        assert_eq!(
+            suggested_name_from_mask("{object}_def.sql", "orders"),
+            "orders_def.sql"
+        );
+        // A mask that is nothing but wildcards falls back to `<object>.sql`.
+        assert_eq!(suggested_name_from_mask("*", "orders"), "orders.sql");
+    }
 
     #[test]
     fn glob_match_handles_star_and_question() {
