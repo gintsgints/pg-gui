@@ -125,6 +125,13 @@ pub struct Config {
     /// Casing the formatter applies to constants (NULL, TRUE, FALSE).
     #[serde(default)]
     pub constant_case: CaseStyle,
+    /// Glob matched against `.sql` filenames when a database-browser object
+    /// is clicked, deciding which file (if any) to open instead of fetching
+    /// the object's definition. `{object}` is replaced with the object name;
+    /// `*` matches any run of characters, `?` any single one; matching is
+    /// case-insensitive. Default `*__{object}.sql`.
+    #[serde(default = "default_definition_file_mask")]
+    pub definition_file_mask: String,
     /// Directory the file dialogs (Open, Save As, Export) start in; set to
     /// the parent of the last file chosen in any of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,6 +217,7 @@ impl Default for Config {
             format_on_save: false,
             keyword_case: CaseStyle::default(),
             constant_case: CaseStyle::default(),
+            definition_file_mask: default_definition_file_mask(),
             last_dir: None,
             working_dir: None,
             files_panel_visible: default_true(),
@@ -237,6 +245,10 @@ fn default_page_size() -> usize {
 
 fn default_fetch_size() -> usize {
     500
+}
+
+fn default_definition_file_mask() -> String {
+    "*__{object}.sql".to_string()
 }
 
 /// The app's config directory (`~/Library/Application Support/pg-gui` on

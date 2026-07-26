@@ -447,13 +447,42 @@ fn object_definition(
     }
 }
 
-/// Recursively search `dir` for a `.sql` file whose name (minus the
-/// extension) ends with `object`, case-insensitive — so `place_order` matches
-/// `place_order.sql`, `01_place_order.sql`, `create_place_order.sql`, …
+/// Match a filename glob supporting `*` (any run of characters) and `?` (any
+/// single character). `pattern` and `text` are expected already lowercased.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0, 0);
+    // The last `*` seen and the text position to resume from if the greedy
+    // match has to give a character back to it.
+    let (mut star, mut resume) = (None, 0);
+    while ti < text.len() {
+        if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == text[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pattern.len() && pattern[pi] == '*' {
+            star = Some(pi);
+            resume = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            resume += 1;
+            ti = resume;
+        } else {
+            return false;
+        }
+    }
+    while pi < pattern.len() && pattern[pi] == '*' {
+        pi += 1;
+    }
+    pi == pattern.len()
+}
+
+/// Recursively search `dir` for a file whose name matches `pattern` (a glob
+/// with `*`/`?`, already lowercased — see [`config::Config::definition_file_mask`]).
 /// Returns the first match. Hidden directories and the usual heavy build
 /// directories are skipped, and a total-entry budget caps a runaway walk.
-fn find_sql_file(dir: &Path, object: &str) -> Option<PathBuf> {
-    let needle = object.to_ascii_lowercase();
+fn find_sql_file(dir: &Path, pattern: &str) -> Option<PathBuf> {
     let mut stack = vec![dir.to_path_buf()];
     let mut budget = 20_000usize;
     while let Some(dir) = stack.pop() {
@@ -482,12 +511,7 @@ fn find_sql_file(dir: &Path, object: &str) -> Option<PathBuf> {
             } else if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    let lower = name.to_ascii_lowercase();
-                    lower
-                        .strip_suffix(".sql")
-                        .is_some_and(|stem| stem.ends_with(&needle))
-                })
+                .is_some_and(|name| glob_match(pattern, &name.to_ascii_lowercase()))
             {
                 return Some(path);
             }
@@ -1583,12 +1607,17 @@ impl PgGuiApp {
             .to_string();
         let conn = self.config.connection_string.clone();
         let working_dir = self.config.working_dir.clone();
+        // Concrete glob for this object, lowercased for case-insensitive match.
+        let pattern = self
+            .config
+            .definition_file_mask
+            .replace("{object}", &stem)
+            .to_ascii_lowercase();
 
         cx.spawn_in(window, async move |this, cx| {
             if let Some(dir) = working_dir {
-                let stem = stem.clone();
                 let found = cx
-                    .background_spawn(async move { find_sql_file(&dir, &stem) })
+                    .background_spawn(async move { find_sql_file(&dir, &pattern) })
                     .await;
                 if let Some(path) = found {
                     this.update_in(cx, |this, window, cx| this.open_path(&path, window, cx))
@@ -4487,7 +4516,23 @@ impl Render for PgGuiApp {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{dialog_start_dir, mask_credentials, toggle_line_comments};
+    use super::{dialog_start_dir, glob_match, mask_credentials, toggle_line_comments};
+
+    #[test]
+    fn glob_match_handles_star_and_question() {
+        // Default mask `*__{object}.sql` with object `place_order`.
+        let pattern = "*__place_order.sql";
+        assert!(glob_match(pattern, "01__place_order.sql"));
+        assert!(glob_match(pattern, "create__place_order.sql"));
+        assert!(glob_match(pattern, "__place_order.sql"));
+        assert!(!glob_match(pattern, "place_order.sql"));
+        assert!(!glob_match(pattern, "01__place_order.txt"));
+        // `?` matches exactly one character.
+        assert!(glob_match("v?.sql", "v1.sql"));
+        assert!(!glob_match("v?.sql", "v12.sql"));
+        // A trailing `*` may match nothing.
+        assert!(glob_match("orders*", "orders"));
+    }
 
     #[test]
     fn dialog_start_dir_prefers_existing_last_dir() {
