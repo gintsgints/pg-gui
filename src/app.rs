@@ -768,6 +768,11 @@ struct EditorTab {
     /// escape or once no markers remain, so a stray `$1` in hand-written
     /// SQL never hijacks the tab key.
     snippet_mode: bool,
+    /// Default filename proposed by the Save As dialog for a never-saved tab
+    /// (`None` falls back to `script.sql`). Set when the tab was opened from a
+    /// database object's definition, so its file is proposed as
+    /// `<object>.sql`. Cleared once the tab has a real path.
+    suggested_name: Option<String>,
     _subscription: Subscription,
 }
 
@@ -1074,6 +1079,7 @@ impl PgGuiApp {
             saved,
             diverged,
             snippet_mode: false,
+            suggested_name: None,
             _subscription: subscription,
         }
     }
@@ -1598,6 +1604,8 @@ impl PgGuiApp {
             this.update_in(cx, |this, window, cx| match definition {
                 Ok(sql) => {
                     let ix = this.add_tab(sql, None, window, cx);
+                    // Propose `<object>.sql` if this definition tab is saved.
+                    this.tabs[ix].suggested_name = Some(format!("{stem}.sql"));
                     this.activate_tab(ix, window, cx);
                     this.save_config();
                     this.set_status(format!("Opened definition of {stem}"), cx);
@@ -3371,7 +3379,11 @@ impl PgGuiApp {
             return;
         }
 
-        let rx = cx.prompt_for_new_path(&self.start_dir(), Some("script.sql"));
+        let default_name = self.tabs[ix]
+            .suggested_name
+            .as_deref()
+            .unwrap_or("script.sql");
+        let rx = cx.prompt_for_new_path(&self.start_dir(), Some(default_name));
 
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = rx.await else { return };
