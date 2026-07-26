@@ -447,11 +447,13 @@ fn object_definition(
     }
 }
 
-/// Recursively search `dir` for a file named `<stem>.sql` (case-insensitive),
-/// returning the first match. Hidden directories and the usual heavy build
+/// Recursively search `dir` for a `.sql` file whose name (minus the
+/// extension) ends with `object`, case-insensitive — so `place_order` matches
+/// `place_order.sql`, `01_place_order.sql`, `create_place_order.sql`, …
+/// Returns the first match. Hidden directories and the usual heavy build
 /// directories are skipped, and a total-entry budget caps a runaway walk.
-fn find_sql_file(dir: &Path, stem: &str) -> Option<PathBuf> {
-    let target = format!("{stem}.sql");
+fn find_sql_file(dir: &Path, object: &str) -> Option<PathBuf> {
+    let needle = object.to_ascii_lowercase();
     let mut stack = vec![dir.to_path_buf()];
     let mut budget = 20_000usize;
     while let Some(dir) = stack.pop() {
@@ -480,7 +482,12 @@ fn find_sql_file(dir: &Path, stem: &str) -> Option<PathBuf> {
             } else if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.eq_ignore_ascii_case(&target))
+                .is_some_and(|name| {
+                    let lower = name.to_ascii_lowercase();
+                    lower
+                        .strip_suffix(".sql")
+                        .is_some_and(|stem| stem.ends_with(&needle))
+                })
             {
                 return Some(path);
             }
