@@ -1,0 +1,21 @@
+{
+  "$schema": "https://pgtools.dev/latest/schema.json",
+  "db": {
+    "host": "127.0.0.1",
+    "port": 5433,
+    "username": "pgui",
+    "password": "pgui",
+    "database": "pgui_test",
+    "connTimeoutSecs": 10,
+    "allowStatementExecutionsAgainst": ["127.0.0.1/*", "localhost/*"],
+  },
+  "format": {
+    "enabled": true,
+    "lineWidth": 100,
+    "indentSize": 2,
+    "indentStyle": "spaces",
+    "keywordCase": "upper",
+    "constantCase": "upper",
+    "typeCase": "upper",
+  },
+}
