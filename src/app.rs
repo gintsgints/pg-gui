@@ -37,8 +37,8 @@ use crate::{
     AiComplete, CloseTab, Connect, DebugContinue, DebugStepInto, DebugStepOver, DebugStop,
     EditConnection, ExportCsv, ExportInserts, FormatScript, NewConnection, NewFile, NextTab,
     OpenConfig, OpenFile, OpenFolder, OpenGitHub, OpenSnippets, PrevTab, Quit, RunQuery, SaveFile,
-    SetTheme, ShowHelp, StartDebug, ToggleComment, ToggleFilesPanel, ZoomIn, ZoomOut, ZoomReset,
-    ai, config, db, debug, export, file_tree, lsp, snippets, statement,
+    SetTheme, ShowHelp, StartDebug, ToggleComment, ToggleFilesPanel, ToggleResultsPanel, ZoomIn,
+    ZoomOut, ZoomReset, ai, config, db, debug, export, file_tree, lsp, snippets, statement,
 };
 
 /// The project's GitHub page, opened from the About application menu.
@@ -72,7 +72,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cmd-w", "Close the tab"),
     ("ctrl-tab / ctrl-shift-tab", "Next / previous tab"),
     ("cmd-o", "Open a SQL script"),
-    ("cmd-b", "Show or hide the files panel"),
+    ("cmd-b / cmd-2", "Show or hide the files panel"),
+    ("cmd-3", "Show or hide the results panel"),
     ("cmd-s", "Save the script"),
     ("cmd-,", "Open config.json in the system editor"),
     ("cmd-plus / cmd-minus", "Zoom in / out"),
@@ -94,7 +95,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("ctrl-w", "Close the tab"),
     ("ctrl-tab / ctrl-shift-tab", "Next / previous tab"),
     ("ctrl-o", "Open a SQL script"),
-    ("ctrl-b", "Show or hide the files panel"),
+    ("ctrl-b / ctrl-2", "Show or hide the files panel"),
+    ("ctrl-3", "Show or hide the results panel"),
     ("ctrl-s", "Save the script"),
     ("ctrl-,", "Open config.json in the system editor"),
     ("ctrl-plus / ctrl-minus", "Zoom in / out"),
@@ -293,6 +295,7 @@ fn build_menus(recents: &[config::RecentConnection], theme: config::ThemeSelecti
             disabled: false,
             items: vec![
                 MenuItem::action("Toggle Files Panel", ToggleFilesPanel),
+                MenuItem::action("Toggle Results Panel", ToggleResultsPanel),
                 MenuItem::separator(),
                 MenuItem::action("Zoom In", ZoomIn),
                 MenuItem::action("Zoom Out", ZoomOut),
@@ -2612,6 +2615,18 @@ impl PgGuiApp {
         cx.notify();
     }
 
+    /// Show or hide the results panel (cmd-3).
+    pub fn toggle_results_panel(
+        &mut self,
+        _: &ToggleResultsPanel,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.config.results_panel_visible = !self.config.results_panel_visible;
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     /// Open the config file in the system default editor (cmd-,).
     /// Saved edits are picked up live by the config watcher.
     pub fn open_config(&mut self, _: &OpenConfig, _: &mut Window, cx: &mut Context<Self>) {
@@ -3125,6 +3140,28 @@ impl PgGuiApp {
     /// draggable divider; the split position is persisted to the config on
     /// drag and restored on launch via the editor panel's initial size.
     fn render_editor_results(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        // The SQL editor with its tab bar; always shown.
+        let editor = v_flex().size_full().child(self.render_tab_bar(cx)).child(
+            div().flex_1().min_h(px(0.)).p_2().child(
+                Input::new(&self.editor())
+                    .h_full()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(cx.theme().mono_font_size),
+            ),
+        );
+
+        // The bottom panel is the debug view while a session runs, else the
+        // results table, and is hidden entirely (cmd-3) when neither applies.
+        let debugging = self.debug.is_some();
+        if !debugging && !self.config.results_panel_visible {
+            return v_flex().size_full().child(editor).into_any_element();
+        }
+
+        let mut editor_panel = resizable_panel().child(editor);
+        if let Some(height) = self.config.editor_height {
+            editor_panel = editor_panel.size(px(height));
+        }
+
         v_resizable("editor-results")
             .with_state(&self.resizable_state)
             .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _, cx| {
@@ -3133,27 +3170,11 @@ impl PgGuiApp {
                     this.schedule_save(cx);
                 }
             }))
-            .child({
-                // Tab bar over the SQL editor
-                let mut panel = resizable_panel().child(
-                    v_flex().size_full().child(self.render_tab_bar(cx)).child(
-                        div().flex_1().min_h(px(0.)).p_2().child(
-                            Input::new(&self.editor())
-                                .h_full()
-                                .font_family(cx.theme().mono_font_family.clone())
-                                .text_size(cx.theme().mono_font_size),
-                        ),
-                    ),
-                );
-                if let Some(height) = self.config.editor_height {
-                    panel = panel.size(px(height));
-                }
-                panel
-            })
+            .child(editor_panel)
             .child(
                 // Results table with pager — replaced by the debug panel while
                 // a debug session is active.
-                resizable_panel().child(if self.debug.is_some() {
+                resizable_panel().child(if debugging {
                     self.render_debug_panel(cx).into_any_element()
                 } else {
                     v_flex()
@@ -3170,6 +3191,7 @@ impl PgGuiApp {
                         .into_any_element()
                 }),
             )
+            .into_any_element()
     }
 
     /// The files side panel: the working directory's tree, or an "Open
@@ -3865,6 +3887,7 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::toggle_files_panel))
+            .on_action(cx.listener(Self::toggle_results_panel))
             .on_action(cx.listener(Self::save_file))
             .on_action(cx.listener(Self::open_snippet_picker))
             .on_action(cx.listener(Self::open_config))

@@ -135,6 +135,9 @@ pub struct Config {
     /// is first dragged.
     #[serde(default)]
     pub files_panel_width: Option<f32>,
+    /// Whether the results panel is shown (toggled with cmd-3).
+    #[serde(default = "default_true")]
+    pub results_panel_visible: bool,
     /// UI zoom factor (cmd +/-, cmd-0 to reset); 1.0 means 100%.
     #[serde(default = "default_zoom")]
     pub zoom: f32,
@@ -199,6 +202,7 @@ impl Default for Config {
             working_dir: None,
             files_panel_visible: default_true(),
             files_panel_width: None,
+            results_panel_visible: default_true(),
             zoom: default_zoom(),
             theme: ThemeSelection::default(),
         }
