@@ -75,9 +75,15 @@ pub struct DbNode {
     /// Owning schema (empty for leaves). Carried so a folder's lazy fetch has
     /// its query context without re-parsing the id.
     pub schema: SharedString,
-    /// Owning table, for a table's Indexes/Constraints folders (empty
-    /// otherwise).
+    /// Owning table, for a table's Indexes/Constraints folders and for
+    /// index/constraint leaves (empty otherwise).
     pub relation: SharedString,
+    /// The raw catalog name an object leaf refers to, used to look up its
+    /// `.sql` file or fetch its definition. Distinct from `label`, which may
+    /// carry decorations (a function's `(args)`, an index's ` · PK`, …). Empty
+    /// for folders and containers. For functions this is the
+    /// `name(identity arguments)` signature.
+    pub object: SharedString,
     pub load: Load,
     pub children: Vec<DbNode>,
 }
@@ -96,6 +102,7 @@ impl DbNode {
             kind,
             schema: schema.to_string().into(),
             relation: relation.to_string().into(),
+            object: SharedString::default(),
             load: Load::Unloaded,
             children: Vec::new(),
         }
@@ -114,18 +121,29 @@ impl DbNode {
             kind,
             schema: schema.to_string().into(),
             relation: SharedString::default(),
+            object: SharedString::default(),
             load: Load::Loaded,
             children,
         }
     }
 
-    fn leaf(id: String, label: impl Into<SharedString>, kind: NodeKind) -> Self {
+    /// An object leaf. `schema`/`relation`/`object` carry the context needed
+    /// to look up its `.sql` file or fetch its definition on click.
+    fn leaf(
+        id: String,
+        label: impl Into<SharedString>,
+        kind: NodeKind,
+        schema: &str,
+        relation: &str,
+        object: &str,
+    ) -> Self {
         Self {
             id: id.into(),
             label: label.into(),
             kind,
-            schema: SharedString::default(),
-            relation: SharedString::default(),
+            schema: schema.to_string().into(),
+            relation: relation.to_string().into(),
+            object: object.to_string().into(),
             load: Load::Leaf,
             children: Vec::new(),
         }
@@ -193,7 +211,16 @@ pub fn load_children(
     let leaves = |names: Vec<String>, node_kind: NodeKind| -> Vec<DbNode> {
         names
             .iter()
-            .map(|name| DbNode::leaf(format!("{parent_id}{SEP}{name}"), name.clone(), node_kind))
+            .map(|name| {
+                DbNode::leaf(
+                    format!("{parent_id}{SEP}{name}"),
+                    name.clone(),
+                    node_kind,
+                    schema,
+                    "",
+                    name,
+                )
+            })
             .collect()
     };
     let relation_leaves = |relkind: char, node_kind: NodeKind| -> Result<Vec<DbNode>, String> {
@@ -229,6 +256,9 @@ pub fn load_children(
                     format!("{parent_id}{SEP}{}", idx.name),
                     label,
                     NodeKind::Index,
+                    schema,
+                    relation,
+                    &idx.name,
                 )
             })
             .collect()),
@@ -247,6 +277,9 @@ pub fn load_children(
                     format!("{parent_id}{SEP}{}", con.name),
                     format!("{} ({kind_label})", con.name),
                     NodeKind::Constraint,
+                    schema,
+                    relation,
+                    &con.name,
                 )
             })
             .collect()),
@@ -412,8 +445,15 @@ mod tests {
         let tables = &mut schema.children[0];
         tables.load = Load::Loaded;
         tables.children = vec![
-            DbNode::leaf("t1".into(), "orders", NodeKind::Table),
-            DbNode::leaf("t2".into(), "customers", NodeKind::Table),
+            DbNode::leaf("t1".into(), "orders", NodeKind::Table, "app", "", "orders"),
+            DbNode::leaf(
+                "t2".into(),
+                "customers",
+                NodeKind::Table,
+                "app",
+                "",
+                "customers",
+            ),
         ];
         let items = to_tree_items(&[schema], &HashSet::new(), "order");
         // Only the schema → Tables → orders spine survives.

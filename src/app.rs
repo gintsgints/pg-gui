@@ -409,6 +409,81 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
     path.metadata().ok()?.modified().ok()
 }
 
+/// Whether an object-browser leaf of this kind has a fetchable definition.
+/// Tables are branch nodes (they expand to Indexes/Constraints), so they
+/// never reach here.
+fn object_kind_has_definition(kind: db_tree::NodeKind) -> bool {
+    use db_tree::NodeKind::{Constraint, Function, Index, MatView, Sequence, Type, View};
+    matches!(
+        kind,
+        View | MatView | Function | Sequence | Type | Index | Constraint
+    )
+}
+
+/// Fetch the SQL definition of a database object, dispatching to the right
+/// catalog query per kind. Runs on the background executor.
+fn object_definition(
+    conn: &str,
+    kind: db_tree::NodeKind,
+    schema: &str,
+    object: &str,
+    relation: &str,
+) -> Result<String, String> {
+    use db_tree::NodeKind::{Constraint, Function, Index, MatView, Sequence, Type, View};
+    match kind {
+        View => db::view_definition(conn, schema, object, false),
+        MatView => db::view_definition(conn, schema, object, true),
+        Function => db::function_definition(conn, schema, object),
+        Sequence => db::sequence_definition(conn, schema, object),
+        Type => db::type_definition(conn, schema, object),
+        Index => db::index_definition(conn, schema, object),
+        Constraint => db::constraint_definition(conn, schema, relation, object),
+        _ => Err("no definition for this object".to_string()),
+    }
+}
+
+/// Recursively search `dir` for a file named `<stem>.sql` (case-insensitive),
+/// returning the first match. Hidden directories and the usual heavy build
+/// directories are skipped, and a total-entry budget caps a runaway walk.
+fn find_sql_file(dir: &Path, stem: &str) -> Option<PathBuf> {
+    let target = format!("{stem}.sql");
+    let mut stack = vec![dir.to_path_buf()];
+    let mut budget = 20_000usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                return None;
+            }
+            budget -= 1;
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                let skip = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with('.') || matches!(name, "target" | "node_modules")
+                    });
+                if !skip {
+                    stack.push(path);
+                }
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case(&target))
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 /// Where a file dialog (Open, Save As, Export) should start: the directory
 /// the last dialog picked a file in, then the active tab's file's directory,
 /// then home — the first of those that still exists on disk.
@@ -1461,6 +1536,61 @@ impl PgGuiApp {
                     }
                 }
                 this.rebuild_db_tree(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Handle a click on an object leaf in the database browser: open the
+    /// object's `.sql` file if one exists in the working directory, otherwise
+    /// fetch its definition and open that in a new tab. Folders and
+    /// placeholder rows (no backing node) are ignored.
+    fn open_db_object(&mut self, id: &SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(node) = db_tree::find(&self.db_nodes, id) else {
+            return;
+        };
+        let kind = node.kind;
+        if !object_kind_has_definition(kind) {
+            return;
+        }
+        let schema = node.schema.to_string();
+        let object = node.object.to_string();
+        let relation = node.relation.to_string();
+        // A function leaf's `object` is a `name(args)` signature; the file is
+        // named after the bare routine name.
+        let stem = object
+            .split_once('(')
+            .map_or(object.as_str(), |(name, _)| name)
+            .to_string();
+        let conn = self.config.connection_string.clone();
+        let working_dir = self.config.working_dir.clone();
+
+        cx.spawn_in(window, async move |this, cx| {
+            if let Some(dir) = working_dir {
+                let stem = stem.clone();
+                let found = cx
+                    .background_spawn(async move { find_sql_file(&dir, &stem) })
+                    .await;
+                if let Some(path) = found {
+                    this.update_in(cx, |this, window, cx| this.open_path(&path, window, cx))
+                        .ok();
+                    return;
+                }
+            }
+            let definition = cx
+                .background_spawn(async move {
+                    object_definition(&conn, kind, &schema, &object, &relation)
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| match definition {
+                Ok(sql) => {
+                    let ix = this.add_tab(sql, None, window, cx);
+                    this.activate_tab(ix, window, cx);
+                    this.save_config();
+                    this.set_status(format!("Opened definition of {stem}"), cx);
+                }
+                Err(err) => this.set_status(format!("Definition failed: {err}"), cx),
             })
             .ok();
         })
@@ -3548,40 +3678,53 @@ impl PgGuiApp {
         } else if self.db_nodes.is_empty() {
             message("No schemas", false)
         } else {
+            let view = cx.entity();
             div()
                 .size_full()
                 .px_1()
                 .child(tree(
                     &self.db_tree_state,
                     move |ix, entry, _selected, _window, cx| {
-                        let item = entry.item();
-                        // Text glyphs (gpui-component ships no icon assets):
-                        // an arrow for expandable nodes, blank for leaves.
-                        let glyph = if !entry.is_folder() {
-                            ""
-                        } else if entry.is_expanded() {
-                            "▾"
-                        } else {
-                            "▸"
-                        };
-                        ListItem::new(ix)
-                            .w_full()
-                            .rounded(cx.theme().radius)
-                            .px_2()
-                            .pl(px(14.) * entry.depth() + px(8.))
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .w_4()
-                                            .flex_none()
-                                            .text_center()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(glyph),
-                                    )
-                                    .child(item.label.clone()),
-                            )
+                        view.update(cx, |_, cx| {
+                            let item = entry.item();
+                            // Text glyphs (gpui-component ships no icon assets):
+                            // an arrow for expandable nodes, blank for leaves.
+                            let glyph = if !entry.is_folder() {
+                                ""
+                            } else if entry.is_expanded() {
+                                "▾"
+                            } else {
+                                "▸"
+                            };
+                            let list_item = ListItem::new(ix)
+                                .w_full()
+                                .rounded(cx.theme().radius)
+                                .px_2()
+                                .pl(px(14.) * entry.depth() + px(8.))
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .w_4()
+                                                .flex_none()
+                                                .text_center()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(glyph),
+                                        )
+                                        .child(item.label.clone()),
+                                );
+                            if entry.is_folder() {
+                                // Folders expand through the tree's own click
+                                // handling; only object leaves open.
+                                list_item
+                            } else {
+                                let id = item.id.clone();
+                                list_item.on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_db_object(&id, window, cx);
+                                }))
+                            }
+                        })
                     },
                 ))
                 .into_any_element()

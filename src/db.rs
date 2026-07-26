@@ -224,9 +224,23 @@ fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// Quote a string as a SQL identifier, doubling embedded double quotes, so a
+/// name with mixed case or special characters round-trips in generated DDL.
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
 /// Whether a simple-query text boolean (`"t"`/`"f"`) is true.
 fn is_true(value: Option<&str>) -> bool {
     value == Some("t")
+}
+
+/// Run a query and return the first column of the first row, `None` when the
+/// query yields no rows or that value is NULL.
+fn catalog_scalar(conn_str: &str, sql: &str) -> Result<Option<String>, String> {
+    Ok(catalog_rows(conn_str, sql)?
+        .first()
+        .and_then(|row| row.get(0).map(ToString::to_string)))
 }
 
 /// Run a simple query and keep only the data rows.
@@ -366,6 +380,207 @@ pub fn list_constraints(
             kind: row.get(1).and_then(|s| s.chars().next()).unwrap_or('?'),
         })
         .collect())
+}
+
+/// Runnable `CREATE` statement reconstructing a view or materialized view.
+/// The body comes from `pg_get_viewdef`; the header is generated so the whole
+/// thing re-creates the object.
+pub fn view_definition(
+    conn_str: &str,
+    schema: &str,
+    name: &str,
+    materialized: bool,
+) -> Result<String, String> {
+    let sql = format!(
+        "SELECT pg_catalog.pg_get_viewdef(c.oid, true) \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = {schema} AND c.relname = {name}",
+        schema = quote_literal(schema),
+        name = quote_literal(name),
+    );
+    let body =
+        catalog_scalar(conn_str, &sql)?.ok_or_else(|| format!("view {schema}.{name} not found"))?;
+    let keyword = if materialized {
+        "CREATE MATERIALIZED VIEW"
+    } else {
+        "CREATE OR REPLACE VIEW"
+    };
+    Ok(format!(
+        "{keyword} {}.{} AS\n{body}",
+        quote_ident(schema),
+        quote_ident(name),
+    ))
+}
+
+/// Full `CREATE OR REPLACE FUNCTION`/`PROCEDURE` text from
+/// `pg_get_functiondef`. `signature` is the `name(identity arguments)` form
+/// carried by the browser leaf, so overloads resolve to the right routine.
+pub fn function_definition(
+    conn_str: &str,
+    schema: &str,
+    signature: &str,
+) -> Result<String, String> {
+    // Match the `name(identity arguments)` string the browser leaf was built
+    // from (see `list_functions`) rather than casting to `regprocedure`: the
+    // identity-argument text does not always parse back as a `regprocedure`
+    // (argument modes, `VARIADIC`, quoting), which raises a hard error.
+    let sql = format!(
+        "SELECT pg_catalog.pg_get_functiondef(p.oid) \
+         FROM pg_catalog.pg_proc p \
+         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = {schema} \
+           AND p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' \
+               = {signature}",
+        schema = quote_literal(schema),
+        signature = quote_literal(signature),
+    );
+    catalog_scalar(conn_str, &sql)?
+        .ok_or_else(|| format!("function {schema}.{signature} not found"))
+}
+
+/// Best-effort `CREATE SEQUENCE` reconstructed from `information_schema`.
+pub fn sequence_definition(conn_str: &str, schema: &str, name: &str) -> Result<String, String> {
+    let sql = format!(
+        "SELECT data_type, start_value, increment, minimum_value, maximum_value, cycle_option \
+         FROM information_schema.sequences \
+         WHERE sequence_schema = {schema} AND sequence_name = {name}",
+        schema = quote_literal(schema),
+        name = quote_literal(name),
+    );
+    let row = catalog_rows(conn_str, &sql)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("sequence {schema}.{name} not found"))?;
+    let col = |i: usize| row.get(i).unwrap_or_default().to_string();
+    let cycle = if row.get(5) == Some("YES") {
+        "CYCLE"
+    } else {
+        "NO CYCLE"
+    };
+    Ok(format!(
+        "CREATE SEQUENCE {}.{}\n    AS {}\n    START WITH {}\n    INCREMENT BY {}\n    MINVALUE {}\n    MAXVALUE {}\n    {cycle};",
+        quote_ident(schema),
+        quote_ident(name),
+        col(0),
+        col(1),
+        col(2),
+        col(3),
+        col(4),
+    ))
+}
+
+/// Best-effort DDL for a user-defined type. Composite, enum and domain types
+/// are reconstructed fully; other kinds (base, range, …) return a comment
+/// noting the kind is not supported.
+pub fn type_definition(conn_str: &str, schema: &str, name: &str) -> Result<String, String> {
+    let sql = format!(
+        "SELECT t.typtype, t.oid, t.typrelid, \
+                pg_catalog.format_type(t.typbasetype, t.typtypmod), \
+                t.typnotnull, t.typdefault \
+         FROM pg_catalog.pg_type t \
+         JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+         WHERE n.nspname = {schema} AND t.typname = {name}",
+        schema = quote_literal(schema),
+        name = quote_literal(name),
+    );
+    let row = catalog_rows(conn_str, &sql)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("type {schema}.{name} not found"))?;
+    let typtype = row.get(0).and_then(|s| s.chars().next()).unwrap_or('?');
+    let oid = row.get(1).unwrap_or_default().to_string();
+    let typrelid = row.get(2).unwrap_or_default().to_string();
+    let qualified = format!("{}.{}", quote_ident(schema), quote_ident(name));
+
+    match typtype {
+        // Composite type: reconstruct from its columns.
+        'c' => {
+            let cols_sql = format!(
+                "SELECT string_agg(quote_ident(a.attname) || ' ' \
+                            || pg_catalog.format_type(a.atttypid, a.atttypmod), ', ' \
+                            ORDER BY a.attnum) \
+                 FROM pg_catalog.pg_attribute a \
+                 WHERE a.attrelid = {typrelid} AND a.attnum > 0 AND NOT a.attisdropped"
+            );
+            let cols = catalog_scalar(conn_str, &cols_sql)?.unwrap_or_default();
+            Ok(format!("CREATE TYPE {qualified} AS ({cols});"))
+        }
+        // Enum: reconstruct from its labels.
+        'e' => {
+            let labels_sql = format!(
+                "SELECT string_agg(quote_literal(e.enumlabel), ', ' ORDER BY e.enumsortorder) \
+                 FROM pg_catalog.pg_enum e WHERE e.enumtypid = {oid}"
+            );
+            let labels = catalog_scalar(conn_str, &labels_sql)?.unwrap_or_default();
+            Ok(format!("CREATE TYPE {qualified} AS ENUM ({labels});"))
+        }
+        // Domain: base type plus NOT NULL / DEFAULT / CHECK modifiers.
+        'd' => {
+            let base = row.get(3).unwrap_or_default().to_string();
+            let mut out = format!("CREATE DOMAIN {qualified} AS {base}");
+            if is_true(row.get(4)) {
+                out.push_str(" NOT NULL");
+            }
+            if let Some(default) = row.get(5) {
+                let _ = write!(out, " DEFAULT {default}");
+            }
+            let checks_sql = format!(
+                "SELECT string_agg(pg_catalog.pg_get_constraintdef(con.oid), ' ') \
+                 FROM pg_catalog.pg_constraint con WHERE con.contypid = {oid}"
+            );
+            if let Some(checks) = catalog_scalar(conn_str, &checks_sql)? {
+                let _ = write!(out, " {checks}");
+            }
+            out.push(';');
+            Ok(out)
+        }
+        other => Ok(format!(
+            "-- Definition of type {schema}.{name} (typtype '{other}') is not supported."
+        )),
+    }
+}
+
+/// `CREATE INDEX` text from `pg_get_indexdef`.
+pub fn index_definition(conn_str: &str, schema: &str, name: &str) -> Result<String, String> {
+    let sql = format!(
+        "SELECT pg_catalog.pg_get_indexdef(c.oid) \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = {schema} AND c.relname = {name} AND c.relkind IN ('i', 'I')",
+        schema = quote_literal(schema),
+        name = quote_literal(name),
+    );
+    let def = catalog_scalar(conn_str, &sql)?
+        .ok_or_else(|| format!("index {schema}.{name} not found"))?;
+    Ok(format!("{def};"))
+}
+
+/// `ALTER TABLE … ADD CONSTRAINT` text from `pg_get_constraintdef`.
+pub fn constraint_definition(
+    conn_str: &str,
+    schema: &str,
+    relation: &str,
+    name: &str,
+) -> Result<String, String> {
+    let sql = format!(
+        "SELECT pg_catalog.pg_get_constraintdef(con.oid) \
+         FROM pg_catalog.pg_constraint con \
+         JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = {schema} AND c.relname = {relation} AND con.conname = {name}",
+        schema = quote_literal(schema),
+        relation = quote_literal(relation),
+        name = quote_literal(name),
+    );
+    let def = catalog_scalar(conn_str, &sql)?
+        .ok_or_else(|| format!("constraint {name} on {schema}.{relation} not found"))?;
+    Ok(format!(
+        "ALTER TABLE {}.{} ADD CONSTRAINT {} {def};",
+        quote_ident(schema),
+        quote_ident(relation),
+        quote_ident(name),
+    ))
 }
 
 /// Execute a SQL script (one or more statements) using the simple query protocol,
