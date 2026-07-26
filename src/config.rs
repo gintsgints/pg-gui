@@ -67,6 +67,10 @@ impl<'de> Deserialize<'de> for RecentConnection {
 
 /// Persisted app settings, stored as JSON in the platform config directory
 /// (`~/Library/Application Support/pg-gui/config.json` on macOS).
+// The bools are independent, persisted on/off UI preferences (panel
+// visibility, format-on-save); a state machine or enums would not model them
+// any better, so the excessive-bools lint is a false positive here.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -138,6 +142,14 @@ pub struct Config {
     /// Whether the results panel is shown (toggled with cmd-3).
     #[serde(default = "default_true")]
     pub results_panel_visible: bool,
+    /// Whether the database object browser (left panel) is shown (toggled
+    /// with cmd-1).
+    #[serde(default = "default_true")]
+    pub db_panel_visible: bool,
+    /// Width of the database object browser in pixels; `None` until its
+    /// divider is first dragged.
+    #[serde(default)]
+    pub db_panel_width: Option<f32>,
     /// UI zoom factor (cmd +/-, cmd-0 to reset); 1.0 means 100%.
     #[serde(default = "default_zoom")]
     pub zoom: f32,
@@ -203,6 +215,8 @@ impl Default for Config {
             files_panel_visible: default_true(),
             files_panel_width: None,
             results_panel_visible: default_true(),
+            db_panel_visible: default_true(),
+            db_panel_width: None,
             zoom: default_zoom(),
             theme: ThemeSelection::default(),
         }

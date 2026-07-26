@@ -5,6 +5,7 @@ mod ai;
 mod app;
 mod config;
 mod db;
+mod db_tree;
 mod debug;
 mod export;
 mod file_tree;
@@ -35,6 +36,8 @@ actions!(
         OpenFolder,
         ToggleFilesPanel,
         ToggleResultsPanel,
+        ToggleDbPanel,
+        RefreshDbTree,
         SaveFile,
         OpenSnippets,
         OpenConfig,
@@ -137,6 +140,7 @@ fn main() {
             KeyBinding::new("ctrl-shift-tab", PrevTab, None),
             KeyBinding::new("secondary-o", OpenFile, None),
             KeyBinding::new("secondary-b", ToggleFilesPanel, None),
+            KeyBinding::new("secondary-1", ToggleDbPanel, None),
             KeyBinding::new("secondary-2", ToggleFilesPanel, None),
             KeyBinding::new("secondary-3", ToggleResultsPanel, None),
             KeyBinding::new("secondary-s", SaveFile, None),

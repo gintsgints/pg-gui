@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime};
 use futures::StreamExt as _;
 use gpui::Subscription;
 use gpui::{
-    App, AppContext as _, Context, Entity, EntityInputHandler as _, Focusable as _, Hsla,
-    InteractiveElement as _, IntoElement, Menu, MenuItem, MouseButton, NoAction,
+    AnyElement, App, AppContext as _, Context, Entity, EntityInputHandler as _, Focusable as _,
+    Hsla, InteractiveElement as _, IntoElement, Menu, MenuItem, MouseButton, NoAction,
     ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
     Window, div, px,
 };
@@ -36,9 +36,10 @@ use crate::results::ResultsDelegate;
 use crate::{
     AiComplete, CloseTab, Connect, DebugContinue, DebugStepInto, DebugStepOver, DebugStop,
     EditConnection, ExportCsv, ExportInserts, FormatScript, NewConnection, NewFile, NextTab,
-    OpenConfig, OpenFile, OpenFolder, OpenGitHub, OpenSnippets, PrevTab, Quit, RunQuery, SaveFile,
-    SetTheme, ShowHelp, StartDebug, ToggleComment, ToggleFilesPanel, ToggleResultsPanel, ZoomIn,
-    ZoomOut, ZoomReset, ai, config, db, debug, export, file_tree, lsp, snippets, statement,
+    OpenConfig, OpenFile, OpenFolder, OpenGitHub, OpenSnippets, PrevTab, Quit, RefreshDbTree,
+    RunQuery, SaveFile, SetTheme, ShowHelp, StartDebug, ToggleComment, ToggleDbPanel,
+    ToggleFilesPanel, ToggleResultsPanel, ZoomIn, ZoomOut, ZoomReset, ai, config, db, db_tree,
+    debug, export, file_tree, lsp, snippets, statement,
 };
 
 /// The project's GitHub page, opened from the About application menu.
@@ -72,6 +73,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cmd-w", "Close the tab"),
     ("ctrl-tab / ctrl-shift-tab", "Next / previous tab"),
     ("cmd-o", "Open a SQL script"),
+    ("cmd-1", "Show or hide the database browser"),
     ("cmd-b / cmd-2", "Show or hide the files panel"),
     ("cmd-3", "Show or hide the results panel"),
     ("cmd-s", "Save the script"),
@@ -95,6 +97,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("ctrl-w", "Close the tab"),
     ("ctrl-tab / ctrl-shift-tab", "Next / previous tab"),
     ("ctrl-o", "Open a SQL script"),
+    ("ctrl-1", "Show or hide the database browser"),
     ("ctrl-b / ctrl-2", "Show or hide the files panel"),
     ("ctrl-3", "Show or hide the results panel"),
     ("ctrl-s", "Save the script"),
@@ -294,8 +297,10 @@ fn build_menus(recents: &[config::RecentConnection], theme: config::ThemeSelecti
             name: "View".into(),
             disabled: false,
             items: vec![
+                MenuItem::action("Toggle Database Browser", ToggleDbPanel),
                 MenuItem::action("Toggle Files Panel", ToggleFilesPanel),
                 MenuItem::action("Toggle Results Panel", ToggleResultsPanel),
+                MenuItem::action("Refresh Database Browser", RefreshDbTree),
                 MenuItem::separator(),
                 MenuItem::action("Zoom In", ZoomIn),
                 MenuItem::action("Zoom Out", ZoomOut),
@@ -700,6 +705,18 @@ struct DebugState {
     terminated: bool,
 }
 
+/// State of the object browser's top-level schema-list fetch. The three
+/// states are mutually exclusive, so they live in one enum rather than a
+/// `loading` bool plus an `error` option.
+enum DbSchemaLoad {
+    /// Loaded (or idle before the first load); the tree shows the current nodes.
+    Ready,
+    /// A fetch is in flight.
+    Loading,
+    /// The last fetch failed; the message is shown in the panel body.
+    Failed(String),
+}
+
 pub struct PgGuiApp {
     tabs: Vec<EditorTab>,
     active_tab: usize,
@@ -723,6 +740,25 @@ pub struct PgGuiApp {
     /// Hash of the last scan, so an unchanged re-scan skips the rebuild
     /// (which would reset the tree's selection).
     tree_signature: u64,
+    /// Split state of the database browser / editor area; the panel width is
+    /// persisted to the config whenever the divider is dragged.
+    db_sidebar_state: Entity<ResizableState>,
+    /// The database object browser tree widget (left panel).
+    db_tree_state: Entity<TreeState>,
+    /// The lazily-loaded object model backing [`Self::db_tree_state`]; the
+    /// single source of truth, re-projected to `TreeItem`s on every change.
+    db_nodes: Vec<db_tree::DbNode>,
+    /// Ids of the browser's expanded nodes, re-applied when the tree is
+    /// rebuilt (the widget itself has no lazy/expansion-preserving API).
+    db_expanded: HashSet<SharedString>,
+    /// The browser's filter box; its text filters loaded nodes client-side.
+    db_filter_input: Entity<InputState>,
+    db_filter: String,
+    /// Whether system schemas (`pg_*`, `information_schema`) are shown;
+    /// runtime-only, defaults off.
+    show_system_schemas: bool,
+    /// State of the browser's top-level schema-list fetch.
+    db_schema_load: DbSchemaLoad,
     status: SharedString,
     running: bool,
     ai_running: bool,
@@ -810,6 +846,7 @@ impl PgGuiApp {
         let resizable_state = cx.new(|_| ResizableState::default());
         let sidebar_state = cx.new(|_| ResizableState::default());
         let tree_state = cx.new(|cx| TreeState::new(cx));
+        let (db_sidebar_state, db_tree_state, db_filter_input) = Self::build_db_browser(window, cx);
 
         let (connections, connections_sub) = Self::build_connection_combo(&config, window, cx);
 
@@ -830,6 +867,8 @@ impl PgGuiApp {
             }),
             connections_sub,
             Self::track_expanded_dirs(&tree_state, cx),
+            Self::track_db_expanded(&db_tree_state, cx),
+            Self::track_db_filter(&db_filter_input, cx),
             // Follow OS light/dark switches while the theme is "System".
             window.observe_window_appearance(move |window, cx| {
                 weak_this
@@ -870,6 +909,14 @@ impl PgGuiApp {
             expanded_dirs: HashSet::new(),
             tree_dirs: Rc::new(HashSet::new()),
             tree_signature: 0,
+            db_sidebar_state,
+            db_tree_state,
+            db_nodes: Vec::new(),
+            db_expanded: HashSet::new(),
+            db_filter_input,
+            db_filter: String::new(),
+            show_system_schemas: false,
+            db_schema_load: DbSchemaLoad::Ready,
             status: "Ready".into(),
             running: false,
             ai_running: false,
@@ -888,6 +935,9 @@ impl PgGuiApp {
         this.refresh_menus(cx);
         this.start_lsp(cx);
         this.load_tree(cx);
+        if this.config.db_panel_visible {
+            this.load_db_schemas(cx);
+        }
         Self::watch_files(window, cx);
         this.apply_zoom(cx);
         this
@@ -1281,6 +1331,142 @@ impl PgGuiApp {
         .detach();
     }
 
+    /// Create the object browser's widgets: its resizable-split state, the
+    /// tree, and the filter box.
+    fn build_db_browser(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (
+        Entity<ResizableState>,
+        Entity<TreeState>,
+        Entity<InputState>,
+    ) {
+        let sidebar = cx.new(|_| ResizableState::default());
+        let tree = cx.new(|cx| TreeState::new(cx));
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter loaded objects…"));
+        (sidebar, tree, filter)
+    }
+
+    /// Record the browser tree's expanded ids (re-applied on rebuild) and
+    /// kick off the lazy fetch when an unloaded node is expanded.
+    fn track_db_expanded(
+        db_tree_state: &Entity<TreeState>,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe(
+            db_tree_state,
+            |this, _, event: &TreeEvent, cx| match event {
+                TreeEvent::Expanded(id) => {
+                    this.db_expanded.insert(id.clone());
+                    this.load_db_children(id.clone(), cx);
+                }
+                TreeEvent::Collapsed(id) => {
+                    this.db_expanded.remove(id);
+                }
+            },
+        )
+    }
+
+    /// Re-filter the browser tree as the filter box changes.
+    fn track_db_filter(input: &Entity<InputState>, cx: &mut Context<Self>) -> Subscription {
+        cx.subscribe(input, |this, input, event: &InputEvent, cx| {
+            if !matches!(event, InputEvent::Change) {
+                return;
+            }
+            let text = input.read(cx).value().to_string();
+            if text == this.db_filter {
+                return;
+            }
+            this.db_filter = text;
+            this.rebuild_db_tree(cx);
+        })
+    }
+
+    /// Re-project the object model into the browser tree widget. Cheap
+    /// (UI-side only); runs after every model or filter change.
+    fn rebuild_db_tree(&mut self, cx: &mut Context<Self>) {
+        let items = db_tree::to_tree_items(&self.db_nodes, &self.db_expanded, &self.db_filter);
+        self.db_tree_state
+            .update(cx, |state, cx| state.set_items(items, cx));
+        cx.notify();
+    }
+
+    /// Reset the browser and fetch the schema list on the background executor.
+    /// A no-op reset (clears the tree) when there is no connection string.
+    fn load_db_schemas(&mut self, cx: &mut Context<Self>) {
+        self.db_nodes.clear();
+        self.db_expanded.clear();
+        let conn = self.config.connection_string.clone();
+        if conn.is_empty() {
+            self.db_schema_load = DbSchemaLoad::Ready;
+            self.rebuild_db_tree(cx);
+            return;
+        }
+        self.db_schema_load = DbSchemaLoad::Loading;
+        self.rebuild_db_tree(cx);
+        let show_system = self.show_system_schemas;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { db_tree::load_schemas(&conn, show_system) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.db_schema_load = match result {
+                    Ok(nodes) => {
+                        this.db_nodes = nodes;
+                        DbSchemaLoad::Ready
+                    }
+                    Err(err) => DbSchemaLoad::Failed(err),
+                };
+                this.rebuild_db_tree(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Fetch the children of a just-expanded folder node. Ignores nodes that
+    /// are already loaded/loading (re-expanding a failed node retries).
+    fn load_db_children(&mut self, id: SharedString, cx: &mut Context<Self>) {
+        let Some(node) = db_tree::find(&self.db_nodes, &id) else {
+            return;
+        };
+        if !matches!(
+            node.load,
+            db_tree::Load::Unloaded | db_tree::Load::Failed(_)
+        ) {
+            return;
+        }
+        let (kind, schema, relation) = (node.kind, node.schema.clone(), node.relation.clone());
+        let conn = self.config.connection_string.clone();
+        if let Some(node) = db_tree::find_mut(&mut self.db_nodes, &id) {
+            node.load = db_tree::Load::Loading;
+        }
+        self.rebuild_db_tree(cx);
+
+        let parent_id = id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    db_tree::load_children(&conn, kind, &parent_id, &schema, &relation)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(node) = db_tree::find_mut(&mut this.db_nodes, &id) {
+                    match result {
+                        Ok(children) => {
+                            node.children = children;
+                            node.load = db_tree::Load::Loaded;
+                        }
+                        Err(err) => node.load = db_tree::Load::Failed(err),
+                    }
+                }
+                this.rebuild_db_tree(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Notice when an open tab's file changed on disk. A clean tab reloads
     /// silently; a tab with unsaved edits is flagged diverged (its buffer is
     /// left untouched) so the next save can prompt before clobbering.
@@ -1383,6 +1569,12 @@ impl PgGuiApp {
                 "",
             );
             self.refresh_menus(cx);
+            if self.config.db_panel_visible {
+                self.load_db_schemas(cx);
+            } else {
+                self.db_nodes.clear();
+                self.db_expanded.clear();
+            }
         }
         // Covers both a changed active connection and an edited recent list.
         self.sync_connection_combo(window, cx);
@@ -2307,6 +2499,12 @@ impl PgGuiApp {
         self.refresh_menus(cx);
         self.sync_connection_combo(window, cx);
         self.restart_lsp(cx);
+        if self.config.db_panel_visible {
+            self.load_db_schemas(cx);
+        } else {
+            self.db_nodes.clear();
+            self.db_expanded.clear();
+        }
         let label = if name.is_empty() {
             mask_credentials(url)
         } else {
@@ -2631,6 +2829,32 @@ impl PgGuiApp {
         self.config.results_panel_visible = !self.config.results_panel_visible;
         self.schedule_save(cx);
         cx.notify();
+    }
+
+    /// Show or hide the database object browser (cmd-1). Loads the schema
+    /// list the first time it's revealed for the current connection.
+    pub fn toggle_db_panel(&mut self, _: &ToggleDbPanel, _: &mut Window, cx: &mut Context<Self>) {
+        self.config.db_panel_visible = !self.config.db_panel_visible;
+        if self.config.db_panel_visible
+            && self.db_nodes.is_empty()
+            && !matches!(self.db_schema_load, DbSchemaLoad::Loading)
+        {
+            self.load_db_schemas(cx);
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// Reload the object browser from scratch (collapse to the schema list
+    /// and refetch), picking up objects created since the last load.
+    pub fn refresh_db_tree(&mut self, _: &RefreshDbTree, _: &mut Window, cx: &mut Context<Self>) {
+        self.load_db_schemas(cx);
+    }
+
+    /// Toggle whether system schemas are listed, then reload.
+    fn toggle_system_schemas(&mut self, cx: &mut Context<Self>) {
+        self.show_system_schemas = !self.show_system_schemas;
+        self.load_db_schemas(cx);
     }
 
     /// Open the config file in the system default editor (cmd-,).
@@ -3203,6 +3427,167 @@ impl PgGuiApp {
     /// The files side panel: the working directory's tree, or an "Open
     /// Folder…" hint while none is set. Non-SQL files are disabled — shown
     /// greyed out, with no click handlers.
+    /// Compose the three-column workspace: the database browser (left), the
+    /// editor+results area (center), and the files panel (right). Each side
+    /// panel is present only when visible, with its own draggable divider.
+    fn render_workspace(&self, cx: &mut Context<Self>) -> AnyElement {
+        let center_and_files = if self.config.files_panel_visible {
+            h_resizable("editor-sidebar")
+                .with_state(&self.sidebar_state)
+                .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _, cx| {
+                    // The files panel is the second (right) child.
+                    if let Some(width) = state.read(cx).sizes().last() {
+                        this.config.files_panel_width = Some(f32::from(*width));
+                        this.schedule_save(cx);
+                    }
+                }))
+                .child(resizable_panel().child(self.render_editor_results(cx)))
+                .child(
+                    resizable_panel()
+                        .size(px(self.config.files_panel_width.unwrap_or(240.)))
+                        .size_range(px(120.)..px(600.))
+                        .child(self.render_files_panel(cx)),
+                )
+                .into_any_element()
+        } else {
+            self.render_editor_results(cx).into_any_element()
+        };
+
+        if self.config.db_panel_visible {
+            h_resizable("db-sidebar")
+                .with_state(&self.db_sidebar_state)
+                .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _, cx| {
+                    // The database browser is the first (left) child.
+                    if let Some(width) = state.read(cx).sizes().first() {
+                        this.config.db_panel_width = Some(f32::from(*width));
+                        this.schedule_save(cx);
+                    }
+                }))
+                .child(
+                    resizable_panel()
+                        .size(px(self.config.db_panel_width.unwrap_or(260.)))
+                        .size_range(px(120.)..px(600.))
+                        .child(self.render_db_panel(cx)),
+                )
+                .child(resizable_panel().child(center_and_files))
+                .into_any_element()
+        } else {
+            center_and_files
+        }
+    }
+
+    /// The database object browser (left panel): a header with a system-schema
+    /// toggle and refresh button, a filter box, and the lazily-loaded tree.
+    fn render_db_panel(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let header = h_flex()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .truncate()
+                    .child("Database"),
+            )
+            .child(
+                Checkbox::new("db-system")
+                    .label("System")
+                    .checked(self.show_system_schemas)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_system_schemas(cx))),
+            )
+            .child(
+                Button::new("db-refresh")
+                    .ghost()
+                    .xsmall()
+                    .tooltip("Refresh")
+                    .label("↻")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.refresh_db_tree(&RefreshDbTree, window, cx);
+                    })),
+            );
+
+        let filter = div()
+            .px_1()
+            .pb_1()
+            .child(Input::new(&self.db_filter_input).xsmall());
+
+        v_flex()
+            .size_full()
+            .child(header)
+            .child(filter)
+            .child(div().flex_1().min_h(px(0.)).child(self.render_db_body(cx)))
+    }
+
+    /// The browser panel's body: one of the empty/error/loading placeholders,
+    /// or the object tree itself.
+    fn render_db_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        let message = |text: &str, danger: bool| {
+            let color = if danger {
+                cx.theme().danger
+            } else {
+                cx.theme().muted_foreground
+            };
+            v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .p_4()
+                .child(div().text_sm().text_color(color).child(text.to_string()))
+                .into_any_element()
+        };
+
+        if self.config.connection_string.is_empty() {
+            message("Not connected", false)
+        } else if let DbSchemaLoad::Failed(err) = &self.db_schema_load {
+            message(err, true)
+        } else if matches!(self.db_schema_load, DbSchemaLoad::Loading) && self.db_nodes.is_empty() {
+            message("Loading…", false)
+        } else if self.db_nodes.is_empty() {
+            message("No schemas", false)
+        } else {
+            div()
+                .size_full()
+                .px_1()
+                .child(tree(
+                    &self.db_tree_state,
+                    move |ix, entry, _selected, _window, cx| {
+                        let item = entry.item();
+                        // Text glyphs (gpui-component ships no icon assets):
+                        // an arrow for expandable nodes, blank for leaves.
+                        let glyph = if !entry.is_folder() {
+                            ""
+                        } else if entry.is_expanded() {
+                            "▾"
+                        } else {
+                            "▸"
+                        };
+                        ListItem::new(ix)
+                            .w_full()
+                            .rounded(cx.theme().radius)
+                            .px_2()
+                            .pl(px(14.) * entry.depth() + px(8.))
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .w_4()
+                                            .flex_none()
+                                            .text_center()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(glyph),
+                                    )
+                                    .child(item.label.clone()),
+                            )
+                    },
+                ))
+                .into_any_element()
+        }
+    }
+
     fn render_files_panel(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let Some(root) = self.config.working_dir.clone() else {
             return v_flex()
@@ -3894,6 +4279,8 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::toggle_files_panel))
             .on_action(cx.listener(Self::toggle_results_panel))
+            .on_action(cx.listener(Self::toggle_db_panel))
+            .on_action(cx.listener(Self::refresh_db_tree))
             .on_action(cx.listener(Self::save_file))
             .on_action(cx.listener(Self::open_snippet_picker))
             .on_action(cx.listener(Self::open_config))
@@ -3913,35 +4300,14 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::request_quit))
             .child(self.render_title_bar(cx))
             .child(
-                // The files panel next to the editor area, both split by
-                // draggable dividers whose positions are persisted to the
-                // config on drag and restored on launch.
+                // The database browser (left) and files panel (right) flank
+                // the editor area, each split by a draggable divider whose
+                // position is persisted to the config on drag and restored on
+                // launch.
                 div()
                     .flex_1()
                     .min_h(px(0.))
-                    .child(if self.config.files_panel_visible {
-                        h_resizable("editor-sidebar")
-                            .with_state(&self.sidebar_state)
-                            .on_resize(cx.listener(
-                                |this, state: &Entity<ResizableState>, _, cx| {
-                                    // The panel is the second (right) child.
-                                    if let Some(width) = state.read(cx).sizes().last() {
-                                        this.config.files_panel_width = Some(f32::from(*width));
-                                        this.schedule_save(cx);
-                                    }
-                                },
-                            ))
-                            .child(resizable_panel().child(self.render_editor_results(cx)))
-                            .child(
-                                resizable_panel()
-                                    .size(px(self.config.files_panel_width.unwrap_or(240.)))
-                                    .size_range(px(120.)..px(600.))
-                                    .child(self.render_files_panel(cx)),
-                            )
-                            .into_any_element()
-                    } else {
-                        self.render_editor_results(cx).into_any_element()
-                    }),
+                    .child(self.render_workspace(cx)),
             )
             .child(self.render_status_bar(cx))
             // Dialogs (e.g. the snippet picker) are drawn by the app's root

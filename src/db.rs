@@ -196,6 +196,178 @@ pub fn test_connection(conn_str: &str) -> Result<(), String> {
     connect(conn_str).map(|_| ()).map_err(|e| describe(&e))
 }
 
+// --- Catalog introspection for the database object browser ---------------
+//
+// Each function opens a fresh connection (the browser loads objects lazily,
+// one level per node expansion — see [`crate::db_tree`]), runs one
+// `pg_catalog` query through the simple query protocol (every value comes
+// back as text), and maps the rows to a small `Send` result type. Object
+// names are always fetched from the catalog, but are still quoted defensively
+// with [`quote_literal`] before being spliced into the SQL.
+
+/// An index, as shown under a table's Indexes folder.
+pub struct IndexInfo {
+    pub name: String,
+    pub unique: bool,
+    pub primary: bool,
+}
+
+/// A constraint, as shown under a table's Constraints folder. `kind` is the
+/// raw `pg_constraint.contype` code (`p`/`f`/`u`/`c`/`x`/…).
+pub struct ConstraintInfo {
+    pub name: String,
+    pub kind: char,
+}
+
+/// Quote a string as a SQL literal, doubling embedded single quotes.
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Whether a simple-query text boolean (`"t"`/`"f"`) is true.
+fn is_true(value: Option<&str>) -> bool {
+    value == Some("t")
+}
+
+/// Run a simple query and keep only the data rows.
+fn catalog_rows(conn_str: &str, sql: &str) -> Result<Vec<SimpleQueryRow>, String> {
+    let mut client = connect(conn_str).map_err(|e| describe(&e))?;
+    let messages = client.simple_query(sql).map_err(|e| describe(&e))?;
+    Ok(messages
+        .into_iter()
+        .filter_map(|msg| match msg {
+            SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Schema names, ordered. System schemas (`pg_*`, `information_schema`) are
+/// excluded unless `show_system`.
+pub fn list_schemas(conn_str: &str, show_system: bool) -> Result<Vec<String>, String> {
+    let filter = if show_system {
+        String::new()
+    } else {
+        " WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema'".to_string()
+    };
+    let sql = format!("SELECT nspname FROM pg_catalog.pg_namespace{filter} ORDER BY nspname");
+    Ok(catalog_rows(conn_str, &sql)?
+        .iter()
+        .filter_map(|row| row.get(0).map(ToString::to_string))
+        .collect())
+}
+
+/// Relation names in `schema` of a given `pg_class.relkind` (`r` tables,
+/// `v` views, `m` materialized views, `S` sequences), ordered.
+pub fn list_relations(conn_str: &str, schema: &str, relkind: char) -> Result<Vec<String>, String> {
+    let sql = format!(
+        "SELECT c.relname \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = {schema} AND c.relkind = {kind} \
+         ORDER BY c.relname",
+        schema = quote_literal(schema),
+        kind = quote_literal(&relkind.to_string()),
+    );
+    Ok(catalog_rows(conn_str, &sql)?
+        .iter()
+        .filter_map(|row| row.get(0).map(ToString::to_string))
+        .collect())
+}
+
+/// Function/procedure signatures in `schema`, ordered. Each entry is
+/// `name(identity arguments)` so overloads stay distinct.
+pub fn list_functions(conn_str: &str, schema: &str) -> Result<Vec<String>, String> {
+    let sql = format!(
+        "SELECT p.proname \
+             || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' \
+         FROM pg_catalog.pg_proc p \
+         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = {schema} \
+         ORDER BY p.proname, 1",
+        schema = quote_literal(schema),
+    );
+    Ok(catalog_rows(conn_str, &sql)?
+        .iter()
+        .filter_map(|row| row.get(0).map(ToString::to_string))
+        .collect())
+}
+
+/// User-defined type names in `schema` (composite, enum, domain, base),
+/// ordered. Array and implicit relation row types are excluded, matching
+/// psql's `\dT`.
+pub fn list_types(conn_str: &str, schema: &str) -> Result<Vec<String>, String> {
+    let sql = format!(
+        "SELECT t.typname \
+         FROM pg_catalog.pg_type t \
+         JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+         WHERE n.nspname = {schema} \
+           AND (t.typrelid = 0 \
+                OR (SELECT c.relkind FROM pg_catalog.pg_class c WHERE c.oid = t.typrelid) = 'c') \
+           AND NOT EXISTS ( \
+                SELECT 1 FROM pg_catalog.pg_type el \
+                WHERE el.oid = t.typelem AND el.typarray = t.oid) \
+         ORDER BY t.typname",
+        schema = quote_literal(schema),
+    );
+    Ok(catalog_rows(conn_str, &sql)?
+        .iter()
+        .filter_map(|row| row.get(0).map(ToString::to_string))
+        .collect())
+}
+
+/// Indexes on `schema.relation`, ordered by name.
+pub fn list_indexes(
+    conn_str: &str,
+    schema: &str,
+    relation: &str,
+) -> Result<Vec<IndexInfo>, String> {
+    let sql = format!(
+        "SELECT ic.relname, ix.indisunique, ix.indisprimary \
+         FROM pg_catalog.pg_index ix \
+         JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
+         JOIN pg_catalog.pg_class tc ON tc.oid = ix.indrelid \
+         JOIN pg_catalog.pg_namespace n ON n.oid = tc.relnamespace \
+         WHERE n.nspname = {schema} AND tc.relname = {relation} \
+         ORDER BY ic.relname",
+        schema = quote_literal(schema),
+        relation = quote_literal(relation),
+    );
+    Ok(catalog_rows(conn_str, &sql)?
+        .iter()
+        .map(|row| IndexInfo {
+            name: row.get(0).unwrap_or_default().to_string(),
+            unique: is_true(row.get(1)),
+            primary: is_true(row.get(2)),
+        })
+        .collect())
+}
+
+/// Constraints on `schema.relation`, ordered by name.
+pub fn list_constraints(
+    conn_str: &str,
+    schema: &str,
+    relation: &str,
+) -> Result<Vec<ConstraintInfo>, String> {
+    let sql = format!(
+        "SELECT con.conname, con.contype \
+         FROM pg_catalog.pg_constraint con \
+         JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = {schema} AND c.relname = {relation} \
+         ORDER BY con.conname",
+        schema = quote_literal(schema),
+        relation = quote_literal(relation),
+    );
+    Ok(catalog_rows(conn_str, &sql)?
+        .iter()
+        .map(|row| ConstraintInfo {
+            name: row.get(0).unwrap_or_default().to_string(),
+            kind: row.get(1).and_then(|s| s.chars().next()).unwrap_or('?'),
+        })
+        .collect())
+}
+
 /// Execute a SQL script (one or more statements) using the simple query protocol,
 /// which returns every value as text and supports multi-statement scripts.
 pub fn run_script(conn_str: &str, sql: &str) -> Result<QueryOutcome, String> {
