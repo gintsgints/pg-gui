@@ -1652,7 +1652,25 @@ impl PgGuiApp {
                 .await;
             this.update_in(cx, |this, window, cx| match definition {
                 Ok(sql) => {
-                    let ix = this.add_tab(sql, None, window, cx);
+                    // Reuse an untouched untitled tab (the active one first) if
+                    // there is one, rather than piling up empty tabs.
+                    let pristine = if this.tab_is_pristine(this.active_tab, cx) {
+                        Some(this.active_tab)
+                    } else {
+                        (0..this.tabs.len()).find(|&i| this.tab_is_pristine(i, cx))
+                    };
+                    let ix = match pristine {
+                        Some(i) => {
+                            this.config.tabs[i].script.clone_from(&sql);
+                            this.tabs[i].saved.clone_from(&sql);
+                            this.tabs[i].dirty = false;
+                            this.tabs[i]
+                                .editor
+                                .update(cx, |state, cx| state.set_value(sql, window, cx));
+                            i
+                        }
+                        None => this.add_tab(sql, None, window, cx),
+                    };
                     // Propose a save name derived from the file mask.
                     this.tabs[ix].suggested_name = Some(suggested);
                     this.activate_tab(ix, window, cx);
