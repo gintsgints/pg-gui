@@ -583,6 +583,98 @@ pub fn constraint_definition(
     ))
 }
 
+/// Best-effort `CREATE TABLE` DDL: columns (type, NOT NULL, DEFAULT), then
+/// table constraints (`pg_get_constraintdef`), then any indexes that do not
+/// back a constraint (`pg_get_indexdef`). Postgres has no single "get table
+/// definition" function, so this is reconstructed from the catalog.
+pub fn table_definition(conn_str: &str, schema: &str, name: &str) -> Result<String, String> {
+    let oid = catalog_scalar(
+        conn_str,
+        &format!(
+            "SELECT c.oid FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = {schema} AND c.relname = {name} AND c.relkind IN ('r', 'p')",
+            schema = quote_literal(schema),
+            name = quote_literal(name),
+        ),
+    )?
+    .ok_or_else(|| format!("table {schema}.{name} not found"))?;
+
+    // Columns, in attribute order.
+    let column_rows = catalog_rows(
+        conn_str,
+        &format!(
+            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                    a.attnotnull, pg_catalog.pg_get_expr(d.adbin, d.adrelid) \
+             FROM pg_catalog.pg_attribute a \
+             LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+             WHERE a.attrelid = {oid} AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum"
+        ),
+    )?;
+    let mut items: Vec<String> = column_rows
+        .iter()
+        .map(|row| {
+            let mut line = format!(
+                "{} {}",
+                quote_ident(row.get(0).unwrap_or_default()),
+                row.get(1).unwrap_or_default(),
+            );
+            if is_true(row.get(2)) {
+                line.push_str(" NOT NULL");
+            }
+            if let Some(default) = row.get(3) {
+                let _ = write!(line, " DEFAULT {default}");
+            }
+            line
+        })
+        .collect();
+
+    // Table constraints (primary key first, then the rest by name).
+    let constraint_rows = catalog_rows(
+        conn_str,
+        &format!(
+            "SELECT con.conname, pg_catalog.pg_get_constraintdef(con.oid) \
+             FROM pg_catalog.pg_constraint con \
+             WHERE con.conrelid = {oid} \
+             ORDER BY con.contype = 'p' DESC, con.conname"
+        ),
+    )?;
+    for row in &constraint_rows {
+        items.push(format!(
+            "CONSTRAINT {} {}",
+            quote_ident(row.get(0).unwrap_or_default()),
+            row.get(1).unwrap_or_default(),
+        ));
+    }
+
+    let mut out = format!(
+        "CREATE TABLE {}.{} (\n    {}\n);",
+        quote_ident(schema),
+        quote_ident(name),
+        items.join(",\n    "),
+    );
+
+    // Indexes that are not the implementation of a constraint.
+    let index_rows = catalog_rows(
+        conn_str,
+        &format!(
+            "SELECT pg_catalog.pg_get_indexdef(ix.indexrelid) \
+             FROM pg_catalog.pg_index ix \
+             WHERE ix.indrelid = {oid} \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint con \
+                               WHERE con.conindid = ix.indexrelid) \
+             ORDER BY 1"
+        ),
+    )?;
+    for row in &index_rows {
+        if let Some(def) = row.get(0) {
+            let _ = write!(out, "\n{def};");
+        }
+    }
+    Ok(out)
+}
+
 /// Execute a SQL script (one or more statements) using the simple query protocol,
 /// which returns every value as text and supports multi-statement scripts.
 pub fn run_script(conn_str: &str, sql: &str) -> Result<QueryOutcome, String> {

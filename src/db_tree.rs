@@ -36,8 +36,10 @@ pub enum NodeKind {
     FunctionsFolder,
     SequencesFolder,
     TypesFolder,
-    // A table, which expands to its Indexes/Constraints folders.
+    // A table, which expands to its Definition/Indexes/Constraints entries.
     Table,
+    // The table's reconstructed CREATE TABLE DDL (a leaf).
+    TableDefinition,
     // Sub-folders under a table (lazy).
     IndexesFolder,
     ConstraintsFolder,
@@ -183,6 +185,16 @@ impl DbNode {
             DbNode::folder(format!("{id}{SEP}{tag}"), label, kind, schema, name)
         };
         let children = vec![
+            // A leaf that opens the table's CREATE TABLE DDL; `object` is the
+            // table name so a `.sql` lookup and the DDL fetch both use it.
+            DbNode::leaf(
+                format!("{id}{SEP}def"),
+                "definition",
+                NodeKind::TableDefinition,
+                schema,
+                name,
+                name,
+            ),
             sub("idx", "Indexes", NodeKind::IndexesFolder),
             sub("cons", "Constraints", NodeKind::ConstraintsFolder),
         ];
@@ -404,19 +416,36 @@ mod tests {
     }
 
     #[test]
-    fn table_expands_to_indexes_and_constraints() {
+    fn table_expands_to_definition_indexes_and_constraints() {
         let table = DbNode::table("p", "app", "users");
         assert_eq!(table.kind, NodeKind::Table);
         assert!(matches!(table.load, Load::Loaded));
         let kinds: Vec<NodeKind> = table.children.iter().map(|c| c.kind).collect();
         assert_eq!(
             kinds,
-            [NodeKind::IndexesFolder, NodeKind::ConstraintsFolder]
+            [
+                NodeKind::TableDefinition,
+                NodeKind::IndexesFolder,
+                NodeKind::ConstraintsFolder,
+            ]
         );
-        // The sub-folders carry the query context for their lazy fetch.
-        assert!(table.children.iter().all(|c| c.schema.as_ref() == "app"
-            && c.relation.as_ref() == "users"
-            && matches!(c.load, Load::Unloaded)));
+        // Every child carries the table's query context.
+        assert!(
+            table
+                .children
+                .iter()
+                .all(|c| c.schema.as_ref() == "app" && c.relation.as_ref() == "users")
+        );
+        // The definition entry is a leaf carrying the table name as its
+        // object; the sub-folders are lazily loaded.
+        let def = &table.children[0];
+        assert!(matches!(def.load, Load::Leaf));
+        assert_eq!(def.object.as_ref(), "users");
+        assert!(
+            table.children[1..]
+                .iter()
+                .all(|c| matches!(c.load, Load::Unloaded))
+        );
     }
 
     #[test]

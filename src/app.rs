@@ -413,10 +413,12 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
 /// Tables are branch nodes (they expand to Indexes/Constraints), so they
 /// never reach here.
 fn object_kind_has_definition(kind: db_tree::NodeKind) -> bool {
-    use db_tree::NodeKind::{Constraint, Function, Index, MatView, Sequence, Type, View};
+    use db_tree::NodeKind::{
+        Constraint, Function, Index, MatView, Sequence, TableDefinition, Type, View,
+    };
     matches!(
         kind,
-        View | MatView | Function | Sequence | Type | Index | Constraint
+        View | MatView | Function | Sequence | Type | Index | Constraint | TableDefinition
     )
 }
 
@@ -429,7 +431,9 @@ fn object_definition(
     object: &str,
     relation: &str,
 ) -> Result<String, String> {
-    use db_tree::NodeKind::{Constraint, Function, Index, MatView, Sequence, Type, View};
+    use db_tree::NodeKind::{
+        Constraint, Function, Index, MatView, Sequence, TableDefinition, Type, View,
+    };
     match kind {
         View => db::view_definition(conn, schema, object, false),
         MatView => db::view_definition(conn, schema, object, true),
@@ -438,6 +442,7 @@ fn object_definition(
         Type => db::type_definition(conn, schema, object),
         Index => db::index_definition(conn, schema, object),
         Constraint => db::constraint_definition(conn, schema, relation, object),
+        TableDefinition => db::table_definition(conn, schema, object),
         _ => Err("no definition for this object".to_string()),
     }
 }
