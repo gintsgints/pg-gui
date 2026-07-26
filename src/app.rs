@@ -1844,6 +1844,12 @@ impl PgGuiApp {
                             table.delegate_mut().set_data(outcome.columns, outcome.rows);
                             table.refresh(cx);
                         });
+                        // Reveal the results panel (cmd-3) when a query returns
+                        // rows so the output isn't silently hidden.
+                        if row_count > 0 && !this.config.results_panel_visible {
+                            this.config.results_panel_visible = true;
+                            this.schedule_save(cx);
+                        }
                         this.set_status(
                             format!(
                                 "{scope}: {statements} statement(s) executed in {elapsed:.0?} — showing {row_count} row(s){more}"
