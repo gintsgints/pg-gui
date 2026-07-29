@@ -74,7 +74,12 @@ pub struct Client {
 }
 
 struct Inner {
+    // Runtime provider calls go through the document worker (`doc_tx`), which
+    // owns its own workspace/path clones; these two are kept only so the
+    // `#[cfg(test)]` probes can hit the workspace synchronously.
+    #[cfg_attr(not(test), allow(dead_code))]
     workspace: Arc<dyn Workspace>,
+    #[cfg_attr(not(test), allow(dead_code))]
     path: PgLSPath,
     connection_string: String,
     keyword_case: CaseStyle,
@@ -107,6 +112,14 @@ enum DocEvent {
         position: TextSize,
         reply: oneshot::Sender<CompletionOutcome>,
     },
+    /// Sync the buffer to `text`, then compute hover at `position` and reply.
+    /// Routed through the worker for the same reason as [`Self::Completions`]:
+    /// hovering the just-typed token must see the current document.
+    Hover {
+        text: String,
+        position: TextSize,
+        reply: oneshot::Sender<HoverOutcome>,
+    },
     /// Close the workspace document and stop the worker.
     Close,
 }
@@ -115,6 +128,15 @@ enum DocEvent {
 enum CompletionOutcome {
     Items(Vec<pgls_completions::CompletionItem>),
     /// The database is unreachable; the caller falls back to snippets alone.
+    DatabaseOffline,
+    Failed(String),
+}
+
+/// Result of a worker-side hover request.
+enum HoverOutcome {
+    /// Markdown blocks for the hovered symbol.
+    Content(Vec<String>),
+    /// The database is unreachable; the caller shows nothing.
     DatabaseOffline,
     Failed(String),
 }
@@ -284,16 +306,7 @@ fn document_worker(
         match event {
             Some(DocEvent::Changed(content)) => {
                 version += 1;
-                contain_panic(|| {
-                    workspace
-                        .change_file(ChangeFileParams {
-                            path: path.clone(),
-                            version,
-                            content,
-                        })
-                        .ok();
-                })
-                .ok();
+                apply_change(workspace, path, version, content);
                 dirty = true;
             }
             Some(DocEvent::Format { text, reply }) => {
@@ -305,30 +318,21 @@ fn document_worker(
                 reply,
             }) => {
                 version += 1;
-                contain_panic(|| {
-                    workspace
-                        .change_file(ChangeFileParams {
-                            path: path.clone(),
-                            version,
-                            content: text,
-                        })
-                        .ok();
-                })
-                .ok();
-                let outcome = match contain_panic(|| {
-                    workspace.get_completions(GetCompletionsParams {
-                        path: path.clone(),
-                        position,
-                    })
-                }) {
-                    Ok(Ok(result)) => CompletionOutcome::Items(result.into_iter().collect()),
-                    Ok(Err(WorkspaceError::DatabaseConnectionError(_))) => {
-                        CompletionOutcome::DatabaseOffline
-                    }
-                    Ok(Err(err)) => CompletionOutcome::Failed(err.to_string()),
-                    Err(err) => CompletionOutcome::Failed(err.to_string()),
-                };
-                reply.send(outcome).ok();
+                apply_change(workspace, path, version, text);
+                reply
+                    .send(worker_completions(workspace, path, position))
+                    .ok();
+                // The document moved, so diagnostics need a fresh run.
+                dirty = true;
+            }
+            Some(DocEvent::Hover {
+                text,
+                position,
+                reply,
+            }) => {
+                version += 1;
+                apply_change(workspace, path, version, text);
+                reply.send(worker_hover(workspace, path, position)).ok();
                 // The document moved, so diagnostics need a fresh run.
                 dirty = true;
             }
@@ -351,6 +355,58 @@ fn document_worker(
             .ok();
     })
     .ok();
+}
+
+/// Apply a full-text change to the workspace document, containing any panic.
+fn apply_change(workspace: &Arc<dyn Workspace>, path: &PgLSPath, version: i32, content: String) {
+    contain_panic(|| {
+        workspace
+            .change_file(ChangeFileParams {
+                path: path.clone(),
+                version,
+                content,
+            })
+            .ok();
+    })
+    .ok();
+}
+
+/// Compute completions at `position` on the (already synced) document.
+fn worker_completions(
+    workspace: &Arc<dyn Workspace>,
+    path: &PgLSPath,
+    position: TextSize,
+) -> CompletionOutcome {
+    match contain_panic(|| {
+        workspace.get_completions(GetCompletionsParams {
+            path: path.clone(),
+            position,
+        })
+    }) {
+        Ok(Ok(result)) => CompletionOutcome::Items(result.into_iter().collect()),
+        Ok(Err(WorkspaceError::DatabaseConnectionError(_))) => CompletionOutcome::DatabaseOffline,
+        Ok(Err(err)) => CompletionOutcome::Failed(err.to_string()),
+        Err(err) => CompletionOutcome::Failed(err.to_string()),
+    }
+}
+
+/// Compute hover at `position` on the (already synced) document.
+fn worker_hover(
+    workspace: &Arc<dyn Workspace>,
+    path: &PgLSPath,
+    position: TextSize,
+) -> HoverOutcome {
+    match contain_panic(|| {
+        workspace.on_hover(OnHoverParams {
+            path: path.clone(),
+            position,
+        })
+    }) {
+        Ok(Ok(result)) => HoverOutcome::Content(result.into_iter().collect()),
+        Ok(Err(WorkspaceError::DatabaseConnectionError(_))) => HoverOutcome::DatabaseOffline,
+        Ok(Err(err)) => HoverOutcome::Failed(err.to_string()),
+        Err(err) => HoverOutcome::Failed(err.to_string()),
+    }
 }
 
 fn pull_diagnostics(workspace: &Arc<dyn Workspace>, path: &PgLSPath) -> Vec<lsp_types::Diagnostic> {
@@ -574,20 +630,35 @@ fn snippet_items(rope: &Rope, offset: usize) -> Vec<lsp_types::CompletionItem> {
 impl HoverProvider for Provider {
     fn hover(
         &self,
-        _text: &Rope,
+        text: &Rope,
         offset: usize,
         _: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Option<Hover>>> {
         let position = to_text_size(offset);
-        let workspace = self.client.inner.workspace.clone();
-        let path = self.client.inner.path.clone();
+        let doc_tx = self.client.inner.doc_tx.clone();
+        let content = text.to_string();
         cx.background_spawn(async move {
-            let result = contain_panic(|| workspace.on_hover(OnHoverParams { path, position }))?;
-            let result = match result {
-                Ok(result) => result,
-                Err(WorkspaceError::DatabaseConnectionError(_)) => return Ok(None),
-                Err(err) => return Err(anyhow!("hover request failed: {err}")),
+            // Route through the document worker so the query runs after the
+            // buffer change it follows; the workspace document is otherwise
+            // stale by one keystroke.
+            let (reply, reply_rx) = oneshot::channel();
+            if doc_tx
+                .send(DocEvent::Hover {
+                    text: content,
+                    position,
+                    reply,
+                })
+                .is_err()
+            {
+                return Ok(None);
+            }
+            let result = match reply_rx.await {
+                Ok(HoverOutcome::Content(result)) => result,
+                Ok(HoverOutcome::DatabaseOffline) | Err(_) => return Ok(None),
+                Ok(HoverOutcome::Failed(err)) => {
+                    return Err(anyhow!("hover request failed: {err}"));
+                }
             };
             let blocks: Vec<MarkedString> = result
                 .into_iter()
