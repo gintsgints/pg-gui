@@ -96,8 +96,27 @@ enum DocEvent {
         text: String,
         reply: oneshot::Sender<Result<Option<String>>>,
     },
+    /// Sync the buffer to `text`, then compute completions at `position` and
+    /// reply. Routed through the worker (rather than hitting the workspace
+    /// directly) so the completion query is ordered *after* the change that
+    /// triggered it — otherwise it races the pending [`DocEvent::Changed`] and
+    /// sees a stale document, yielding clause keywords instead of the schema
+    /// item being typed.
+    Completions {
+        text: String,
+        position: TextSize,
+        reply: oneshot::Sender<CompletionOutcome>,
+    },
     /// Close the workspace document and stop the worker.
     Close,
+}
+
+/// Result of a worker-side completion request.
+enum CompletionOutcome {
+    Items(Vec<pgls_completions::CompletionItem>),
+    /// The database is unreachable; the caller falls back to snippets alone.
+    DatabaseOffline,
+    Failed(String),
 }
 
 impl Client {
@@ -280,6 +299,39 @@ fn document_worker(
             Some(DocEvent::Format { text, reply }) => {
                 reply.send(format_document(workspace, path, &text)).ok();
             }
+            Some(DocEvent::Completions {
+                text,
+                position,
+                reply,
+            }) => {
+                version += 1;
+                contain_panic(|| {
+                    workspace
+                        .change_file(ChangeFileParams {
+                            path: path.clone(),
+                            version,
+                            content: text,
+                        })
+                        .ok();
+                })
+                .ok();
+                let outcome = match contain_panic(|| {
+                    workspace.get_completions(GetCompletionsParams {
+                        path: path.clone(),
+                        position,
+                    })
+                }) {
+                    Ok(Ok(result)) => CompletionOutcome::Items(result.into_iter().collect()),
+                    Ok(Err(WorkspaceError::DatabaseConnectionError(_))) => {
+                        CompletionOutcome::DatabaseOffline
+                    }
+                    Ok(Err(err)) => CompletionOutcome::Failed(err.to_string()),
+                    Err(err) => CompletionOutcome::Failed(err.to_string()),
+                };
+                reply.send(outcome).ok();
+                // The document moved, so diagnostics need a fresh run.
+                dirty = true;
+            }
             Some(DocEvent::Close) => break,
             None => {
                 // The burst settled. A contained panic publishes nothing and
@@ -398,22 +450,35 @@ impl CompletionProvider for Provider {
         // clamping the items' filter_text below.
         let query = trigger.trigger_character.unwrap_or_default();
         let position = to_text_size(offset);
-        let workspace = self.client.inner.workspace.clone();
-        let path = self.client.inner.path.clone();
+        let doc_tx = self.client.inner.doc_tx.clone();
+        let content = text.to_string();
         let rope = text.clone();
         let snippets = snippet_items(text, offset);
         cx.background_spawn(async move {
-            let result = contain_panic(|| {
-                workspace.get_completions(GetCompletionsParams { path, position })
-            })?;
-            let result = match result {
-                Ok(result) => result,
-                // The database is unreachable; offer the snippets alone
-                // rather than error.
-                Err(WorkspaceError::DatabaseConnectionError(_)) => {
+            // Route through the document worker so the query runs *after* the
+            // buffer change it was triggered by; the workspace document is
+            // otherwise stale by one keystroke.
+            let (reply, reply_rx) = oneshot::channel();
+            if doc_tx
+                .send(DocEvent::Completions {
+                    text: content,
+                    position,
+                    reply,
+                })
+                .is_err()
+            {
+                return Ok(CompletionResponse::Array(snippets));
+            }
+            let result = match reply_rx.await {
+                Ok(CompletionOutcome::Items(result)) => result,
+                // The database is unreachable (or the worker is gone); offer
+                // the snippets alone rather than error.
+                Ok(CompletionOutcome::DatabaseOffline) | Err(_) => {
                     return Ok(CompletionResponse::Array(snippets));
                 }
-                Err(err) => return Err(anyhow!("completion request failed: {err}")),
+                Ok(CompletionOutcome::Failed(err)) => {
+                    return Err(anyhow!("completion request failed: {err}"));
+                }
             };
             let mut items: Vec<lsp_types::CompletionItem> = snippets;
             items.extend(
