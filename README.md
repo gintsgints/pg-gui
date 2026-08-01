@@ -129,6 +129,8 @@ or `F1` (Linux) in the app to see this list in a dialog. On Linux, `cmd` is
 | `cmd-i` / `ctrl-space` | AI complete at cursor |
 | `cmd-shift-f` | Format the script |
 | `cmd-/` | Comment or uncomment the line / selection |
+| `cmd-f` / `ctrl-f` | Find in the script |
+| `cmd-r` / `ctrl-r` | Find and replace in the script |
 | `cmd-p` | Insert a snippet |
 | `cmd-t` | New script tab |
 | `cmd-w` | Close the tab |
