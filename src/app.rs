@@ -863,6 +863,13 @@ struct DebugState {
     terminated: bool,
 }
 
+/// Which view the bottom panel shows: the returned rows or the message log.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BottomView {
+    Data,
+    Log,
+}
+
 /// State of the object browser's top-level schema-list fetch. The three
 /// states are mutually exclusive, so they live in one enum rather than a
 /// `loading` bool plus an `error` option.
@@ -881,6 +888,11 @@ pub struct PgGuiApp {
     /// The active debug session, if any. Drives the debug panel.
     debug: Option<DebugState>,
     results: Entity<TableState<ResultsDelegate>>,
+    /// Which view the bottom panel shows (Data table vs. message log).
+    bottom_view: BottomView,
+    /// Per-statement messages from the last executed query/script, shown in
+    /// the Log view.
+    log: Vec<SharedString>,
     /// Split state of the editor/results panels; the editor height is
     /// persisted to the config whenever the divider is dragged.
     resizable_state: Entity<ResizableState>,
@@ -1052,6 +1064,8 @@ impl PgGuiApp {
             active_tab,
             debug: None,
             results,
+            bottom_view: BottomView::Data,
+            log: Vec::new(),
             resizable_state,
             sidebar_state,
             tree_state,
@@ -2275,9 +2289,14 @@ impl PgGuiApp {
             this.update_in(cx, |this, window, cx| {
                 this.running = false;
                 match result {
-                    Ok((outcome, cursor)) => {
+                    Ok((mut outcome, cursor)) => {
                         let row_count = outcome.rows.len();
                         let statements = outcome.messages.len();
+                        this.log.extend(
+                            std::mem::take(&mut outcome.messages)
+                                .into_iter()
+                                .map(SharedString::from),
+                        );
                         let more = if cursor.is_some() {
                             ", more available"
                         } else {
@@ -2306,6 +2325,7 @@ impl PgGuiApp {
                             table.delegate_mut().clear();
                             table.refresh(cx);
                         });
+                        this.log.push(SharedString::from(err.clone()));
                         this.show_query_error(&err, window, cx);
                     }
                 }
@@ -2850,6 +2870,119 @@ impl PgGuiApp {
 
     /// The "Prev / Next / Page x of y" bar under the results table; `None`
     /// when everything fits on one page.
+    /// A small outline button that switches the bottom panel to `view`.
+    /// gpui-component ships no icon assets, so the icon is a text glyph.
+    fn bottom_view_button(
+        view: BottomView,
+        glyph: &'static str,
+        tooltip: &'static str,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        Button::new(id)
+            .outline()
+            .small()
+            .label(glyph)
+            .tooltip(tooltip)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.bottom_view != view {
+                    this.bottom_view = view;
+                    cx.notify();
+                }
+            }))
+    }
+
+    /// The results table over a bottom row holding the pager (when present)
+    /// and the Log switch button.
+    fn render_data_view(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        v_flex()
+            .size_full()
+            .p_2()
+            .gap_1()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(DataTable::new(&self.results)),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .children(self.render_results_pager(cx))
+                    .child(div().flex_1())
+                    // The Log switch only appears once there are messages.
+                    .children((!self.log.is_empty()).then(|| {
+                        Self::bottom_view_button(
+                            BottomView::Log,
+                            "☰",
+                            "Show log",
+                            "bottom-view-log",
+                            cx,
+                        )
+                    })),
+            )
+    }
+
+    /// The message log (one line per statement from the last query/script)
+    /// over a Data switch button at the bottom.
+    fn render_log(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let body = if self.log.is_empty() {
+            v_flex().child(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No messages yet."),
+            )
+        } else {
+            v_flex()
+                .w_full()
+                .gap_0p5()
+                .children(self.log.iter().cloned().map(|line| div().child(line)))
+        };
+        v_flex()
+            .size_full()
+            .p_2()
+            .gap_1()
+            .child(
+                div()
+                    .id("log-view")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(cx.theme().mono_font_size)
+                    .child(body),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("clear-log")
+                            .outline()
+                            .small()
+                            .label("🗑")
+                            .tooltip("Clear log")
+                            .disabled(self.log.is_empty())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.log.clear();
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().flex_1())
+                    // The Data switch only appears once there are rows.
+                    .children(
+                        (self.results.read(cx).delegate().total_rows() > 0).then(|| {
+                            Self::bottom_view_button(
+                                BottomView::Data,
+                                "▦",
+                                "Show data",
+                                "bottom-view-data",
+                                cx,
+                            )
+                        }),
+                    ),
+            )
+    }
+
     fn render_results_pager(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let delegate = self.results.read(cx).delegate();
         let (page, page_count, total_rows) = (
@@ -3745,18 +3878,10 @@ impl PgGuiApp {
                 resizable_panel().child(if debugging {
                     self.render_debug_panel(cx).into_any_element()
                 } else {
-                    v_flex()
-                        .size_full()
-                        .p_2()
-                        .gap_1()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_h(px(0.))
-                                .child(DataTable::new(&self.results)),
-                        )
-                        .children(self.render_results_pager(cx))
-                        .into_any_element()
+                    match self.bottom_view {
+                        BottomView::Data => self.render_data_view(cx).into_any_element(),
+                        BottomView::Log => self.render_log(cx).into_any_element(),
+                    }
                 }),
             )
             .into_any_element()
