@@ -31,6 +31,10 @@ use gpui_component::{
     tree::{TreeEvent, TreeState, tree},
     v_flex,
 };
+// Linux and Windows have no OS-native menu bar, so an in-window one is drawn
+// in the title bar. macOS uses the real menu bar and skips all of this.
+#[cfg(not(target_os = "macos"))]
+use gpui_component::{GlobalState, menu::AppMenuBar};
 
 use crate::results::ResultsDelegate;
 use crate::{
@@ -913,6 +917,11 @@ pub struct PgGuiApp {
     /// The title-bar connection picker, mirroring `config.recent_connections`
     /// with the active connection selected.
     connections: Entity<ComboboxState<SearchableVec<ConnectionItem>>>,
+    /// In-window menu bar for Linux/Windows, mirroring the menus set via
+    /// `cx.set_menus`; rebuilt alongside them in [`Self::refresh_menus`]. On
+    /// macOS the native menu bar is used and this field does not exist.
+    #[cfg(not(target_os = "macos"))]
+    app_menu_bar: Entity<AppMenuBar>,
     _subscriptions: Vec<Subscription>,
     /// Kept alive for the lifetime of the open New Connection dialog: one
     /// subscription per field input that recomputes the connection-string
@@ -1016,21 +1025,7 @@ impl PgGuiApp {
             }),
         ];
 
-        // The window's close button funnels through the same unsaved-edits
-        // confirmation as cmd-q: veto the close and prompt instead.
-        let weak_this = cx.weak_entity();
-        window.on_window_should_close(cx, move |window, cx| {
-            weak_this
-                .update(cx, |this, cx| {
-                    if this.has_unsaved_tabs() {
-                        this.prompt_quit(window, cx);
-                        false
-                    } else {
-                        true
-                    }
-                })
-                .unwrap_or(true)
-        });
+        Self::install_close_guard(window, cx);
 
         let mut this = Self {
             tabs,
@@ -1062,6 +1057,8 @@ impl PgGuiApp {
             save_generation: 0,
             lsp: None,
             connections,
+            #[cfg(not(target_os = "macos"))]
+            app_menu_bar: AppMenuBar::new(cx),
             _subscriptions: subscriptions,
             connection_dialog_subs: Vec::new(),
         };
@@ -1075,6 +1072,24 @@ impl PgGuiApp {
         Self::watch_files(window, cx);
         this.apply_zoom(cx);
         this
+    }
+
+    /// Route the window's close button through the same unsaved-edits
+    /// confirmation as cmd-q: veto the close and prompt instead.
+    fn install_close_guard(window: &mut Window, cx: &mut Context<Self>) {
+        let weak_this = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            weak_this
+                .update(cx, |this, cx| {
+                    if this.has_unsaved_tabs() {
+                        this.prompt_quit(window, cx);
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .unwrap_or(true)
+        });
     }
 
     /// Create the editor for one tab and wire it into the change plumbing.
@@ -2385,6 +2400,17 @@ impl PgGuiApp {
             &self.config.recent_connections,
             self.config.theme,
         ));
+        // Feed the same menus to the in-window bar (Linux/Windows) and rebuild
+        // it; macOS renders the native bar from `set_menus` alone.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let menus = build_menus(&self.config.recent_connections, self.config.theme)
+                .into_iter()
+                .map(gpui::Menu::owned)
+                .collect();
+            GlobalState::global_mut(cx).set_app_menus(menus);
+            self.app_menu_bar.update(cx, AppMenuBar::reload);
+        }
     }
 
     /// Create the title-bar connection combobox, selecting the active
@@ -3528,7 +3554,13 @@ impl PgGuiApp {
             .path
             .as_deref()
             .map(|path| path.display().to_string());
-        TitleBar::new().child(
+        let title_bar = TitleBar::new();
+        // Linux/Windows: the drawn menu bar sits at the head of the title bar,
+        // before the app name. macOS relies on the OS menu bar instead.
+        #[cfg(not(target_os = "macos"))]
+        let title_bar =
+            title_bar.child(div().flex().items_center().child(self.app_menu_bar.clone()));
+        title_bar.child(
             h_flex()
                 .gap_2()
                 .flex_1()
