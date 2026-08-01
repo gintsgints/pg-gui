@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -650,6 +651,21 @@ impl ConnectionFields {
             user: self.user.read(cx).value().trim().to_string(),
             password: self.password.read(cx).value().to_string(),
         }
+    }
+
+    /// Overwrite every field from `parts`. Used when the connection string is
+    /// edited directly, to drive the individual fields from the parsed URL.
+    fn set(&self, parts: &ConnectionParts, window: &mut Window, cx: &mut App) {
+        self.host
+            .update(cx, |s, cx| s.set_value(parts.host.clone(), window, cx));
+        self.port
+            .update(cx, |s, cx| s.set_value(parts.port.clone(), window, cx));
+        self.database
+            .update(cx, |s, cx| s.set_value(parts.database.clone(), window, cx));
+        self.user
+            .update(cx, |s, cx| s.set_value(parts.user.clone(), window, cx));
+        self.password
+            .update(cx, |s, cx| s.set_value(parts.password.clone(), window, cx));
     }
 }
 
@@ -2538,16 +2554,32 @@ impl PgGuiApp {
         let preview = cx.new(|cx| InputState::new(window, cx).default_value(seed_url.to_string()));
         let test_status = cx.new(|_| ConnectionTest::Idle);
 
-        // Recompute the previewed connection string whenever any field
-        // changes, and drop any stale Test Connection result (it belonged to
-        // the previous url). The subscriptions live in `self` so they outlast
-        // this method but are dropped the next time the dialog opens.
-        let recompute = {
-            let (fields, preview, test_status) =
-                (fields.clone(), preview.clone(), test_status.clone());
-            move |window: &mut Window, cx: &mut App| {
-                let url = fields.read(cx).to_url();
-                preview.update(cx, |state, cx| state.set_value(url, window, cx));
+        self.connection_dialog_subs =
+            Self::wire_connection_sync(&fields, &preview, &test_status, window, cx);
+
+        Self::open_connection_dialog(title, name, fields, preview, test_status, window, cx);
+    }
+
+    /// Wire the two-way sync between the individual fields and the editable
+    /// connection-string preview: a field edit recomputes the string, and a
+    /// string edit re-parses it back into the fields. A shared re-entrancy
+    /// flag stops one side's programmatic write from echoing back through the
+    /// other. Any edit also drops a stale Test Connection result. Returns the
+    /// subscriptions, which the caller keeps alive for the dialog's lifetime.
+    fn wire_connection_sync(
+        fields: &ConnectionFields,
+        preview: &Entity<InputState>,
+        test_status: &Entity<ConnectionTest>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<Subscription> {
+        // While one side programmatically writes the other, the other's Change
+        // event is ignored instead of writing straight back.
+        let syncing = Rc::new(Cell::new(false));
+
+        let clear_test = {
+            let test_status = test_status.clone();
+            move |cx: &mut App| {
                 test_status.update(cx, |status, cx| {
                     if !matches!(status, ConnectionTest::Idle) {
                         *status = ConnectionTest::Idle;
@@ -2556,7 +2588,48 @@ impl PgGuiApp {
                 });
             }
         };
-        self.connection_dialog_subs = fields
+
+        // Field edit: recompute the previewed connection string.
+        let recompute = {
+            let (fields, preview, syncing, clear_test) = (
+                fields.clone(),
+                preview.clone(),
+                syncing.clone(),
+                clear_test.clone(),
+            );
+            move |window: &mut Window, cx: &mut App| {
+                if syncing.get() {
+                    return;
+                }
+                let url = fields.read(cx).to_url();
+                syncing.set(true);
+                preview.update(cx, |state, cx| state.set_value(url, window, cx));
+                syncing.set(false);
+                clear_test(cx);
+            }
+        };
+        // String edit: parse it and drive the fields. Skipped for a partial
+        // entry that is not yet a URL, so the fields are not wiped mid-type.
+        let apply_preview = {
+            let (fields, preview, syncing, clear_test) =
+                (fields.clone(), preview.clone(), syncing, clear_test);
+            move |window: &mut Window, cx: &mut App| {
+                if syncing.get() {
+                    return;
+                }
+                let url = preview.read(cx).value().to_string();
+                if !url.contains("://") {
+                    return;
+                }
+                let parts = ConnectionParts::parse(&url);
+                syncing.set(true);
+                fields.set(&parts, window, cx);
+                syncing.set(false);
+                clear_test(cx);
+            }
+        };
+
+        let mut subs: Vec<Subscription> = fields
             .as_array()
             .iter()
             .map(|input| {
@@ -2572,8 +2645,16 @@ impl PgGuiApp {
                 )
             })
             .collect();
-
-        Self::open_connection_dialog(title, name, fields, preview, test_status, window, cx);
+        subs.push(cx.subscribe_in(
+            preview,
+            window,
+            move |_, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    apply_preview(window, cx);
+                }
+            },
+        ));
+        subs
     }
 
     /// Build and show the connection dialog for the given title, name and
@@ -2652,7 +2733,7 @@ impl PgGuiApp {
                                     .text_color(cx.theme().muted_foreground)
                                     .child("Connection string"),
                             )
-                            .child(Input::new(&preview).disabled(true)),
+                            .child(Input::new(&preview)),
                     )
                     .child(test_status)
                     .child(
