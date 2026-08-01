@@ -2799,7 +2799,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.2"
-source = "git+https://github.com/gintsgints/gpui-component?branch=my_fixes#2f119b6d9aae49fd16e4fd6d38a0b46b3669ecc3"
+source = "git+https://github.com/gintsgints/gpui-component?branch=my_fixes#bc300ee5a6322b389a2c57b49d2c670730549185"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2882,7 +2882,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/gintsgints/gpui-component?branch=my_fixes#2f119b6d9aae49fd16e4fd6d38a0b46b3669ecc3"
+source = "git+https://github.com/gintsgints/gpui-component?branch=my_fixes#bc300ee5a6322b389a2c57b49d2c670730549185"
 dependencies = [
  "anyhow",
  "gpui",
@@ -2896,7 +2896,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/gintsgints/gpui-component?branch=my_fixes#2f119b6d9aae49fd16e4fd6d38a0b46b3669ecc3"
+source = "git+https://github.com/gintsgints/gpui-component?branch=my_fixes#bc300ee5a6322b389a2c57b49d2c670730549185"
 dependencies = [
  "proc-macro2",
  "quote",
