@@ -48,12 +48,6 @@ impl ResultsDelegate {
         self.rows.extend(rows);
     }
 
-    pub fn clear(&mut self) {
-        self.columns.clear();
-        self.rows.clear();
-        self.page = 0;
-    }
-
     pub fn total_rows(&self) -> usize {
         self.rows.len()
     }

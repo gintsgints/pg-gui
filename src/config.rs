@@ -75,6 +75,11 @@ impl<'de> Deserialize<'de> for RecentConnection {
 pub struct Config {
     #[serde(default)]
     pub connection_string: String,
+    /// Default autocommit mode for new editor tabs. ON (each Run commits
+    /// immediately); OFF starts a transaction that Commit/Rollback ends.
+    /// Each tab keeps its own live toggle; this only seeds a fresh tab.
+    #[serde(default = "default_true")]
+    pub autocommit: bool,
     /// Previously used connections, most recent first, shown in the
     /// Connection ▸ Recent application menu.
     #[serde(default)]
@@ -203,6 +208,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             connection_string: String::new(),
+            autocommit: default_true(),
             recent_connections: Vec::new(),
             script: String::new(),
             script_file: None,
@@ -333,5 +339,15 @@ mod tests {
         );
         assert_eq!(config.recent_connections[1].name, "Prod");
         assert_eq!(config.recent_connections[1].url, "postgres://b@remote/db");
+    }
+
+    #[test]
+    fn autocommit_defaults_on_when_absent() {
+        // A config from before the field existed must come back autocommit ON.
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.autocommit);
+        // An explicit value is respected.
+        let off: Config = serde_json::from_str(r#"{"autocommit": false}"#).unwrap();
+        assert!(!off.autocommit);
     }
 }

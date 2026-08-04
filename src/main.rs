@@ -25,6 +25,10 @@ actions!(
     pg_gui,
     [
         RunQuery,
+        ToggleAutocommit,
+        Commit,
+        Rollback,
+        CancelQuery,
         ExportCsv,
         ExportInserts,
         AiComplete,

@@ -39,12 +39,13 @@ use gpui_component::{GlobalState, menu::AppMenuBar};
 
 use crate::results::ResultsDelegate;
 use crate::{
-    AiComplete, CloseTab, Connect, DebugContinue, DebugStepInto, DebugStepOver, DebugStop,
-    EditConnection, ExportCsv, ExportInserts, FormatScript, NewConnection, NewFile, NextTab,
-    OpenConfig, OpenFile, OpenFolder, OpenGitHub, OpenSnippets, PrevTab, Quit, RefreshDbTree,
-    RunQuery, SaveFile, SetTheme, ShowHelp, StartDebug, ToggleComment, ToggleDbPanel,
-    ToggleFilesPanel, ToggleResultsPanel, ZoomIn, ZoomOut, ZoomReset, ai, config, db, db_tree,
-    debug, export, file_tree, lsp, snippets, statement,
+    AiComplete, CancelQuery, CloseTab, Commit, Connect, DebugContinue, DebugStepInto,
+    DebugStepOver, DebugStop, EditConnection, ExportCsv, ExportInserts, FormatScript,
+    NewConnection, NewFile, NextTab, OpenConfig, OpenFile, OpenFolder, OpenGitHub, OpenSnippets,
+    PrevTab, Quit, RefreshDbTree, Rollback, RunQuery, SaveFile, SetTheme, ShowHelp, StartDebug,
+    ToggleAutocommit, ToggleComment, ToggleDbPanel, ToggleFilesPanel, ToggleResultsPanel, ZoomIn,
+    ZoomOut, ZoomReset, ai, config, db, db_tree, debug, export, file_tree, lsp, snippets,
+    statement,
 };
 
 /// The project's GitHub page, opened from the About application menu.
@@ -287,6 +288,18 @@ fn build_menus(recents: &[config::RecentConnection], theme: config::ThemeSelecti
                 MenuItem::action("AI Complete", AiComplete),
                 MenuItem::separator(),
                 MenuItem::action("Toggle Comment", ToggleComment),
+            ],
+        },
+        Menu {
+            name: "Session".into(),
+            disabled: false,
+            items: vec![
+                MenuItem::action("Toggle Autocommit", ToggleAutocommit),
+                MenuItem::separator(),
+                MenuItem::action("Commit", Commit),
+                MenuItem::action("Rollback", Rollback),
+                MenuItem::separator(),
+                MenuItem::action("Cancel Query", CancelQuery),
             ],
         },
         Menu {
@@ -810,6 +823,10 @@ fn toggle_line_comments(block: &str) -> String {
 /// One open script: its editor buffer and the file it belongs to, if
 /// any — cmd-s writes there without prompting. Mirrored in
 /// `config.tabs` at the same index, which holds the persisted text.
+// The bools are independent per-tab flags (edit/disk state, snippet mode,
+// autocommit, in-flight); they don't form a state machine, so the
+// excessive-bools lint is a false positive here.
+#[allow(clippy::struct_excessive_bools)]
 struct EditorTab {
     editor: Entity<InputState>,
     path: Option<PathBuf>,
@@ -840,6 +857,38 @@ struct EditorTab {
     /// `<object>.sql`. Cleared once the tab has a real path.
     suggested_name: Option<String>,
     _subscription: Subscription,
+    /// Stable id, so a query completing after the tab was reordered or
+    /// closed still lands on the right tab (indices shift; ids don't).
+    id: u64,
+    /// This tab's live database session — one persistent connection, opened
+    /// lazily on the first Run and isolated from every other tab's. `None`
+    /// before the first Run or after it was torn down (connection change,
+    /// dropped connection).
+    session: Option<db::Session>,
+    /// Whether this tab's session commits each Run immediately (ON) or runs
+    /// inside a transaction ended by Commit/Rollback (OFF). Seeded from
+    /// `config.autocommit`; not persisted per tab.
+    autocommit: bool,
+    /// A query is in flight on this tab's session (single in-flight per tab).
+    running: bool,
+    /// Cancels the in-flight query; set while `running`, taken by Cancel.
+    cancel: Option<postgres::CancelToken>,
+    /// This tab's last query output, mirrored into the shared results table
+    /// and log view while the tab is active and restored when it is
+    /// reactivated.
+    result: TabResult,
+}
+
+/// A tab's last query output, mirrored into the shared results table and
+/// log view when the tab is active.
+#[derive(Default)]
+struct TabResult {
+    columns: Vec<String>,
+    rows: db::Rows,
+    /// The cursor is still open on the tab's session, so Fetch More is valid.
+    has_more: bool,
+    /// Per-statement messages, shown in the Log view.
+    log: Vec<SharedString>,
 }
 
 /// Live state of a running debug session, shown in the debug panel that
@@ -930,12 +979,13 @@ pub struct PgGuiApp {
     /// State of the browser's top-level schema-list fetch.
     db_schema_load: DbSchemaLoad,
     status: SharedString,
-    running: bool,
     ai_running: bool,
-    /// Server-side cursor left open by the last SELECT; Fetch More pulls
-    /// the next batch from it. Dropped (closing its connection) when a new
-    /// query runs or the connection changes.
-    cursor: Option<db::Cursor>,
+    /// Next id handed to a new tab; only ever increments (see [`EditorTab::id`]).
+    next_tab_id: u64,
+    /// Bumped whenever the active connection changes, so a query that was in
+    /// flight against the previous server is discarded (its session not
+    /// stored back) when it finally returns.
+    db_epoch: u64,
     config: config::Config,
     /// Mtime of the config file after our last read or write; a different
     /// mtime on disk means it was edited externally and should be reloaded.
@@ -1009,11 +1059,7 @@ impl PgGuiApp {
         // highlighting from it and the base font sizes below come from it.
         apply_theme_selection(config.theme, window, cx);
 
-        let tabs: Vec<EditorTab> = config
-            .tabs
-            .iter()
-            .map(|tab| Self::build_tab(tab, Self::launch_baseline(tab), window, cx))
-            .collect();
+        let (tabs, next_tab_id) = Self::build_initial_tabs(&config, window, cx);
         let active_tab = config.active_tab;
 
         let results =
@@ -1081,9 +1127,9 @@ impl PgGuiApp {
             show_system_schemas: false,
             db_schema_load: DbSchemaLoad::Ready,
             status: "Ready".into(),
-            running: false,
             ai_running: false,
-            cursor: None,
+            next_tab_id,
+            db_epoch: 0,
             config,
             config_disk_time: config::modified_time(),
             base_font_size: cx.theme().font_size,
@@ -1129,9 +1175,38 @@ impl PgGuiApp {
     /// Create the editor for one tab and wire it into the change plumbing.
     /// `saved` is the on-disk baseline used for the unsaved-edits marker.
     /// The caller hooks up the language server, if connected.
+    /// Build the editor tabs restored from the config at launch, handing
+    /// each a fresh id. Returns the tabs and the next free id.
+    fn build_initial_tabs(
+        config: &config::Config,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Vec<EditorTab>, u64) {
+        let mut next_id: u64 = 0;
+        let tabs = config
+            .tabs
+            .iter()
+            .map(|tab| {
+                let id = next_id;
+                next_id += 1;
+                Self::build_tab(
+                    tab,
+                    Self::launch_baseline(tab),
+                    id,
+                    config.autocommit,
+                    window,
+                    cx,
+                )
+            })
+            .collect();
+        (tabs, next_id)
+    }
+
     fn build_tab(
         tab: &config::ScriptTab,
         saved: String,
+        id: u64,
+        autocommit: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> EditorTab {
@@ -1172,6 +1247,12 @@ impl PgGuiApp {
             snippet_mode: false,
             suggested_name: None,
             _subscription: subscription,
+            id,
+            session: None,
+            autocommit,
+            running: false,
+            cancel: None,
+            result: TabResult::default(),
         }
     }
 
@@ -1203,6 +1284,62 @@ impl PgGuiApp {
         self.tabs[self.active_tab].editor.clone()
     }
 
+    /// Index of the tab with `id`, if it still exists (it may have been
+    /// closed while a query ran).
+    fn tab_index_by_id(&self, id: u64) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    /// Set a tab's in-flight flag by id (no-op if the tab was closed).
+    fn set_tab_running(&mut self, tab_id: u64, running: bool) {
+        if let Some(ix) = self.tab_index_by_id(tab_id) {
+            self.tabs[ix].running = running;
+        }
+    }
+
+    /// Whether the active tab has a query in flight.
+    fn active_running(&self) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .is_some_and(|tab| tab.running)
+    }
+
+    /// Whether the active tab's last SELECT left a cursor open (Fetch More).
+    fn active_has_more(&self) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .is_some_and(|tab| tab.result.has_more)
+    }
+
+    /// Whether the active tab runs each statement autocommitted.
+    fn active_autocommit(&self) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .is_none_or(|tab| tab.autocommit)
+    }
+
+    /// Whether the active tab's session has an open (autocommit-off) transaction.
+    fn active_in_txn(&self) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .is_some_and(|tab| tab.session.as_ref().is_some_and(db::Session::in_txn))
+    }
+
+    /// Mirror the tab's stored result and log into the shared results table
+    /// and Log view.
+    fn show_tab_result(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(ix) else {
+            return;
+        };
+        let columns = tab.result.columns.clone();
+        let rows = tab.result.rows.clone();
+        self.log = tab.result.log.clone();
+        self.results.update(cx, |table, cx| {
+            table.delegate_mut().set_data(columns, rows);
+            table.refresh(cx);
+        });
+    }
+
     /// Append a tab (not yet selected) and its config mirror.
     fn add_tab(
         &mut self,
@@ -1218,7 +1355,16 @@ impl PgGuiApp {
         };
         // A freshly added tab starts clean: its content is the baseline
         // (empty for a new script, the file's text for an opened one).
-        let tab = Self::build_tab(&tab_config, tab_config.script.clone(), window, cx);
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let tab = Self::build_tab(
+            &tab_config,
+            tab_config.script.clone(),
+            id,
+            self.config.autocommit,
+            window,
+            cx,
+        );
         if let Some(client) = &self.lsp {
             Self::attach_lsp_providers(client, &tab.editor, cx);
         }
@@ -1235,6 +1381,8 @@ impl PgGuiApp {
         }
         self.active_tab = ix;
         self.config.active_tab = ix;
+        // Swap the shared results/log view over to this tab's own output.
+        self.show_tab_result(ix, cx);
         let editor = self.editor();
         editor.update(cx, |state, cx| {
             // Any diagnostics in this buffer are from when it was last
@@ -1275,13 +1423,77 @@ impl PgGuiApp {
         self.request_close_tab(self.active_tab, window, cx);
     }
 
-    /// Close a tab, but prompt first when it has unsaved edits.
+    /// Close a tab, but prompt first when it has an open transaction (which
+    /// closing would roll back) or unsaved edits.
     fn request_close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix >= self.tabs.len() {
+            return;
+        }
+        if self.tabs[ix]
+            .session
+            .as_ref()
+            .is_some_and(db::Session::in_txn)
+        {
+            self.prompt_txn_before_close(ix, window, cx);
+        } else {
+            self.after_txn_close(ix, window, cx);
+        }
+    }
+
+    /// Continue closing a tab once any open transaction has been dealt with:
+    /// prompt for unsaved edits, otherwise close.
+    fn after_txn_close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.tabs.len() && self.tabs[ix].dirty {
             self.prompt_save_before_close(ix, window, cx);
         } else {
             self.close_tab_at(ix, window, cx);
         }
+    }
+
+    /// Warn before closing a tab whose session has an open transaction —
+    /// closing drops the connection, which rolls the transaction back.
+    /// Committing on close is intentionally not offered; commit explicitly
+    /// first if the work should be kept.
+    fn prompt_txn_before_close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let name = self.tab_label(ix);
+        let app = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let close = app.clone();
+            dialog.title("Open transaction").w(px(420.)).child(
+                v_flex()
+                    .gap_4()
+                    .pb_2()
+                    .child(div().text_sm().child(format!(
+                        "“{name}” has an open transaction that will be rolled back."
+                    )))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(Button::new("cancel").label("Cancel").on_click(
+                                |_, window, cx| {
+                                    window.close_dialog(cx);
+                                },
+                            ))
+                            .child(
+                                Button::new("close")
+                                    .danger()
+                                    .label("Roll Back & Close")
+                                    .on_click(move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        close
+                                            .update(cx, |this, cx| {
+                                                this.after_txn_close(ix, window, cx);
+                                            })
+                                            .ok();
+                                    }),
+                            ),
+                    ),
+            )
+        });
     }
 
     /// Ask whether to save a tab's unsaved edits before closing it.
@@ -1887,12 +2099,26 @@ impl PgGuiApp {
             self.config.tabs.push(config::ScriptTab::default());
         }
         self.config.active_tab = self.config.active_tab.min(self.config.tabs.len() - 1);
+        let mut id = self.next_tab_id;
+        let autocommit = self.config.autocommit;
         self.tabs = self
             .config
             .tabs
             .iter()
-            .map(|tab| Self::build_tab(tab, Self::launch_baseline(tab), window, cx))
+            .map(|tab| {
+                let this_id = id;
+                id += 1;
+                Self::build_tab(
+                    tab,
+                    Self::launch_baseline(tab),
+                    this_id,
+                    autocommit,
+                    window,
+                    cx,
+                )
+            })
             .collect();
+        self.next_tab_id = id;
         if let Some(client) = &self.lsp {
             for tab in &self.tabs {
                 Self::attach_lsp_providers(client, &tab.editor, cx);
@@ -2236,7 +2462,10 @@ impl PgGuiApp {
     }
 
     pub fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
-        if self.running {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        if tab.running {
             return;
         }
         // The input may be showing the masked value; the config always
@@ -2248,89 +2477,265 @@ impl PgGuiApp {
             return;
         };
 
-        self.running = true;
-        self.set_status(format!("Running {scope}…"), cx);
-
-        // A single SELECT-style statement runs through a server-side cursor
-        // so only the first `fetch_size` rows are transferred (Fetch More
-        // pulls the rest); scripts and DML run directly. The previous
-        // cursor's connection is dropped off the main thread.
+        let ix = self.active_tab;
+        let tab_id = self.tabs[ix].id;
+        let autocommit = self.tabs[ix].autocommit;
         let batch_size = self.config.fetch_size.max(1);
-        let old_cursor = self.cursor.take();
+        let epoch = self.db_epoch;
+        // Move the tab's live session into the worker (opened lazily below on
+        // the first Run). A single SELECT-style statement pages through a
+        // server-side cursor on that connection; scripts and DML run directly.
+        let session = self.tabs[ix].session.take();
+        self.tabs[ix].running = true;
+        self.set_status(format!("Running {scope}…"), cx);
 
         cx.spawn_in(window, async move |this, cx| {
             let started = std::time::Instant::now();
-            let result = cx
+            // Open the session on the first Run, off the UI thread.
+            let opened = cx
                 .background_spawn(async move {
-                    drop(old_cursor);
-                    let Ok(select) = export::copyable(&sql).map(str::to_string) else {
-                        return db::run_script(&conn, &sql).map(|outcome| (outcome, None));
-                    };
-                    match db::open_cursor(&conn, &select, batch_size) {
-                        Ok(page) => {
-                            let outcome = db::QueryOutcome {
-                                messages: vec![format!("ok ({} rows)", page.rows.len())],
-                                columns: page.columns,
-                                rows: page.rows,
-                            };
-                            Ok((outcome, page.cursor))
-                        }
-                        // DECLARE was rejected (e.g. a data-modifying CTE):
-                        // nothing was executed, so the plain path is safe.
-                        Err(db::CursorError::Declare) => {
-                            db::run_script(&conn, &sql).map(|outcome| (outcome, None))
-                        }
-                        Err(db::CursorError::Fetch(err)) => Err(err),
+                    match session {
+                        Some(session) => Ok(session),
+                        None => db::Session::connect(&conn)
+                            .map_err(|e| format!("connection failed: {}", db::describe(&e))),
                     }
+                })
+                .await;
+            let mut session = match opened {
+                Ok(session) => session,
+                Err(err) => {
+                    this.update_in(cx, |this, window, cx| {
+                        this.on_query_error(tab_id, epoch, None, &err, window, cx);
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            // Publish the cancel token so Cancel can abort the query below.
+            let token = session.cancel_token();
+            this.update(cx, |this, _| {
+                if let Some(ix) = this.tab_index_by_id(tab_id) {
+                    this.tabs[ix].cancel = Some(token);
+                }
+            })
+            .ok();
+
+            let (session, result) = cx
+                .background_spawn(async move {
+                    let result = session.run(&sql, batch_size, autocommit);
+                    (session, result)
                 })
                 .await;
             let elapsed = started.elapsed();
 
-            this.update_in(cx, |this, window, cx| {
-                this.running = false;
-                match result {
-                    Ok((mut outcome, cursor)) => {
-                        let row_count = outcome.rows.len();
-                        let statements = outcome.messages.len();
-                        this.log.extend(
-                            std::mem::take(&mut outcome.messages)
-                                .into_iter()
-                                .map(SharedString::from),
-                        );
-                        let more = if cursor.is_some() {
-                            ", more available"
-                        } else {
-                            ""
-                        };
-                        this.cursor = cursor;
-                        this.results.update(cx, |table, cx| {
-                            table.delegate_mut().set_data(outcome.columns, outcome.rows);
-                            table.refresh(cx);
-                        });
-                        // Reveal the results panel (cmd-3) when a query returns
-                        // rows so the output isn't silently hidden.
-                        if row_count > 0 && !this.config.results_panel_visible {
-                            this.config.results_panel_visible = true;
-                            this.schedule_save(cx);
-                        }
-                        this.set_status(
-                            format!(
-                                "{scope}: {statements} statement(s) executed in {elapsed:.0?} — showing {row_count} row(s){more}"
-                            ),
-                            cx,
-                        );
-                    }
-                    Err(err) => {
-                        this.results.update(cx, |table, cx| {
-                            table.delegate_mut().clear();
-                            table.refresh(cx);
-                        });
-                        this.log.push(SharedString::from(err.clone()));
-                        this.show_query_error(&err, window, cx);
-                    }
-                }
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(run) => this.on_query_ok(tab_id, epoch, session, run, scope, elapsed, cx),
+                Err(err) => this.on_query_error(tab_id, epoch, Some(session), &err, window, cx),
             })
             .ok();
+        })
+        .detach();
+    }
+
+    /// Put a finished query's session back on its tab and clear the running
+    /// state. Returns the tab index to display the result on, or `None` when
+    /// the tab was closed, the connection changed underneath it, or the
+    /// connection died (session discarded so the next Run reconnects).
+    fn settle_session(&mut self, tab_id: u64, epoch: u64, session: db::Session) -> Option<usize> {
+        let ix = self.tab_index_by_id(tab_id)?;
+        self.tabs[ix].running = false;
+        self.tabs[ix].cancel = None;
+        if epoch != self.db_epoch || session.is_closed() {
+            self.tabs[ix].session = None;
+            self.tabs[ix].result.has_more = false;
+            return None;
+        }
+        self.tabs[ix].session = Some(session);
+        Some(ix)
+    }
+
+    /// Store a successful query's output on its tab and, if that tab is
+    /// showing, mirror it into the shared results table and Log view.
+    #[allow(clippy::too_many_arguments)]
+    fn on_query_ok(
+        &mut self,
+        tab_id: u64,
+        epoch: u64,
+        session: db::Session,
+        run: db::RunResult,
+        scope: &'static str,
+        elapsed: std::time::Duration,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.settle_session(tab_id, epoch, session) else {
+            return;
+        };
+        let db::RunResult { outcome, more } = run;
+        let row_count = outcome.rows.len();
+        let statements = outcome.messages.len();
+        {
+            let result = &mut self.tabs[ix].result;
+            result
+                .log
+                .extend(outcome.messages.into_iter().map(SharedString::from));
+            result.columns = outcome.columns;
+            result.rows = outcome.rows;
+            result.has_more = more;
+        }
+        if ix == self.active_tab {
+            self.show_tab_result(ix, cx);
+        }
+        // Reveal the results panel (cmd-3) when a query returns rows so the
+        // output isn't silently hidden.
+        if row_count > 0 && !self.config.results_panel_visible {
+            self.config.results_panel_visible = true;
+            self.schedule_save(cx);
+        }
+        let more_txt = if more { ", more available" } else { "" };
+        self.set_status(
+            format!(
+                "{scope}: {statements} statement(s) executed in {elapsed:.0?} — showing {row_count} row(s){more_txt}"
+            ),
+            cx,
+        );
+    }
+
+    /// Record a failed query on its tab: keep a live session (so an aborted
+    /// transaction can still be rolled back), discard a dead or superseded
+    /// one, clear the tab's result, and surface the error.
+    fn on_query_error(
+        &mut self,
+        tab_id: u64,
+        epoch: u64,
+        session: Option<db::Session>,
+        err: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ix) = self.tab_index_by_id(tab_id) {
+            self.tabs[ix].running = false;
+            self.tabs[ix].cancel = None;
+            self.tabs[ix].session = session.filter(|s| epoch == self.db_epoch && !s.is_closed());
+            let result = &mut self.tabs[ix].result;
+            result.log.push(SharedString::from(err.to_string()));
+            result.columns.clear();
+            result.rows.clear();
+            result.has_more = false;
+            if ix == self.active_tab {
+                self.show_tab_result(ix, cx);
+            }
+        }
+        self.show_query_error(err, window, cx);
+    }
+
+    /// Toggle the active tab's autocommit mode. Turning it ON commits any
+    /// transaction the tab left open while it was OFF.
+    fn toggle_autocommit(
+        &mut self,
+        _: &ToggleAutocommit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ix = self.active_tab;
+        if self.tabs.get(ix).is_none_or(|tab| tab.running) {
+            return;
+        }
+        let now_on = !self.tabs[ix].autocommit;
+        self.tabs[ix].autocommit = now_on;
+        if now_on && self.active_in_txn() {
+            self.end_txn(true, window, cx);
+        } else {
+            self.set_status(
+                format!("Autocommit {}", if now_on { "on" } else { "off" }),
+                cx,
+            );
+            cx.notify();
+        }
+    }
+
+    fn commit_txn(&mut self, _: &Commit, window: &mut Window, cx: &mut Context<Self>) {
+        self.end_txn(true, window, cx);
+    }
+
+    fn rollback_txn(&mut self, _: &Rollback, window: &mut Window, cx: &mut Context<Self>) {
+        self.end_txn(false, window, cx);
+    }
+
+    /// Commit or roll back the active tab's open transaction on its session.
+    fn end_txn(&mut self, commit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let ix = self.active_tab;
+        let Some(tab) = self.tabs.get_mut(ix) else {
+            return;
+        };
+        // Nothing to do without an open transaction, and never mid-query.
+        if tab.running || !tab.session.as_ref().is_some_and(db::Session::in_txn) {
+            return;
+        }
+        let Some(mut session) = tab.session.take() else {
+            return;
+        };
+        let tab_id = tab.id;
+        let epoch = self.db_epoch;
+        tab.running = true;
+        self.set_status(
+            if commit {
+                "Committing…"
+            } else {
+                "Rolling back…"
+            },
+            cx,
+        );
+
+        cx.spawn_in(window, async move |this, cx| {
+            let (session, result) = cx
+                .background_spawn(async move {
+                    let result = if commit {
+                        session.commit()
+                    } else {
+                        session.rollback()
+                    };
+                    (session, result)
+                })
+                .await;
+
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => {
+                    if let Some(ix) = this.settle_session(tab_id, epoch, session) {
+                        // Ending the transaction closed any cursor with it.
+                        this.tabs[ix].result.has_more = false;
+                    }
+                    this.set_status(if commit { "Committed" } else { "Rolled back" }, cx);
+                    cx.notify();
+                }
+                Err(err) => this.on_query_error(tab_id, epoch, Some(session), &err, window, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Cancel the query in flight on the active tab, over a side connection.
+    /// The in-flight Run reports the cancellation and clears its own running
+    /// state when it returns.
+    fn cancel_query(&mut self, _: &CancelQuery, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        if !tab.running {
+            return;
+        }
+        let Some(token) = tab.cancel.clone() else {
+            return;
+        };
+        self.set_status("Cancelling…", cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx.background_spawn(async move { db::cancel(&token) }).await;
+            if let Err(err) = result {
+                this.update(cx, |this, cx| {
+                    this.set_status(format!("Cancel failed: {err}"), cx);
+                })
+                .ok();
+            }
         })
         .detach();
     }
@@ -2353,7 +2758,7 @@ impl PgGuiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.running {
+        if self.active_running() {
             return;
         }
         let conn = self.config.connection_string.clone();
@@ -2361,6 +2766,7 @@ impl PgGuiApp {
             self.set_status("Nothing to export", cx);
             return;
         };
+        let tab_id = self.tabs[self.active_tab].id;
 
         let default_name = export::default_file_name(
             &sql,
@@ -2374,7 +2780,7 @@ impl PgGuiApp {
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = rx.await else { return };
             this.update(cx, |this, cx| {
-                this.running = true;
+                this.set_tab_running(tab_id, true);
                 this.set_status(format!("Exporting {scope}…"), cx);
             })
             .ok();
@@ -2396,7 +2802,7 @@ impl PgGuiApp {
             let elapsed = started.elapsed();
 
             this.update_in(cx, |this, window, cx| {
-                this.running = false;
+                this.set_tab_running(tab_id, false);
                 match result {
                     Ok(detail) => {
                         this.remember_dir(&path);
@@ -2839,8 +3245,17 @@ impl PgGuiApp {
         if url.is_empty() {
             return;
         }
-        // The cursor's transaction belongs to the previous server; close it.
-        self.cursor = None;
+        // Every tab's session belongs to the previous server; tear them all
+        // down (rolling back any open transaction) so the next Run reconnects.
+        // Bumping the epoch discards any query still in flight against the old
+        // server when it returns.
+        self.db_epoch += 1;
+        for tab in &mut self.tabs {
+            tab.session = None;
+            tab.running = false;
+            tab.cancel = None;
+            tab.result.has_more = false;
+        }
         self.config.connection_string = url.to_string();
         record_recent(&mut self.config.recent_connections, url, name);
         self.save_config();
@@ -2990,7 +3405,7 @@ impl PgGuiApp {
             delegate.page_count(),
             delegate.total_rows(),
         );
-        let has_more = self.cursor.is_some();
+        let has_more = self.active_has_more();
         if page_count <= 1 && !has_more {
             return None;
         }
@@ -3023,7 +3438,7 @@ impl PgGuiApp {
                         .outline()
                         .small()
                         .label("Fetch more")
-                        .disabled(self.running)
+                        .disabled(self.active_running())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.fetch_more_rows(window, cx);
                         }))
@@ -3041,50 +3456,59 @@ impl PgGuiApp {
         )
     }
 
-    /// Fetch More: pull the next batch from the open cursor and append it
-    /// to the results table.
+    /// Fetch More: pull the next batch from the active tab's open cursor and
+    /// append it to the results table.
     fn fetch_more_rows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.running {
-            return;
-        }
-        let Some(cursor) = self.cursor.take() else {
+        let ix = self.active_tab;
+        let Some(tab) = self.tabs.get_mut(ix) else {
             return;
         };
-        self.running = true;
+        if tab.running || !tab.result.has_more {
+            return;
+        }
+        let Some(mut session) = tab.session.take() else {
+            return;
+        };
+        let tab_id = tab.id;
+        let epoch = self.db_epoch;
+        let batch_size = self.config.fetch_size.max(1);
+        self.tabs[ix].running = true;
         self.set_status("Fetching more rows…", cx);
 
         cx.spawn_in(window, async move |this, cx| {
             let started = std::time::Instant::now();
-            let result = cx
-                .background_spawn(async move { cursor.fetch_more() })
+            let (session, result) = cx
+                .background_spawn(async move {
+                    let result = session.fetch_more(batch_size);
+                    (session, result)
+                })
                 .await;
             let elapsed = started.elapsed();
 
-            this.update_in(cx, |this, window, cx| {
-                this.running = false;
-                match result {
-                    Ok((rows, cursor)) => {
-                        let fetched = rows.len();
-                        let more = if cursor.is_some() {
-                            ", more available"
-                        } else {
-                            ""
-                        };
-                        this.cursor = cursor;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok((rows, more)) => {
+                    let Some(ix) = this.settle_session(tab_id, epoch, session) else {
+                        return;
+                    };
+                    let fetched = rows.len();
+                    this.tabs[ix].result.rows.extend(rows.iter().cloned());
+                    this.tabs[ix].result.has_more = more;
+                    if ix == this.active_tab {
                         this.results.update(cx, |table, cx| {
                             table.delegate_mut().append_rows(rows);
                             table.refresh(cx);
                         });
-                        let total = this.results.read(cx).delegate().total_rows();
-                        this.set_status(
-                            format!(
-                                "Fetched {fetched} more row(s) in {elapsed:.0?} — {total} row(s) total{more}"
-                            ),
-                            cx,
-                        );
                     }
-                    Err(err) => this.show_query_error(&err, window, cx),
+                    let total = this.tabs[ix].result.rows.len();
+                    let more_txt = if more { ", more available" } else { "" };
+                    this.set_status(
+                        format!(
+                            "Fetched {fetched} more row(s) in {elapsed:.0?} — {total} row(s) total{more_txt}"
+                        ),
+                        cx,
+                    );
                 }
+                Err(err) => this.on_query_error(tab_id, epoch, Some(session), &err, window, cx),
             })
             .ok();
         })
@@ -4166,16 +4590,7 @@ impl PgGuiApp {
             .on_click(cx.listener(|this, ix: &usize, window, cx| {
                 this.activate_tab(*ix, window, cx);
             }))
-            .suffix(
-                Button::new("new-tab")
-                    .ghost()
-                    .small()
-                    .label("+")
-                    .tooltip("New script tab")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.new_file(&NewFile, window, cx);
-                    })),
-            )
+            .suffix(self.render_session_toolbar(cx))
             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
                 let label = if tab.diverged {
                     format!("⟳ {}", self.tab_label(ix))
@@ -4195,6 +4610,85 @@ impl PgGuiApp {
                         })),
                 )
             }))
+    }
+
+    /// Session controls sitting after the tabs, next to "+": an autocommit
+    /// toggle, Commit/Rollback (enabled only with an open transaction), a
+    /// Cancel button (enabled while a query runs), and the new-tab "+".
+    /// They act on the active tab's session. gpui-component ships no icon
+    /// assets, so these use text glyphs rather than `IconName` SVGs.
+    fn render_session_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let autocommit = self.active_autocommit();
+        let running = self.active_running();
+        // Commit/Rollback only make sense on a manual transaction that has
+        // actually begun, and never while a query is in flight.
+        let txn_actionable = !autocommit && self.active_in_txn() && !running;
+
+        let autocommit_base = Button::new("session-autocommit")
+            .small()
+            .label(if autocommit { "AC: on" } else { "AC: off" })
+            .tooltip(if autocommit {
+                "Autocommit ON — each Run commits. Click for manual transactions."
+            } else {
+                "Autocommit OFF — Run works inside a transaction. Click to commit each Run."
+            });
+        // Highlight the non-default (manual transaction) mode.
+        let autocommit_btn = if autocommit {
+            autocommit_base.ghost()
+        } else {
+            autocommit_base.primary()
+        }
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.toggle_autocommit(&ToggleAutocommit, window, cx);
+        }));
+
+        let commit_btn = Button::new("session-commit")
+            .outline()
+            .small()
+            .label("✓")
+            .tooltip("Commit transaction")
+            .disabled(!txn_actionable)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.commit_txn(&Commit, window, cx);
+            }));
+
+        let rollback_btn = Button::new("session-rollback")
+            .outline()
+            .small()
+            .label("↺")
+            .tooltip("Roll back transaction")
+            .disabled(!txn_actionable)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.rollback_txn(&Rollback, window, cx);
+            }));
+
+        let cancel_btn = Button::new("session-cancel")
+            .danger()
+            .small()
+            .label("⊘")
+            .tooltip("Cancel running query")
+            .disabled(!running)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.cancel_query(&CancelQuery, window, cx);
+            }));
+
+        let new_tab_btn = Button::new("new-tab")
+            .ghost()
+            .small()
+            .label("+")
+            .tooltip("New script tab")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.new_file(&NewFile, window, cx);
+            }));
+
+        h_flex()
+            .gap_1()
+            .px_1()
+            .child(autocommit_btn)
+            .child(commit_btn)
+            .child(rollback_btn)
+            .child(cancel_btn)
+            .child(new_tab_btn)
     }
 
     // ===== PL/pgSQL step debugger =====
@@ -4741,6 +5235,10 @@ impl Render for PgGuiApp {
             .capture_action(cx.listener(Self::on_editor_tab))
             .capture_action(cx.listener(Self::on_editor_escape))
             .on_action(cx.listener(Self::run_query))
+            .on_action(cx.listener(Self::toggle_autocommit))
+            .on_action(cx.listener(Self::commit_txn))
+            .on_action(cx.listener(Self::rollback_txn))
+            .on_action(cx.listener(Self::cancel_query))
             .on_action(cx.listener(Self::export_csv))
             .on_action(cx.listener(Self::export_inserts))
             .on_action(cx.listener(Self::ai_complete))

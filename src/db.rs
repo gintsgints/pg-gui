@@ -71,84 +71,226 @@ pub struct QueryOutcome {
     pub messages: Vec<String>,
 }
 
-/// A server-side cursor held open between fetches so a large SELECT is
-/// pulled in batches instead of all at once. Owns its connection; dropping
-/// it closes the connection, which aborts the transaction and with it the
-/// cursor.
-pub struct Cursor {
-    client: Client,
-    batch_size: usize,
-}
-
-/// The first batch of a cursor-backed SELECT.
-pub struct CursorPage {
-    pub columns: Vec<String>,
-    pub rows: Rows,
-    /// `None` when the first batch already exhausted the result set.
-    pub cursor: Option<Cursor>,
-}
-
-/// Why [`open_cursor`] failed, so the caller knows whether re-running the
-/// statement without a cursor is safe.
-#[derive(Debug)]
-pub enum CursorError {
-    /// `DECLARE CURSOR` was rejected (e.g. a data-modifying CTE) — nothing
-    /// was executed, so the caller may retry via [`run_script`], which also
-    /// reports the error without the `DECLARE` prefix shifting its position.
-    Declare,
-    /// Connecting or fetching failed; retrying could execute the statement
-    /// a second time.
-    Fetch(String),
-}
-
 fn parse_row(row: &SimpleQueryRow) -> Vec<Option<String>> {
     (0..row.len())
         .map(|i| row.get(i).map(std::string::ToString::to_string))
         .collect()
 }
 
-/// Open a cursor over a single SELECT-style statement (`sql` must not end
-/// with a semicolon) and pull the first `batch_size` rows.
-pub fn open_cursor(
-    conn_str: &str,
-    sql: &str,
-    batch_size: usize,
-) -> Result<CursorPage, CursorError> {
-    let mut client = connect(conn_str)
-        .map_err(|e| CursorError::Fetch(format!("connection failed: {}", describe(&e))))?;
-    // One batch so a DECLARE failure rolls the transaction back implicitly.
-    client
-        .batch_execute(&format!(
-            "BEGIN; DECLARE _pg_gui_results NO SCROLL CURSOR FOR {sql}"
-        ))
-        .map_err(|_| CursorError::Declare)?;
-    let mut cursor = Cursor { client, batch_size };
-    let (columns, rows) = cursor.fetch_batch().map_err(CursorError::Fetch)?;
-    let more = rows.len() == batch_size;
-    Ok(CursorPage {
-        columns,
-        rows,
-        cursor: more.then_some(cursor),
-    })
+/// Build a [`QueryOutcome`] from simple-query messages, keeping the most
+/// recent result set that produced columns.
+fn collect_outcome(results: Vec<SimpleQueryMessage>) -> QueryOutcome {
+    let mut outcome = QueryOutcome {
+        columns: Vec::new(),
+        rows: Vec::new(),
+        messages: Vec::new(),
+    };
+    let mut current_cols: Vec<String> = Vec::new();
+    let mut current_rows: Rows = Vec::new();
+    for msg in results {
+        match msg {
+            SimpleQueryMessage::RowDescription(cols) => {
+                current_cols = cols.iter().map(|c| c.name().to_string()).collect();
+                current_rows.clear();
+            }
+            SimpleQueryMessage::Row(row) => {
+                if current_cols.is_empty() {
+                    current_cols = row.columns().iter().map(|c| c.name().to_string()).collect();
+                }
+                current_rows.push(parse_row(&row));
+            }
+            SimpleQueryMessage::CommandComplete(n) => {
+                outcome.messages.push(format!("ok ({n} rows)"));
+                // Keep the most recent result set that produced columns.
+                if !current_cols.is_empty() {
+                    outcome.columns = std::mem::take(&mut current_cols);
+                    outcome.rows = std::mem::take(&mut current_rows);
+                }
+            }
+            _ => {}
+        }
+    }
+    outcome
 }
 
-impl Cursor {
-    /// Pull the next batch, consuming the cursor. Returns the rows plus the
-    /// cursor when more rows may remain; once exhausted the cursor is
-    /// dropped, closing its connection.
-    pub fn fetch_more(mut self) -> Result<(Rows, Option<Self>), String> {
-        let (_, rows) = self.fetch_batch()?;
-        let more = rows.len() == self.batch_size;
-        Ok((rows, more.then_some(self)))
+/// A live database session: one persistent connection owned by a single
+/// editor tab, so temp tables, `SET`, and an open transaction survive
+/// across Runs within that tab and stay isolated from other tabs.
+///
+/// A single SELECT is paged through a server-side cursor declared on this
+/// same connection; the transaction wrapping that cursor is either the
+/// user's (autocommit off) or an implicit one opened just to hold the
+/// cursor (autocommit on).
+pub struct Session {
+    client: Client,
+    /// `_pg_gui_results` is declared and not yet closed.
+    cursor_open: bool,
+    /// A user transaction (autocommit off) is open.
+    in_txn: bool,
+    /// A cursor-only transaction (autocommit on) is open, committed when the
+    /// cursor is closed.
+    implicit_txn: bool,
+}
+
+/// One Run's result: the last result set plus whether the cursor was left
+/// open (more rows available via [`Session::fetch_more`]).
+pub struct RunResult {
+    pub outcome: QueryOutcome,
+    pub more: bool,
+}
+
+impl Session {
+    /// Open a session over `conn_str`. The connection stays open until the
+    /// session is dropped.
+    pub fn connect(conn_str: &str) -> Result<Self, postgres::Error> {
+        Ok(Self {
+            client: connect(conn_str)?,
+            cursor_open: false,
+            in_txn: false,
+            implicit_txn: false,
+        })
     }
 
-    fn fetch_batch(&mut self) -> Result<(Vec<String>, Rows), String> {
+    /// A token usable from another thread to cancel the query currently
+    /// running on this session.
+    pub fn cancel_token(&self) -> postgres::CancelToken {
+        self.client.cancel_token()
+    }
+
+    /// Whether a user transaction (autocommit off) is currently open.
+    pub fn in_txn(&self) -> bool {
+        self.in_txn
+    }
+
+    /// Whether the underlying connection has been closed (e.g. the server
+    /// dropped it); a closed session should be discarded and reopened.
+    pub fn is_closed(&self) -> bool {
+        self.client.is_closed()
+    }
+
+    /// Close any open cursor, committing its implicit transaction
+    /// (autocommit on) or leaving the user transaction intact (autocommit
+    /// off).
+    fn end_cursor(&mut self) -> Result<(), String> {
+        if !self.cursor_open {
+            return Ok(());
+        }
+        let sql = if self.implicit_txn {
+            "COMMIT"
+        } else {
+            "CLOSE _pg_gui_results"
+        };
+        self.client.batch_execute(sql).map_err(|e| describe(&e))?;
+        self.cursor_open = false;
+        self.implicit_txn = false;
+        Ok(())
+    }
+
+    /// Execute `sql` on the session. A single SELECT-style statement is
+    /// paged through a cursor (first `batch_size` rows returned, `more` set
+    /// when the cursor is left open); scripts and DML run directly. With
+    /// `autocommit` off, statements run inside a transaction started on the
+    /// first Run and ended only by [`Self::commit`]/[`Self::rollback`].
+    pub fn run(
+        &mut self,
+        sql: &str,
+        batch_size: usize,
+        autocommit: bool,
+    ) -> Result<RunResult, String> {
+        self.end_cursor()?;
+        if !autocommit && !self.in_txn {
+            self.client
+                .batch_execute("BEGIN")
+                .map_err(|e| describe(&e))?;
+            self.in_txn = true;
+        }
+        if let Ok(select) = export::copyable(sql)
+            && let Some(result) = self.try_cursor(select, batch_size)?
+        {
+            return Ok(result);
+        }
+        // Plain path: scripts, DML, or a SELECT the cursor rejected.
+        let results = self.client.simple_query(sql).map_err(|e| describe(&e))?;
+        Ok(RunResult {
+            outcome: collect_outcome(results),
+            more: false,
+        })
+    }
+
+    /// Try to page `select` through a cursor. Returns `None` (the caller
+    /// falls back to a plain execute) when `DECLARE CURSOR` is rejected —
+    /// e.g. a data-modifying CTE. A savepoint keeps a rejected DECLARE from
+    /// aborting an open user transaction.
+    fn try_cursor(&mut self, select: &str, batch_size: usize) -> Result<Option<RunResult>, String> {
+        let implicit = !self.in_txn && !self.implicit_txn;
+        if implicit {
+            self.client
+                .batch_execute("BEGIN")
+                .map_err(|e| describe(&e))?;
+            self.implicit_txn = true;
+        }
+        // Inside a user transaction a failed DECLARE would abort it; guard
+        // with a savepoint so the fallback path can still run.
+        let savepoint = self.in_txn;
+        if savepoint {
+            self.client
+                .batch_execute("SAVEPOINT _pg_gui_sp")
+                .map_err(|e| describe(&e))?;
+        }
+        let declared = self.client.batch_execute(&format!(
+            "DECLARE _pg_gui_results NO SCROLL CURSOR FOR {select}"
+        ));
+        if declared.is_err() {
+            if implicit {
+                let _ = self.client.batch_execute("ROLLBACK");
+                self.implicit_txn = false;
+            } else if savepoint {
+                self.client
+                    .batch_execute("ROLLBACK TO SAVEPOINT _pg_gui_sp")
+                    .map_err(|e| describe(&e))?;
+            }
+            return Ok(None);
+        }
+        if savepoint {
+            self.client
+                .batch_execute("RELEASE SAVEPOINT _pg_gui_sp")
+                .map_err(|e| describe(&e))?;
+        }
+        self.cursor_open = true;
+        let (columns, rows) = self.fetch_batch(batch_size)?;
+        let more = rows.len() == batch_size;
+        let n = rows.len();
+        if !more {
+            self.end_cursor()?;
+        }
+        Ok(Some(RunResult {
+            outcome: QueryOutcome {
+                columns,
+                rows,
+                messages: vec![format!("ok ({n} rows)")],
+            },
+            more,
+        }))
+    }
+
+    /// Pull the next `batch_size` rows from the open cursor, closing it when
+    /// exhausted. Returns the rows and whether more may remain.
+    pub fn fetch_more(&mut self, batch_size: usize) -> Result<(Rows, bool), String> {
+        if !self.cursor_open {
+            return Ok((Vec::new(), false));
+        }
+        let (_, rows) = self.fetch_batch(batch_size)?;
+        let more = rows.len() == batch_size;
+        if !more {
+            self.end_cursor()?;
+        }
+        Ok((rows, more))
+    }
+
+    fn fetch_batch(&mut self, batch_size: usize) -> Result<(Vec<String>, Rows), String> {
         let results = self
             .client
-            .simple_query(&format!(
-                "FETCH FORWARD {} FROM _pg_gui_results",
-                self.batch_size
-            ))
+            .simple_query(&format!("FETCH FORWARD {batch_size} FROM _pg_gui_results"))
             .map_err(|e| describe(&e))?;
         let mut columns = Vec::new();
         let mut rows = Vec::new();
@@ -168,6 +310,33 @@ impl Cursor {
         }
         Ok((columns, rows))
     }
+
+    /// Commit the open transaction (and any cursor within it).
+    pub fn commit(&mut self) -> Result<(), String> {
+        self.finish_txn("COMMIT")
+    }
+
+    /// Roll the open transaction back (and any cursor within it).
+    pub fn rollback(&mut self) -> Result<(), String> {
+        self.finish_txn("ROLLBACK")
+    }
+
+    fn finish_txn(&mut self, sql: &str) -> Result<(), String> {
+        if self.in_txn || self.implicit_txn || self.cursor_open {
+            self.client.batch_execute(sql).map_err(|e| describe(&e))?;
+        }
+        self.in_txn = false;
+        self.implicit_txn = false;
+        self.cursor_open = false;
+        Ok(())
+    }
+}
+
+/// Cancel the query running on the session the token came from, over a
+/// side connection. Safe to call when nothing is running (a no-op server
+/// side).
+pub fn cancel(token: &postgres::CancelToken) -> Result<(), String> {
+    token.cancel_query(NoTls).map_err(|e| describe(&e))
 }
 
 /// The connection's effective schema search path (including what `ALTER
@@ -682,41 +851,7 @@ pub fn run_script(conn_str: &str, sql: &str) -> Result<QueryOutcome, String> {
         connect(conn_str).map_err(|e| format!("connection failed: {}", describe(&e)))?;
 
     let results = client.simple_query(sql).map_err(|e| describe(&e))?;
-
-    let mut outcome = QueryOutcome {
-        columns: Vec::new(),
-        rows: Vec::new(),
-        messages: Vec::new(),
-    };
-
-    let mut current_cols: Vec<String> = Vec::new();
-    let mut current_rows: Vec<Vec<Option<String>>> = Vec::new();
-
-    for msg in results {
-        match msg {
-            SimpleQueryMessage::RowDescription(cols) => {
-                current_cols = cols.iter().map(|c| c.name().to_string()).collect();
-                current_rows.clear();
-            }
-            SimpleQueryMessage::Row(row) => {
-                if current_cols.is_empty() {
-                    current_cols = row.columns().iter().map(|c| c.name().to_string()).collect();
-                }
-                current_rows.push(parse_row(&row));
-            }
-            SimpleQueryMessage::CommandComplete(n) => {
-                outcome.messages.push(format!("ok ({n} rows)"));
-                // Keep the most recent result set that produced columns.
-                if !current_cols.is_empty() {
-                    outcome.columns = std::mem::take(&mut current_cols);
-                    outcome.rows = std::mem::take(&mut current_rows);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(outcome)
+    Ok(collect_outcome(results))
 }
 
 /// Re-run `sql` server-side wrapped in `COPY (…) TO STDOUT WITH (FORMAT
@@ -758,7 +893,7 @@ pub fn export_inserts(conn_str: &str, sql: &str, path: &Path) -> Result<usize, S
 
 #[cfg(test)]
 mod tests {
-    use super::{CursorError, export_csv, export_inserts, open_cursor, search_path};
+    use super::{Session, export_csv, export_inserts, search_path};
 
     const CONN: &str = "postgres://pgui:pgui@localhost:5433/pgui_test";
 
@@ -809,42 +944,57 @@ mod tests {
     #[test]
     #[ignore = "requires the docker compose database on localhost:5433"]
     fn cursor_fetches_in_batches() {
-        let page = open_cursor(CONN, "SELECT g FROM generate_series(1, 12) g", 5).unwrap();
-        assert_eq!(page.columns, vec!["g"]);
-        assert_eq!(page.rows.len(), 5);
-        assert_eq!(page.rows[0][0].as_deref(), Some("1"));
+        let mut session = Session::connect(CONN).unwrap();
+        let page = session
+            .run("SELECT g FROM generate_series(1, 12) g", 5, true)
+            .unwrap();
+        assert_eq!(page.outcome.columns, vec!["g"]);
+        assert_eq!(page.outcome.rows.len(), 5);
+        assert_eq!(page.outcome.rows[0][0].as_deref(), Some("1"));
+        assert!(page.more);
 
-        let (rows, cursor) = page.cursor.unwrap().fetch_more().unwrap();
+        let (rows, more) = session.fetch_more(5).unwrap();
         assert_eq!(rows.len(), 5);
         assert_eq!(rows[0][0].as_deref(), Some("6"));
+        assert!(more);
 
         // The last, short batch exhausts the cursor.
-        let (rows, cursor) = cursor.unwrap().fetch_more().unwrap();
+        let (rows, more) = session.fetch_more(5).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1][0].as_deref(), Some("12"));
-        assert!(cursor.is_none());
+        assert!(!more);
     }
 
     #[test]
     #[ignore = "requires the docker compose database on localhost:5433"]
     fn cursor_exact_multiple_ends_with_empty_fetch() {
-        let page = open_cursor(CONN, "SELECT g FROM generate_series(1, 4) g", 4).unwrap();
-        assert_eq!(page.rows.len(), 4);
+        let mut session = Session::connect(CONN).unwrap();
+        let page = session
+            .run("SELECT g FROM generate_series(1, 4) g", 4, true)
+            .unwrap();
+        assert_eq!(page.outcome.rows.len(), 4);
+        assert!(page.more);
         // A full first batch keeps the cursor open; the next fetch is empty.
-        let (rows, cursor) = page.cursor.unwrap().fetch_more().unwrap();
+        let (rows, more) = session.fetch_more(4).unwrap();
         assert!(rows.is_empty());
-        assert!(cursor.is_none());
+        assert!(!more);
     }
 
     #[test]
     #[ignore = "requires the docker compose database on localhost:5433"]
-    fn cursor_rejects_statements_declare_cannot_run() {
-        // SELECT INTO passes the first-word check but DECLARE refuses it;
-        // the caller falls back to run_script on this variant.
-        let Err(err) = open_cursor(CONN, "SELECT 1 INTO TEMP _pg_gui_t", 10) else {
-            panic!("expected DECLARE to reject SELECT INTO");
-        };
-        assert!(matches!(err, CursorError::Declare), "{err:?}");
+    fn cursor_falls_back_when_declare_rejects() {
+        let mut session = Session::connect(CONN).unwrap();
+        // SELECT INTO passes copyable's first-word check but DECLARE refuses
+        // it; run falls back to a plain execute (no cursor left open).
+        let page = session
+            .run("SELECT 1 INTO TEMP _pg_gui_t", 10, true)
+            .unwrap();
+        assert!(!page.more);
+        // The temp table was created by the fallback execute on this session.
+        let check = session
+            .run("SELECT count(*) FROM _pg_gui_t", 10, true)
+            .unwrap();
+        assert_eq!(check.outcome.rows[0][0].as_deref(), Some("1"));
     }
 
     #[test]
