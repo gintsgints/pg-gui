@@ -436,11 +436,18 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
 /// never reach here.
 fn object_kind_has_definition(kind: db_tree::NodeKind) -> bool {
     use db_tree::NodeKind::{
-        Constraint, Function, Index, MatView, Sequence, TableDefinition, Type, View,
+        Constraint, Function, Index, MatView, Sequence, TableDefinition, Trigger, Type, View,
     };
     matches!(
         kind,
-        View | MatView | Function | Sequence | Type | Index | Constraint | TableDefinition
+        View | MatView
+            | Function
+            | Sequence
+            | Type
+            | Index
+            | Constraint
+            | Trigger
+            | TableDefinition
     )
 }
 
@@ -454,7 +461,7 @@ fn object_definition(
     relation: &str,
 ) -> Result<String, String> {
     use db_tree::NodeKind::{
-        Constraint, Function, Index, MatView, Sequence, TableDefinition, Type, View,
+        Constraint, Function, Index, MatView, Sequence, TableDefinition, Trigger, Type, View,
     };
     match kind {
         View => db::view_definition(conn, schema, object, false),
@@ -464,6 +471,7 @@ fn object_definition(
         Type => db::type_definition(conn, schema, object),
         Index => db::index_definition(conn, schema, object),
         Constraint => db::constraint_definition(conn, schema, relation, object),
+        Trigger => db::trigger_definition(conn, schema, relation, object),
         TableDefinition => db::table_definition(conn, schema, object),
         _ => Err("no definition for this object".to_string()),
     }

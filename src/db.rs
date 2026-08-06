@@ -388,6 +388,11 @@ pub struct ConstraintInfo {
     pub kind: char,
 }
 
+/// A trigger, as shown under a table's Triggers folder.
+pub struct TriggerInfo {
+    pub name: String,
+}
+
 /// Quote a string as a SQL literal, doubling embedded single quotes.
 fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
@@ -549,6 +554,53 @@ pub fn list_constraints(
             kind: row.get(1).and_then(|s| s.chars().next()).unwrap_or('?'),
         })
         .collect())
+}
+
+/// Triggers on `schema.relation`, ordered by name. Internal triggers (the
+/// ones backing foreign-key constraints) are excluded, matching psql's `\d`.
+pub fn list_triggers(
+    conn_str: &str,
+    schema: &str,
+    relation: &str,
+) -> Result<Vec<TriggerInfo>, String> {
+    let sql = format!(
+        "SELECT t.tgname \
+         FROM pg_catalog.pg_trigger t \
+         JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = {schema} AND c.relname = {relation} AND NOT t.tgisinternal \
+         ORDER BY t.tgname",
+        schema = quote_literal(schema),
+        relation = quote_literal(relation),
+    );
+    Ok(catalog_rows(conn_str, &sql)?
+        .iter()
+        .map(|row| TriggerInfo {
+            name: row.get(0).unwrap_or_default().to_string(),
+        })
+        .collect())
+}
+
+/// `CREATE TRIGGER` text from `pg_get_triggerdef`.
+pub fn trigger_definition(
+    conn_str: &str,
+    schema: &str,
+    relation: &str,
+    name: &str,
+) -> Result<String, String> {
+    let sql = format!(
+        "SELECT pg_catalog.pg_get_triggerdef(t.oid, true) \
+         FROM pg_catalog.pg_trigger t \
+         JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = {schema} AND c.relname = {relation} AND t.tgname = {name}",
+        schema = quote_literal(schema),
+        relation = quote_literal(relation),
+        name = quote_literal(name),
+    );
+    let def = catalog_scalar(conn_str, &sql)?
+        .ok_or_else(|| format!("trigger {name} on {schema}.{relation} not found"))?;
+    Ok(format!("{def};"))
 }
 
 /// Runnable `CREATE` statement reconstructing a view or materialized view.

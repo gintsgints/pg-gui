@@ -1,7 +1,8 @@
 //! The database object browser's tree model.
 //!
 //! The tree is schema → object-type folder (Tables, Views, …) → objects, with
-//! tables expanding one level further to their Indexes and Constraints folders.
+//! tables expanding one level further to their Indexes, Constraints and
+//! Triggers folders.
 //! Every folder loads lazily, one catalog query per folder expansion.
 //! gpui-component's `tree` has no lazy API — a node with zero
 //! children can't be expanded, and only a full `set_items` rebuild exists — so
@@ -43,6 +44,7 @@ pub enum NodeKind {
     // Sub-folders under a table (lazy).
     IndexesFolder,
     ConstraintsFolder,
+    TriggersFolder,
     // Object leaves.
     View,
     MatView,
@@ -51,6 +53,7 @@ pub enum NodeKind {
     Type,
     Index,
     Constraint,
+    Trigger,
 }
 
 /// Load state of a node's children.
@@ -177,8 +180,9 @@ impl DbNode {
         DbNode::container(id, name, NodeKind::Schema, name, children)
     }
 
-    /// A table node, pre-populated with its (still-unloaded) Indexes and
-    /// Constraints folders. `parent_id` is the owning Tables folder's id.
+    /// A table node, pre-populated with its (still-unloaded) Indexes,
+    /// Constraints and Triggers folders. `parent_id` is the owning Tables
+    /// folder's id.
     fn table(parent_id: &str, schema: &str, name: &str) -> Self {
         let id = format!("{parent_id}{SEP}{name}");
         let sub = |tag: &str, label: &str, kind: NodeKind| {
@@ -197,6 +201,7 @@ impl DbNode {
             ),
             sub("idx", "Indexes", NodeKind::IndexesFolder),
             sub("cons", "Constraints", NodeKind::ConstraintsFolder),
+            sub("trg", "Triggers", NodeKind::TriggersFolder),
         ];
         DbNode::container(id, name, NodeKind::Table, schema, children)
     }
@@ -292,6 +297,19 @@ pub fn load_children(
                     schema,
                     relation,
                     &con.name,
+                )
+            })
+            .collect()),
+        NodeKind::TriggersFolder => Ok(db::list_triggers(conn_str, schema, relation)?
+            .iter()
+            .map(|trg| {
+                DbNode::leaf(
+                    format!("{parent_id}{SEP}{}", trg.name),
+                    trg.name.clone(),
+                    NodeKind::Trigger,
+                    schema,
+                    relation,
+                    &trg.name,
                 )
             })
             .collect()),
@@ -416,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn table_expands_to_definition_indexes_and_constraints() {
+    fn table_expands_to_definition_indexes_constraints_and_triggers() {
         let table = DbNode::table("p", "app", "users");
         assert_eq!(table.kind, NodeKind::Table);
         assert!(matches!(table.load, Load::Loaded));
@@ -427,6 +445,7 @@ mod tests {
                 NodeKind::TableDefinition,
                 NodeKind::IndexesFolder,
                 NodeKind::ConstraintsFolder,
+                NodeKind::TriggersFolder,
             ]
         );
         // Every child carries the table's query context.
