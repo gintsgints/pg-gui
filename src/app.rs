@@ -2650,6 +2650,10 @@ impl PgGuiApp {
         }
         let now_on = !self.tabs[ix].autocommit;
         self.tabs[ix].autocommit = now_on;
+        // Remember the toggle as the default that seeds future tabs and
+        // survives restart; without this the change is lost on exit.
+        self.config.autocommit = now_on;
+        self.save_config();
         if now_on && self.active_in_txn() {
             self.end_txn(true, window, cx);
         } else {
