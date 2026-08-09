@@ -1,0 +1,15 @@
+// Project-local debug tasks
+//
+// For more documentation on how to configure debug tasks,
+// see: https://zed.dev/docs/debugger
+[
+  {
+    "adapter": "pgdap",
+    "label": "Debug add()",
+    "request": "launch",
+    "connectionString": "host=127.0.0.1 port=5433 dbname=pgui_test user=pgui password=pgui",
+    "function": "app.add(int, int)",
+    "args": [2, 3],
+    "stopOnEntry": true,
+  },
+]
