@@ -56,6 +56,26 @@ pub enum NodeKind {
     Trigger,
 }
 
+impl NodeKind {
+    /// True for the folders whose children are fetched lazily by
+    /// [`load_children`]. These are the nodes a per-row refresh re-queries.
+    #[must_use]
+    pub fn is_lazy_folder(self) -> bool {
+        matches!(
+            self,
+            NodeKind::TablesFolder
+                | NodeKind::ViewsFolder
+                | NodeKind::MatViewsFolder
+                | NodeKind::FunctionsFolder
+                | NodeKind::SequencesFolder
+                | NodeKind::TypesFolder
+                | NodeKind::IndexesFolder
+                | NodeKind::ConstraintsFolder
+                | NodeKind::TriggersFolder
+        )
+    }
+}
+
 /// Load state of a node's children.
 #[derive(Clone, Debug)]
 pub enum Load {
@@ -314,6 +334,29 @@ pub fn load_children(
             })
             .collect()),
         _ => Ok(Vec::new()),
+    }
+}
+
+/// Reset every lazy-folder descendant of `node` to [`Load::Unloaded`],
+/// dropping any fetched children. Ids of the ones currently in `expanded`
+/// are pushed to `reload` so the caller can re-fetch them in place. Used to
+/// refresh a container (schema/table) row: its lazy sub-folders are cleared
+/// and the visible ones re-queried.
+pub fn reset_lazy_descendants(
+    node: &mut DbNode,
+    expanded: &HashSet<SharedString>,
+    reload: &mut Vec<SharedString>,
+) {
+    for child in &mut node.children {
+        if child.kind.is_lazy_folder() {
+            child.children.clear();
+            child.load = Load::Unloaded;
+            if expanded.contains(&child.id) {
+                reload.push(child.id.clone());
+            }
+        } else {
+            reset_lazy_descendants(child, expanded, reload);
+        }
     }
 }
 

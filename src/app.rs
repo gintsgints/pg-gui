@@ -1871,6 +1871,34 @@ impl PgGuiApp {
         .detach();
     }
 
+    /// Re-fetch a folder's contents on demand — the refresh button on each
+    /// folder row. A lazy folder re-runs its catalog query; a container
+    /// (schema/table) resets its lazy sub-folders and reloads the expanded
+    /// ones so newly created objects appear without a full tree reload.
+    fn refresh_db_node(&mut self, id: SharedString, cx: &mut Context<Self>) {
+        let Some(node) = db_tree::find(&self.db_nodes, &id) else {
+            return;
+        };
+        if node.kind.is_lazy_folder() {
+            // Force a reload: back to Unloaded so `load_db_children` re-fetches
+            // (it skips nodes already Loaded/Loading).
+            if let Some(node) = db_tree::find_mut(&mut self.db_nodes, &id) {
+                node.load = db_tree::Load::Unloaded;
+            }
+            self.load_db_children(id, cx);
+            return;
+        }
+        let expanded = self.db_expanded.clone();
+        let mut reload = Vec::new();
+        if let Some(node) = db_tree::find_mut(&mut self.db_nodes, &id) {
+            db_tree::reset_lazy_descendants(node, &expanded, &mut reload);
+        }
+        for child_id in reload {
+            self.load_db_children(child_id, cx);
+        }
+        self.rebuild_db_tree(cx);
+    }
+
     /// Handle a click on an object leaf in the database browser: open the
     /// object's `.sql` file if one exists in the working directory, otherwise
     /// fetch its definition and open that in a new tab. Folders and
@@ -4465,29 +4493,65 @@ impl PgGuiApp {
                             } else {
                                 "▸"
                             };
+                            let label_row = h_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .w_4()
+                                        .flex_none()
+                                        .text_center()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(glyph),
+                                )
+                                .child(item.label.clone());
                             let list_item = ListItem::new(ix)
                                 .w_full()
                                 .rounded(cx.theme().radius)
                                 .px_2()
-                                .pl(px(14.) * entry.depth() + px(8.))
-                                .child(
-                                    h_flex()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .w_4()
-                                                .flex_none()
-                                                .text_center()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(glyph),
-                                        )
-                                        .child(item.label.clone()),
-                                );
+                                .pl(px(14.) * entry.depth() + px(8.));
                             if entry.is_folder() {
                                 // Folders expand through the tree's own click
-                                // handling; only object leaves open.
-                                list_item
+                                // handling; only object leaves open. A refresh
+                                // button re-fetches this folder's contents so
+                                // objects created since the last load appear.
+                                let node_id = item.id.clone();
+                                list_item.child(
+                                    h_flex()
+                                        .group("db-row")
+                                        .w_full()
+                                        .justify_between()
+                                        .items_center()
+                                        .child(label_row)
+                                        .child(
+                                            // Hidden until the row is hovered.
+                                            div()
+                                                .invisible()
+                                                .group_hover("db-row", gpui::Styled::visible)
+                                                // The tree toggles a row on
+                                                // mouse-down; swallow it here so
+                                                // pressing refresh doesn't also
+                                                // collapse the folder.
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                    cx.stop_propagation();
+                                                })
+                                                .child(
+                                                    Button::new(SharedString::from(format!(
+                                                        "db-refresh-{}",
+                                                        item.id
+                                                    )))
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .tooltip("Refresh")
+                                                    .label("↻")
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.refresh_db_node(node_id.clone(), cx);
+                                                    })),
+                                                ),
+                                        ),
+                                )
                             } else {
+                                let list_item = list_item.child(label_row);
                                 let id = item.id.clone();
                                 list_item.on_click(cx.listener(move |this, _, window, cx| {
                                     this.open_db_object(&id, window, cx);
