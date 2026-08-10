@@ -134,7 +134,9 @@ pub struct Config {
     /// is clicked, deciding which file (if any) to open instead of fetching
     /// the object's definition. `{object}` is replaced with the object name;
     /// `*` matches any run of characters, `?` any single one; matching is
-    /// case-insensitive. Default `*__{object}.sql`.
+    /// case-insensitive. Default `*_{object}.sql`, which matches both
+    /// single- and double-underscore separators (e.g. `R__001_add.sql`
+    /// and `01__place_order.sql`).
     #[serde(default = "default_definition_file_mask")]
     pub definition_file_mask: String,
     /// Directory the file dialogs (Open, Save As, Export) start in; set to
@@ -254,7 +256,7 @@ fn default_fetch_size() -> usize {
 }
 
 fn default_definition_file_mask() -> String {
-    "*__{object}.sql".to_string()
+    "*_{object}.sql".to_string()
 }
 
 /// The app's config directory (`~/Library/Application Support/pg-gui` on

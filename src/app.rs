@@ -5407,6 +5407,13 @@ mod tests {
         assert!(!glob_match("v?.sql", "v12.sql"));
         // A trailing `*` may match nothing.
         assert!(glob_match("orders*", "orders"));
+        // Default mask `*_{object}.sql` matches both single- and
+        // double-underscore separators.
+        let default = "*_add.sql";
+        assert!(glob_match(default, "r__001_add.sql"));
+        assert!(glob_match(default, "01__add.sql"));
+        assert!(glob_match(default, "_add.sql"));
+        assert!(!glob_match(default, "add.sql"));
     }
 
     #[test]
