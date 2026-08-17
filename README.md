@@ -62,7 +62,8 @@ config directory) as you type — the scripts with a short debounce — and rest
 the next start, unsaved edits included. Each tab's `.sql` file path is remembered
 too, so `cmd-s` keeps writing to the same file after a restart. The config also
 holds the recent-connections list, the theme, the zoom level, and a few
-options: `format_on_save` (off by default), `keyword_case` / `constant_case`
+options: `format_on_save` (on by default; toggled from the `fmt:` switch in the
+status bar or Edit ▸ Format on Save), `keyword_case` / `constant_case`
 (`"lower"`/`"upper"`, used by the formatter), and the AI settings
 (`ai_api_key`, `ai_model`, `ai_prompt`).
 `cmd-,` (Preferences…) opens the file in the system editor.

@@ -120,9 +120,10 @@ pub struct Config {
     /// e.g. schema hints or style preferences.
     #[serde(default)]
     pub ai_prompt: String,
-    /// Whether cmd-s formats the script through the language server
-    /// before writing it to disk. Needs postgrestools ≥ 0.22.
-    #[serde(default)]
+    /// Whether cmd-s formats the script through the language server before
+    /// writing it to disk. On by default; toggled from the `fmt:` segment
+    /// in the status bar or Edit ▸ Format on Save.
+    #[serde(default = "default_true")]
     pub format_on_save: bool,
     /// Casing the formatter applies to keywords (SELECT, FROM, WHERE).
     #[serde(default)]
@@ -222,7 +223,7 @@ impl Default for Config {
             ai_api_key: String::new(),
             ai_model: String::new(),
             ai_prompt: String::new(),
-            format_on_save: false,
+            format_on_save: default_true(),
             keyword_case: CaseStyle::default(),
             constant_case: CaseStyle::default(),
             definition_file_mask: default_definition_file_mask(),
@@ -341,6 +342,17 @@ mod tests {
         );
         assert_eq!(config.recent_connections[1].name, "Prod");
         assert_eq!(config.recent_connections[1].url, "postgres://b@remote/db");
+    }
+
+    #[test]
+    fn format_on_save_defaults_on_when_absent() {
+        // The flag used to default off; a config written before the flip
+        // (or by anyone who never touched it) must come back formatting.
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.format_on_save);
+        // An explicit value is respected.
+        let off: Config = serde_json::from_str(r#"{"format_on_save": false}"#).unwrap();
+        assert!(!off.format_on_save);
     }
 
     #[test]

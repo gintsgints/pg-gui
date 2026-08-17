@@ -49,6 +49,7 @@ actions!(
         EditConnection,
         OpenGitHub,
         FormatScript,
+        ToggleFormatOnSave,
         ToggleComment,
         StartDebug,
         DebugStepOver,

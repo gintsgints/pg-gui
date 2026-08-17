@@ -43,9 +43,9 @@ use crate::{
     DebugStepOver, DebugStop, EditConnection, ExportCsv, ExportInserts, FormatScript,
     NewConnection, NewFile, NextTab, OpenConfig, OpenFile, OpenFolder, OpenGitHub, OpenSnippets,
     PrevTab, Quit, RefreshDbTree, Rollback, RunQuery, SaveFile, SetTheme, ShowHelp, StartDebug,
-    ToggleAutocommit, ToggleComment, ToggleDbPanel, ToggleFilesPanel, ToggleResultsPanel, ZoomIn,
-    ZoomOut, ZoomReset, ai, config, db, db_tree, debug, export, file_tree, lsp, snippets,
-    statement,
+    ToggleAutocommit, ToggleComment, ToggleDbPanel, ToggleFilesPanel, ToggleFormatOnSave,
+    ToggleResultsPanel, ZoomIn, ZoomOut, ZoomReset, ai, config, db, db_tree, debug, export,
+    file_tree, lsp, snippets, statement,
 };
 
 /// The project's GitHub page, opened from the About application menu.
@@ -204,6 +204,17 @@ fn theme_menu_item(theme: config::ThemeSelection, current: config::ThemeSelectio
     MenuItem::action(label, SetTheme(theme))
 }
 
+/// The Edit ▸ Format on Save entry, check-marked while the setting is on —
+/// same trick (and same reason) as [`theme_menu_item`].
+fn format_on_save_menu_item(format_on_save: bool) -> MenuItem {
+    let label = if format_on_save {
+        "✓ Format on Save"
+    } else {
+        "Format on Save"
+    };
+    MenuItem::action(label, ToggleFormatOnSave)
+}
+
 /// The application menu bar. Every command lives here now that the toolbar
 /// is gone; the OS fills in each item's shortcut from the keybindings in
 /// `main.rs`. `recents` becomes the Connection ▸ Recent submenu, each entry
@@ -253,7 +264,11 @@ fn connection_menu(recents: &[config::RecentConnection]) -> Menu {
     }
 }
 
-fn build_menus(recents: &[config::RecentConnection], theme: config::ThemeSelection) -> Vec<Menu> {
+fn build_menus(
+    recents: &[config::RecentConnection],
+    theme: config::ThemeSelection,
+    format_on_save: bool,
+) -> Vec<Menu> {
     vec![
         Menu {
             name: "pg-gui".into(),
@@ -284,6 +299,8 @@ fn build_menus(recents: &[config::RecentConnection], theme: config::ThemeSelecti
             disabled: false,
             items: vec![
                 MenuItem::action("Format", FormatScript),
+                format_on_save_menu_item(format_on_save),
+                MenuItem::separator(),
                 MenuItem::action("Snippets", OpenSnippets),
                 MenuItem::action("AI Complete", AiComplete),
                 MenuItem::separator(),
@@ -2093,6 +2110,12 @@ impl PgGuiApp {
         // Covers both a changed active connection and an edited recent list.
         self.sync_connection_combo(window, cx);
 
+        // The Edit ▸ Format on Save check-mark is baked into the menu label,
+        // so an external edit of the flag needs a rebuild.
+        if self.config.format_on_save != old.format_on_save {
+            self.refresh_menus(cx);
+        }
+
         // The language server reads all of these from its generated
         // workspace config at startup, so a change means a restart.
         if self.config.connection_string != old.connection_string
@@ -2885,15 +2908,20 @@ impl PgGuiApp {
         cx.set_menus(build_menus(
             &self.config.recent_connections,
             self.config.theme,
+            self.config.format_on_save,
         ));
         // Feed the same menus to the in-window bar (Linux/Windows) and rebuild
         // it; macOS renders the native bar from `set_menus` alone.
         #[cfg(not(target_os = "macos"))]
         {
-            let menus = build_menus(&self.config.recent_connections, self.config.theme)
-                .into_iter()
-                .map(gpui::Menu::owned)
-                .collect();
+            let menus = build_menus(
+                &self.config.recent_connections,
+                self.config.theme,
+                self.config.format_on_save,
+            )
+            .into_iter()
+            .map(gpui::Menu::owned)
+            .collect();
             GlobalState::global_mut(cx).set_app_menus(menus);
             self.app_menu_bar.update(cx, AppMenuBar::reload);
         }
@@ -3914,6 +3942,21 @@ impl PgGuiApp {
         .detach();
     }
 
+    /// Turn format-on-save on or off (Edit ▸ Format on Save, or the
+    /// `fmt:` segment in the status bar). Persisted, so it holds across
+    /// restarts; the menu is rebuilt for its check-mark.
+    pub fn toggle_format_on_save(
+        &mut self,
+        _: &ToggleFormatOnSave,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.config.format_on_save = !self.config.format_on_save;
+        self.refresh_menus(cx);
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     /// Comment or uncomment the current line, or every line the selection
     /// touches, with `--` (cmd-/). Goes through the input handler so the
     /// edit is undoable and the usual change plumbing runs.
@@ -4274,9 +4317,14 @@ impl PgGuiApp {
     }
 
     /// The status line at the bottom: the latest message on the left, the
-    /// AI / language-server availability summary on the right.
+    /// format-on-save switch and the AI / language-server availability
+    /// summary on the right. The `fmt:` segment is the only interactive
+    /// piece; it stays plain text (not a `Button`) so the bar keeps its
+    /// thin single-line typography, with the pointer cursor and a hover
+    /// brightening as the affordance.
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ai_available = ai::api_key(&self.config.ai_api_key).is_some();
+        let format_on_save = self.config.format_on_save;
         h_flex()
             .px_2()
             .py_1()
@@ -4286,8 +4334,30 @@ impl PgGuiApp {
             .text_color(cx.theme().muted_foreground)
             .child(self.status.clone())
             .child(div().flex_1())
+            .child(
+                div()
+                    .id("format-on-save")
+                    .cursor_pointer()
+                    .hover(|this| this.text_color(cx.theme().foreground))
+                    .tooltip(move |window, cx| {
+                        Tooltip::new(if format_on_save {
+                            "Format on save ON — cmd-s formats first. Click to disable."
+                        } else {
+                            "Format on save OFF — cmd-s writes as typed. Click to enable."
+                        })
+                        .build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_format_on_save(&ToggleFormatOnSave, window, cx);
+                    }))
+                    .child(if format_on_save {
+                        "fmt: on"
+                    } else {
+                        "fmt: off"
+                    }),
+            )
             .child(format!(
-                "{} · {} · cmd-h help",
+                " · {} · {} · cmd-h help",
                 if ai_available {
                     "AI ready"
                 } else {
@@ -5335,6 +5405,7 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::open_snippet_picker))
             .on_action(cx.listener(Self::open_config))
             .on_action(cx.listener(Self::format_script))
+            .on_action(cx.listener(Self::toggle_format_on_save))
             .on_action(cx.listener(Self::toggle_comment))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
