@@ -1,12 +1,13 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::ops::Range;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use postgres::error::ErrorPosition;
 use postgres::{Client, NoTls, SimpleQueryMessage, SimpleQueryRow};
 
-use crate::export;
+use crate::{export, statement};
 
 /// How long a connection attempt may take before it fails, so an
 /// unreachable server errors out quickly instead of hanging on the
@@ -65,6 +66,7 @@ pub(crate) fn describe(error: &postgres::Error) -> String {
 pub type Rows = Vec<Vec<Option<String>>>;
 
 /// Result of executing a SQL script: the last result set plus per-statement messages.
+#[derive(Debug)]
 pub struct QueryOutcome {
     pub columns: Vec<String>,
     pub rows: Rows,
@@ -134,9 +136,74 @@ pub struct Session {
 
 /// One Run's result: the last result set plus whether the cursor was left
 /// open (more rows available via [`Session::fetch_more`]).
+#[derive(Debug)]
 pub struct RunResult {
     pub outcome: QueryOutcome,
     pub more: bool,
+}
+
+/// A failed Run: the error, plus the log lines of the statements that had
+/// already run when it failed (a multi-statement block logs each statement
+/// as it goes, so a failure still shows how far the block got).
+#[derive(Debug)]
+pub struct RunError {
+    pub error: String,
+    pub log: Vec<String>,
+}
+
+impl From<String> for RunError {
+    fn from(error: String) -> Self {
+        Self {
+            error,
+            log: Vec::new(),
+        }
+    }
+}
+
+/// How much of a statement a log line shows before it is elided.
+const LOG_SQL_LEN: usize = 120;
+
+/// A statement collapsed onto a single line for the log: runs of whitespace
+/// (including comments' newlines) become single spaces and anything past
+/// [`LOG_SQL_LEN`] characters is elided.
+fn one_line(sql: &str) -> String {
+    let mut out = String::new();
+    for (i, word) in sql.split_whitespace().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(word);
+        if out.chars().count() > LOG_SQL_LEN {
+            let cut = out
+                .char_indices()
+                .nth(LOG_SQL_LEN)
+                .map_or(out.len(), |(at, _)| at);
+            out.truncate(cut);
+            out.push('…');
+            break;
+        }
+    }
+    out
+}
+
+/// One log line for the `n`th statement of a batch: the statement itself,
+/// what it returned (or the first line of the error that ended it), and how
+/// long it took.
+fn log_line(n: usize, sql: &str, summary: &str, elapsed: Duration) -> String {
+    format!("{n}. {} — {summary} in {elapsed:.0?}", one_line(sql))
+}
+
+/// The statements of `sql`, dropping segments that hold nothing but stray
+/// semicolons and whitespace.
+fn statement_ranges(sql: &str) -> Vec<Range<usize>> {
+    statement::ranges(sql)
+        .into_iter()
+        .filter(|range| {
+            sql[range.clone()]
+                .chars()
+                .any(|c| c != ';' && !c.is_whitespace())
+        })
+        .collect()
 }
 
 impl Session {
@@ -188,15 +255,16 @@ impl Session {
 
     /// Execute `sql` on the session. A single SELECT-style statement is
     /// paged through a cursor (first `batch_size` rows returned, `more` set
-    /// when the cursor is left open); scripts and DML run directly. With
-    /// `autocommit` off, statements run inside a transaction started on the
-    /// first Run and ended only by [`Self::commit`]/[`Self::rollback`].
+    /// when the cursor is left open); a multi-statement block runs statement
+    /// by statement (see [`Self::run_batch`]); anything else runs directly.
+    /// With `autocommit` off, statements run inside a transaction started on
+    /// the first Run and ended only by [`Self::commit`]/[`Self::rollback`].
     pub fn run(
         &mut self,
         sql: &str,
         batch_size: usize,
         autocommit: bool,
-    ) -> Result<RunResult, String> {
+    ) -> Result<RunResult, RunError> {
         self.end_cursor()?;
         if !autocommit && !self.in_txn {
             self.client
@@ -204,15 +272,90 @@ impl Session {
                 .map_err(|e| describe(&e))?;
             self.in_txn = true;
         }
+        let ranges = statement_ranges(sql);
+        if ranges.len() > 1 {
+            return self.run_batch(sql, &ranges);
+        }
         if let Ok(select) = export::copyable(sql)
             && let Some(result) = self.try_cursor(select, batch_size)?
         {
             return Ok(result);
         }
-        // Plain path: scripts, DML, or a SELECT the cursor rejected.
+        // Plain path: DML, DDL, or a SELECT the cursor rejected.
         let results = self.client.simple_query(sql).map_err(|e| describe(&e))?;
         Ok(RunResult {
             outcome: collect_outcome(results),
+            more: false,
+        })
+    }
+
+    /// Run the statements of a multi-statement block one at a time so the log
+    /// gets a line per statement and a failure names the statement that
+    /// caused it. Sending the block as one simple query would instead give
+    /// back bare row counts, and nothing at all once one statement failed.
+    ///
+    /// Postgres wraps a multi-statement simple query in an implicit
+    /// transaction; with autocommit on this wraps the loop in an explicit one
+    /// so the block stays all-or-nothing either way. With autocommit off the
+    /// user's transaction is already open and is left to them to end.
+    fn run_batch(&mut self, sql: &str, ranges: &[Range<usize>]) -> Result<RunResult, RunError> {
+        let wrap = !self.in_txn;
+        if wrap {
+            self.client
+                .batch_execute("BEGIN")
+                .map_err(|e| describe(&e))?;
+        }
+        let mut log = Vec::with_capacity(ranges.len());
+        let mut columns = Vec::new();
+        let mut rows = Vec::new();
+        for (n, range) in ranges.iter().enumerate() {
+            let statement = &sql[range.clone()];
+            let started = Instant::now();
+            let results = match self.client.simple_query(statement) {
+                Ok(results) => results,
+                Err(e) => {
+                    let error = describe(&e);
+                    // The dialog gets the full cause; the log line keeps to
+                    // one line, like every other entry.
+                    let first_line = error.lines().next().unwrap_or("failed");
+                    log.push(log_line(
+                        n + 1,
+                        statement,
+                        &format!("failed: {first_line}"),
+                        started.elapsed(),
+                    ));
+                    if wrap {
+                        let _ = self.client.batch_execute("ROLLBACK");
+                    }
+                    return Err(RunError { error, log });
+                }
+            };
+            let outcome = collect_outcome(results);
+            let summary = if outcome.messages.is_empty() {
+                "ok".to_string()
+            } else {
+                outcome.messages.join("; ")
+            };
+            log.push(log_line(n + 1, statement, &summary, started.elapsed()));
+            // Keep the last result set that produced columns, as a single
+            // simple query over the whole block would have.
+            if !outcome.columns.is_empty() {
+                columns = outcome.columns;
+                rows = outcome.rows;
+            }
+        }
+        if wrap && let Err(e) = self.client.batch_execute("COMMIT") {
+            return Err(RunError {
+                error: describe(&e),
+                log,
+            });
+        }
+        Ok(RunResult {
+            outcome: QueryOutcome {
+                columns,
+                rows,
+                messages: log,
+            },
             more: false,
         })
     }
@@ -945,7 +1088,9 @@ pub fn export_inserts(conn_str: &str, sql: &str, path: &Path) -> Result<usize, S
 
 #[cfg(test)]
 mod tests {
-    use super::{Session, export_csv, export_inserts, search_path};
+    use super::{
+        LOG_SQL_LEN, Session, export_csv, export_inserts, one_line, search_path, statement_ranges,
+    };
 
     const CONN: &str = "postgres://pgui:pgui@localhost:5433/pgui_test";
 
@@ -1060,6 +1205,82 @@ mod tests {
     #[test]
     fn search_path_is_none_when_unreachable() {
         assert!(search_path("postgres://nobody:nope@127.0.0.1:1/none").is_none());
+    }
+
+    #[test]
+    fn one_line_collapses_whitespace_and_elides() {
+        assert_eq!(
+            one_line("SELECT 1,\n       2 -- note\n"),
+            "SELECT 1, 2 -- note"
+        );
+        let long = one_line(&format!("SELECT '{}'", "x".repeat(400)));
+        assert!(long.ends_with('…'), "{long}");
+        assert_eq!(long.chars().count(), LOG_SQL_LEN + 1);
+    }
+
+    #[test]
+    fn statement_ranges_drops_stray_semicolons() {
+        let sql = "SELECT 1;;\n\n; SELECT 2;";
+        let ranges = statement_ranges(sql);
+        let statements: Vec<&str> = ranges.iter().map(|r| &sql[r.clone()]).collect();
+        assert_eq!(statements, vec!["SELECT 1;", "SELECT 2;"]);
+    }
+
+    #[test]
+    #[ignore = "requires the docker compose database on localhost:5433"]
+    fn batch_logs_every_statement() {
+        let mut session = Session::connect(CONN).unwrap();
+        let run = session
+            .run(
+                "CREATE TEMP TABLE _pg_gui_batch (x int);
+                 INSERT INTO _pg_gui_batch VALUES (1), (2);
+                 SELECT x FROM _pg_gui_batch ORDER BY x;",
+                10,
+                true,
+            )
+            .unwrap();
+        let log = &run.outcome.messages;
+        assert_eq!(log.len(), 3, "{log:?}");
+        assert!(
+            log[0].starts_with("1. CREATE TEMP TABLE _pg_gui_batch (x int);"),
+            "{log:?}"
+        );
+        assert!(log[1].contains("ok (2 rows)"), "{log:?}");
+        assert!(
+            log[2].starts_with("3. SELECT x FROM _pg_gui_batch"),
+            "{log:?}"
+        );
+        // The last result set that produced columns is the one shown.
+        assert_eq!(run.outcome.columns, vec!["x"]);
+        assert_eq!(run.outcome.rows.len(), 2);
+        assert!(!run.more);
+    }
+
+    #[test]
+    #[ignore = "requires the docker compose database on localhost:5433"]
+    fn batch_failure_keeps_the_log_and_rolls_back() {
+        let mut session = Session::connect(CONN).unwrap();
+        let err = session
+            .run(
+                "CREATE TEMP TABLE _pg_gui_rollback (x int);
+                 SELECT no_such_function();",
+                10,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(err.log.len(), 2, "{:?}", err.log);
+        assert!(err.log[1].contains("failed:"), "{:?}", err.log);
+        assert!(err.error.contains("no_such_function"), "{}", err.error);
+        // Autocommit wrapped the block in a transaction, so the table the
+        // first statement created is gone again.
+        let check = session
+            .run(
+                "SELECT to_regclass('pg_temp._pg_gui_rollback') IS NULL",
+                10,
+                true,
+            )
+            .unwrap();
+        assert_eq!(check.outcome.rows[0][0].as_deref(), Some("t"));
     }
 
     #[test]

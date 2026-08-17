@@ -2564,7 +2564,7 @@ impl PgGuiApp {
                 Ok(session) => session,
                 Err(err) => {
                     this.update_in(cx, |this, window, cx| {
-                        this.on_query_error(tab_id, epoch, None, &err, window, cx);
+                        this.on_query_error(tab_id, epoch, None, &err.into(), window, cx);
                     })
                     .ok();
                     return;
@@ -2667,7 +2667,7 @@ impl PgGuiApp {
         tab_id: u64,
         epoch: u64,
         session: Option<db::Session>,
-        err: &str,
+        err: &db::RunError,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2676,7 +2676,11 @@ impl PgGuiApp {
             self.tabs[ix].cancel = None;
             self.tabs[ix].session = session.filter(|s| epoch == self.db_epoch && !s.is_closed());
             let result = &mut self.tabs[ix].result;
-            result.log.push(SharedString::from(err.to_string()));
+            // The statements that did run before the failure, then the error.
+            result
+                .log
+                .extend(err.log.iter().cloned().map(SharedString::from));
+            result.log.push(SharedString::from(err.error.clone()));
             result.columns.clear();
             result.rows.clear();
             result.has_more = false;
@@ -2684,7 +2688,7 @@ impl PgGuiApp {
                 self.show_tab_result(ix, cx);
             }
         }
-        self.show_query_error(err, window, cx);
+        self.show_query_error(&err.error, window, cx);
     }
 
     /// Toggle the active tab's autocommit mode. Turning it ON commits any
@@ -2770,7 +2774,9 @@ impl PgGuiApp {
                     this.set_status(if commit { "Committed" } else { "Rolled back" }, cx);
                     cx.notify();
                 }
-                Err(err) => this.on_query_error(tab_id, epoch, Some(session), &err, window, cx),
+                Err(err) => {
+                    this.on_query_error(tab_id, epoch, Some(session), &err.into(), window, cx);
+                }
             })
             .ok();
         })
@@ -3576,7 +3582,9 @@ impl PgGuiApp {
                         cx,
                     );
                 }
-                Err(err) => this.on_query_error(tab_id, epoch, Some(session), &err, window, cx),
+                Err(err) => {
+                    this.on_query_error(tab_id, epoch, Some(session), &err.into(), window, cx);
+                }
             })
             .ok();
         })
