@@ -861,7 +861,9 @@ struct EditorTab {
     /// from the file so restored edits still register as unsaved.
     saved: String,
     /// Whether the buffer differs from `saved`, cached so the tab bar can
-    /// show a marker without diffing on every frame.
+    /// show a marker without diffing on every frame. Always `false` for an
+    /// untitled tab: it has no file to be stale against, and its text is
+    /// persisted to config.json, so closing or quitting never prompts.
     dirty: bool,
     /// Mtime of `path` after our last read or write; a newer mtime on disk
     /// means the file was edited externally. `None` for a tab with no file
@@ -1278,7 +1280,10 @@ impl PgGuiApp {
         });
         let subscription = cx.subscribe_in(&editor, window, Self::on_editor_event);
         let disk_time = tab.file.as_deref().and_then(file_mtime);
-        let dirty = tab.script != saved;
+        // Only a tab backed by a file can be dirty: an untitled tab's text
+        // lives in config.json and is restored on the next launch, so there
+        // is nothing to save and nothing to warn about.
+        let dirty = tab.file.is_some() && tab.script != saved;
         // If the file changed while the app was closed (its mtime differs
         // from the one we persisted last session) and this tab still has
         // unsaved edits, a save would clobber that external change — start
@@ -1315,12 +1320,13 @@ impl PgGuiApp {
     }
 
     /// Recompute a tab's unsaved-edits marker and repaint if it flipped.
+    /// An untitled tab is never dirty — see [`Self::build_tab`].
     fn refresh_dirty(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix >= self.tabs.len() {
             return;
         }
         let value = self.tabs[ix].editor.read(cx).value().to_string();
-        let dirty = value != self.tabs[ix].saved;
+        let dirty = self.tabs[ix].path.is_some() && value != self.tabs[ix].saved;
         if self.tabs[ix].dirty != dirty {
             self.tabs[ix].dirty = dirty;
             cx.notify();
