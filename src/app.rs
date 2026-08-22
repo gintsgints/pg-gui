@@ -3596,6 +3596,12 @@ impl PgGuiApp {
                             .tooltip("Clear log")
                             .disabled(self.log.is_empty())
                             .on_click(cx.listener(|this, _, _, cx| {
+                                // The view is a mirror of the tab's own log;
+                                // clearing only the mirror would bring every
+                                // line back on the next run.
+                                if let Some(tab) = this.tabs.get_mut(this.active_tab) {
+                                    tab.result.log.clear();
+                                }
                                 this.log.clear();
                                 cx.notify();
                             })),
