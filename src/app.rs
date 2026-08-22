@@ -908,12 +908,23 @@ struct EditorTab {
 /// log view when the tab is active.
 #[derive(Default)]
 struct TabResult {
-    columns: Vec<String>,
-    rows: db::Rows,
+    /// One entry per statement of the last Run that returned rows, in the
+    /// order they arrived; the result selector switches between them.
+    results: Vec<db::ResultSet>,
+    /// Index into `results` of the set the table is showing.
+    selected: usize,
     /// The cursor is still open on the tab's session, so Fetch More is valid.
+    /// Only a lone statement pages, so it always belongs to the last set.
     has_more: bool,
     /// Per-statement messages, shown in the Log view.
     log: Vec<SharedString>,
+}
+
+impl TabResult {
+    /// The result set the table is showing, if the last Run produced any.
+    fn selected(&self) -> Option<&db::ResultSet> {
+        self.results.get(self.selected)
+    }
 }
 
 /// Live state of a running debug session, shown in the debug panel that
@@ -1368,8 +1379,10 @@ impl PgGuiApp {
         let Some(tab) = self.tabs.get(ix) else {
             return;
         };
-        let columns = tab.result.columns.clone();
-        let rows = tab.result.rows.clone();
+        let (columns, rows) = tab.result.selected().map_or_else(
+            || (Vec::new(), db::Rows::new()),
+            |set| (set.columns.clone(), set.rows.clone()),
+        );
         self.log = tab.result.log.clone();
         self.results.update(cx, |table, cx| {
             table.delegate_mut().set_data(columns, rows);
@@ -2585,6 +2598,14 @@ impl PgGuiApp {
         // server-side cursor on that connection; scripts and DML run directly.
         let session = self.tabs[ix].session.take();
         self.tabs[ix].running = true;
+        // The run streams its own result sets in; drop the previous Run's so
+        // the selector only ever shows this one's.
+        self.tabs[ix].result.results.clear();
+        self.tabs[ix].result.selected = 0;
+        self.tabs[ix].result.has_more = false;
+        if ix == self.active_tab {
+            self.show_tab_result(ix, cx);
+        }
         self.set_status(format!("Running {scope}…"), cx);
 
         cx.spawn_in(window, async move |this, cx| {
@@ -2603,7 +2624,7 @@ impl PgGuiApp {
                 Ok(session) => session,
                 Err(err) => {
                     this.update_in(cx, |this, window, cx| {
-                        this.on_query_error(tab_id, epoch, None, &err.into(), window, cx);
+                        this.on_query_error(tab_id, epoch, None, &err, window, cx);
                     })
                     .ok();
                     return;
@@ -2618,16 +2639,23 @@ impl PgGuiApp {
             })
             .ok();
 
-            let (session, result) = cx
-                .background_spawn(async move {
-                    let result = session.run(&sql, batch_size, autocommit);
-                    (session, result)
-                })
-                .await;
+            // The run pushes a log line (and a result set) per statement as
+            // it goes; apply them here while the block keeps running, then
+            // wait for the run itself to finish.
+            let (tx, mut events) = futures::channel::mpsc::unbounded();
+            let running = cx.background_spawn(async move {
+                let result = session.run(&sql, batch_size, autocommit, &tx);
+                (session, result)
+            });
+            while let Some(event) = events.next().await {
+                this.update(cx, |this, cx| this.on_run_event(tab_id, epoch, event, cx))
+                    .ok();
+            }
+            let (session, result) = running.await;
             let elapsed = started.elapsed();
 
             this.update_in(cx, |this, window, cx| match result {
-                Ok(run) => this.on_query_ok(tab_id, epoch, session, run, scope, elapsed, cx),
+                Ok(run) => this.on_query_ok(tab_id, epoch, session, &run, scope, elapsed, cx),
                 Err(err) => this.on_query_error(tab_id, epoch, Some(session), &err, window, cx),
             })
             .ok();
@@ -2652,15 +2680,54 @@ impl PgGuiApp {
         Some(ix)
     }
 
-    /// Store a successful query's output on its tab and, if that tab is
-    /// showing, mirror it into the shared results table and Log view.
+    /// Apply one streamed run event to its tab: a log line, or a result set
+    /// that joins the selector and is shown right away, so a long block's
+    /// output appears statement by statement instead of all at the end.
+    fn on_run_event(
+        &mut self,
+        tab_id: u64,
+        epoch: u64,
+        event: db::RunEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if epoch != self.db_epoch {
+            return;
+        }
+        let Some(ix) = self.tab_index_by_id(tab_id) else {
+            return;
+        };
+        let mut rows = false;
+        match event {
+            db::RunEvent::Log(line) => self.tabs[ix].result.log.push(SharedString::from(line)),
+            db::RunEvent::Result(set) => {
+                rows = !set.rows.is_empty();
+                let result = &mut self.tabs[ix].result;
+                result.selected = result.results.len();
+                result.results.push(set);
+            }
+        }
+        if ix == self.active_tab {
+            self.show_tab_result(ix, cx);
+        }
+        // Reveal the results panel (cmd-3) when a statement returns rows so
+        // the output isn't silently hidden.
+        if rows && !self.config.results_panel_visible {
+            self.config.results_panel_visible = true;
+            self.schedule_save(cx);
+        }
+        cx.notify();
+    }
+
+    /// Settle a finished run: put its session back on the tab and report what
+    /// it did. The rows and log lines already arrived through
+    /// [`Self::on_run_event`].
     #[allow(clippy::too_many_arguments)]
     fn on_query_ok(
         &mut self,
         tab_id: u64,
         epoch: u64,
         session: db::Session,
-        run: db::RunResult,
+        run: &db::RunResult,
         scope: &'static str,
         elapsed: std::time::Duration,
         cx: &mut Context<Self>,
@@ -2668,31 +2735,23 @@ impl PgGuiApp {
         let Some(ix) = self.settle_session(tab_id, epoch, session) else {
             return;
         };
-        let db::RunResult { outcome, more } = run;
-        let row_count = outcome.rows.len();
-        let statements = outcome.messages.len();
-        {
-            let result = &mut self.tabs[ix].result;
-            result
-                .log
-                .extend(outcome.messages.into_iter().map(SharedString::from));
-            result.columns = outcome.columns;
-            result.rows = outcome.rows;
-            result.has_more = more;
-        }
+        let db::RunResult { statements, more } = *run;
+        self.tabs[ix].result.has_more = more;
+        let result = &self.tabs[ix].result;
+        let row_count = result.selected().map_or(0, |set| set.rows.len());
+        let sets = result.results.len();
         if ix == self.active_tab {
-            self.show_tab_result(ix, cx);
-        }
-        // Reveal the results panel (cmd-3) when a query returns rows so the
-        // output isn't silently hidden.
-        if row_count > 0 && !self.config.results_panel_visible {
-            self.config.results_panel_visible = true;
-            self.schedule_save(cx);
+            cx.notify();
         }
         let more_txt = if more { ", more available" } else { "" };
+        let sets_txt = if sets > 1 {
+            format!(" of {sets} result sets")
+        } else {
+            String::new()
+        };
         self.set_status(
             format!(
-                "{scope}: {statements} statement(s) executed in {elapsed:.0?} — showing {row_count} row(s){more_txt}"
+                "{scope}: {statements} statement(s) executed in {elapsed:.0?} — showing {row_count} row(s){sets_txt}{more_txt}"
             ),
             cx,
         );
@@ -2706,7 +2765,7 @@ impl PgGuiApp {
         tab_id: u64,
         epoch: u64,
         session: Option<db::Session>,
-        err: &db::RunError,
+        err: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2715,19 +2774,15 @@ impl PgGuiApp {
             self.tabs[ix].cancel = None;
             self.tabs[ix].session = session.filter(|s| epoch == self.db_epoch && !s.is_closed());
             let result = &mut self.tabs[ix].result;
-            // The statements that did run before the failure, then the error.
-            result
-                .log
-                .extend(err.log.iter().cloned().map(SharedString::from));
-            result.log.push(SharedString::from(err.error.clone()));
-            result.columns.clear();
-            result.rows.clear();
+            // The statements that did run were logged as they went; the error
+            // closes the log off. Their result sets stay on the selector.
+            result.log.push(SharedString::from(err.to_string()));
             result.has_more = false;
             if ix == self.active_tab {
                 self.show_tab_result(ix, cx);
             }
         }
-        self.show_query_error(&err.error, window, cx);
+        self.show_query_error(err, window, cx);
     }
 
     /// Toggle the active tab's autocommit mode. Turning it ON commits any
@@ -2814,7 +2869,7 @@ impl PgGuiApp {
                     cx.notify();
                 }
                 Err(err) => {
-                    this.on_query_error(tab_id, epoch, Some(session), &err.into(), window, cx);
+                    this.on_query_error(tab_id, epoch, Some(session), &err, window, cx);
                 }
             })
             .ok();
@@ -3420,13 +3475,63 @@ impl PgGuiApp {
             }))
     }
 
-    /// The results table over a bottom row holding the pager (when present)
-    /// and the Log switch button.
+    /// The row of buttons switching between the result sets a multi-statement
+    /// run produced, one per statement that returned rows. `None` when the run
+    /// produced at most one.
+    fn render_result_selector(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let result = &self.tabs.get(self.active_tab)?.result;
+        if result.results.len() < 2 {
+            return None;
+        }
+        let selected = result.selected;
+        Some(
+            h_flex().gap_1().flex_wrap().children(
+                result
+                    .results
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, set)| {
+                        let button = Button::new(("result-set", ix))
+                            .small()
+                            .label(format!("#{} ({})", set.statement, set.rows.len()))
+                            .tooltip(set.label.clone())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_result_set(ix, cx);
+                            }));
+                        if ix == selected {
+                            button.primary()
+                        } else {
+                            button.outline()
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        )
+    }
+
+    /// Show the `ix`th result set of the active tab's last run in the table.
+    fn select_result_set(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let active = self.active_tab;
+        let Some(tab) = self.tabs.get_mut(active) else {
+            return;
+        };
+        if ix >= tab.result.results.len() || tab.result.selected == ix {
+            return;
+        }
+        tab.result.selected = ix;
+        self.show_tab_result(active, cx);
+        cx.notify();
+    }
+
+    /// The results table between the result-set selector (when a run produced
+    /// more than one) and a bottom row holding the pager (when present) and
+    /// the Log switch button.
     fn render_data_view(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         v_flex()
             .size_full()
             .p_2()
             .gap_1()
+            .children(self.render_result_selector(cx))
             .child(
                 div()
                     .flex_1()
@@ -3604,15 +3709,23 @@ impl PgGuiApp {
                         return;
                     };
                     let fetched = rows.len();
-                    this.tabs[ix].result.rows.extend(rows.iter().cloned());
-                    this.tabs[ix].result.has_more = more;
+                    let result = &mut this.tabs[ix].result;
+                    // Only a lone statement pages, so the cursor's rows
+                    // belong to the one result set the run produced.
+                    let total = match result.results.last_mut() {
+                        Some(set) => {
+                            set.rows.extend(rows.iter().cloned());
+                            set.rows.len()
+                        }
+                        None => 0,
+                    };
+                    result.has_more = more;
                     if ix == this.active_tab {
                         this.results.update(cx, |table, cx| {
                             table.delegate_mut().append_rows(rows);
                             table.refresh(cx);
                         });
                     }
-                    let total = this.tabs[ix].result.rows.len();
                     let more_txt = if more { ", more available" } else { "" };
                     this.set_status(
                         format!(
@@ -3622,7 +3735,7 @@ impl PgGuiApp {
                     );
                 }
                 Err(err) => {
-                    this.on_query_error(tab_id, epoch, Some(session), &err.into(), window, cx);
+                    this.on_query_error(tab_id, epoch, Some(session), &err, window, cx);
                 }
             })
             .ok();

@@ -65,6 +65,32 @@ pub(crate) fn describe(error: &postgres::Error) -> String {
 /// NULL is `None`.
 pub type Rows = Vec<Vec<Option<String>>>;
 
+/// One statement's result set within a run.
+#[derive(Debug)]
+pub struct ResultSet {
+    /// 1-based position of the statement that produced it within the run;
+    /// shown on the result selector.
+    pub statement: usize,
+    /// That statement collapsed onto one line, for the selector's tooltip.
+    pub label: String,
+    pub columns: Vec<String>,
+    pub rows: Rows,
+}
+
+/// What a run reports as it goes, one message per statement (two when the
+/// statement returned rows), pushed the moment that statement finishes so
+/// the UI can show it while the rest of the block is still running.
+#[derive(Debug)]
+pub enum RunEvent {
+    /// A statement finished: its log line.
+    Log(String),
+    /// A statement returned rows.
+    Result(ResultSet),
+}
+
+/// The channel a run reports its [`RunEvent`]s on.
+pub type Progress = futures::channel::mpsc::UnboundedSender<RunEvent>;
+
 /// Result of executing a SQL script: the last result set plus per-statement messages.
 #[derive(Debug)]
 pub struct QueryOutcome {
@@ -134,30 +160,14 @@ pub struct Session {
     implicit_txn: bool,
 }
 
-/// One Run's result: the last result set plus whether the cursor was left
-/// open (more rows available via [`Session::fetch_more`]).
+/// What a finished Run reports back: how many statements it ran and whether
+/// the cursor was left open (more rows available via
+/// [`Session::fetch_more`]). The rows and log lines themselves have already
+/// gone out over the run's [`Progress`] channel.
 #[derive(Debug)]
 pub struct RunResult {
-    pub outcome: QueryOutcome,
+    pub statements: usize,
     pub more: bool,
-}
-
-/// A failed Run: the error, plus the log lines of the statements that had
-/// already run when it failed (a multi-statement block logs each statement
-/// as it goes, so a failure still shows how far the block got).
-#[derive(Debug)]
-pub struct RunError {
-    pub error: String,
-    pub log: Vec<String>,
-}
-
-impl From<String> for RunError {
-    fn from(error: String) -> Self {
-        Self {
-            error,
-            log: Vec::new(),
-        }
-    }
 }
 
 /// How much of a statement a log line shows before it is elided.
@@ -191,6 +201,13 @@ fn one_line(sql: &str) -> String {
 /// long it took.
 fn log_line(n: usize, sql: &str, summary: &str, elapsed: Duration) -> String {
     format!("{n}. {} — {summary} in {elapsed:.0?}", one_line(sql))
+}
+
+/// Push one event to the run's listener. The UI drops the receiver when its
+/// tab goes away mid-run; the statements still have to finish, so a closed
+/// channel is not an error.
+fn send(progress: &Progress, event: RunEvent) {
+    let _ = progress.unbounded_send(event);
 }
 
 /// The statements of `sql`, dropping segments that hold nothing but stray
@@ -253,18 +270,28 @@ impl Session {
         Ok(())
     }
 
-    /// Execute `sql` on the session. A single SELECT-style statement is
-    /// paged through a cursor (first `batch_size` rows returned, `more` set
-    /// when the cursor is left open); a multi-statement block runs statement
-    /// by statement (see [`Self::run_batch`]); anything else runs directly.
-    /// With `autocommit` off, statements run inside a transaction started on
-    /// the first Run and ended only by [`Self::commit`]/[`Self::rollback`].
+    /// Execute `sql` one statement at a time. Every statement reports a log
+    /// line — and, when it returned rows, a result set — over `progress` the
+    /// moment it finishes, so the UI shows a block's output while the rest of
+    /// it is still running, and a failure names the statement that caused it.
+    /// Sending the block as one simple query would instead give back bare row
+    /// counts, only the last result set, and nothing at all once one
+    /// statement failed.
+    ///
+    /// A lone SELECT-style statement is paged through a server-side cursor
+    /// (first `batch_size` rows sent, `more` set when the cursor is left
+    /// open). With `autocommit` off, statements run inside a transaction
+    /// started on the first Run and ended only by
+    /// [`Self::commit`]/[`Self::rollback`]. Postgres wraps a multi-statement
+    /// simple query in an implicit transaction; with autocommit on a block is
+    /// wrapped in an explicit one here so it stays all-or-nothing either way.
     pub fn run(
         &mut self,
         sql: &str,
         batch_size: usize,
         autocommit: bool,
-    ) -> Result<RunResult, RunError> {
+        progress: &Progress,
+    ) -> Result<RunResult, String> {
         self.end_cursor()?;
         if !autocommit && !self.in_txn {
             self.client
@@ -273,98 +300,126 @@ impl Session {
             self.in_txn = true;
         }
         let ranges = statement_ranges(sql);
-        if ranges.len() > 1 {
-            return self.run_batch(sql, &ranges);
-        }
-        if let Ok(select) = export::copyable(sql)
-            && let Some(result) = self.try_cursor(select, batch_size)?
-        {
-            return Ok(result);
-        }
-        // Plain path: DML, DDL, or a SELECT the cursor rejected.
-        let results = self.client.simple_query(sql).map_err(|e| describe(&e))?;
-        Ok(RunResult {
-            outcome: collect_outcome(results),
-            more: false,
-        })
-    }
-
-    /// Run the statements of a multi-statement block one at a time so the log
-    /// gets a line per statement and a failure names the statement that
-    /// caused it. Sending the block as one simple query would instead give
-    /// back bare row counts, and nothing at all once one statement failed.
-    ///
-    /// Postgres wraps a multi-statement simple query in an implicit
-    /// transaction; with autocommit on this wraps the loop in an explicit one
-    /// so the block stays all-or-nothing either way. With autocommit off the
-    /// user's transaction is already open and is left to them to end.
-    fn run_batch(&mut self, sql: &str, ranges: &[Range<usize>]) -> Result<RunResult, RunError> {
-        let wrap = !self.in_txn;
+        // Only a lone statement pages through a cursor: within a block the
+        // cursor would have to stay open across the statements that follow.
+        let single = ranges.len() == 1;
+        let wrap = ranges.len() > 1 && !self.in_txn;
         if wrap {
             self.client
                 .batch_execute("BEGIN")
                 .map_err(|e| describe(&e))?;
         }
-        let mut log = Vec::with_capacity(ranges.len());
-        let mut columns = Vec::new();
-        let mut rows = Vec::new();
+        let mut more = false;
         for (n, range) in ranges.iter().enumerate() {
-            let statement = &sql[range.clone()];
-            let started = Instant::now();
-            let results = match self.client.simple_query(statement) {
-                Ok(results) => results,
-                Err(e) => {
-                    let error = describe(&e);
-                    // The dialog gets the full cause; the log line keeps to
-                    // one line, like every other entry.
-                    let first_line = error.lines().next().unwrap_or("failed");
-                    log.push(log_line(
-                        n + 1,
-                        statement,
-                        &format!("failed: {first_line}"),
-                        started.elapsed(),
-                    ));
+            let paged = single.then_some(batch_size);
+            match self.run_statement(n + 1, &sql[range.clone()], paged, progress) {
+                Ok(left_open) => more = left_open,
+                Err(error) => {
                     if wrap {
                         let _ = self.client.batch_execute("ROLLBACK");
                     }
-                    return Err(RunError { error, log });
+                    return Err(error);
                 }
-            };
-            let outcome = collect_outcome(results);
-            let summary = if outcome.messages.is_empty() {
-                "ok".to_string()
-            } else {
-                outcome.messages.join("; ")
-            };
-            log.push(log_line(n + 1, statement, &summary, started.elapsed()));
-            // Keep the last result set that produced columns, as a single
-            // simple query over the whole block would have.
-            if !outcome.columns.is_empty() {
-                columns = outcome.columns;
-                rows = outcome.rows;
             }
         }
-        if wrap && let Err(e) = self.client.batch_execute("COMMIT") {
-            return Err(RunError {
-                error: describe(&e),
-                log,
-            });
+        if wrap {
+            self.client
+                .batch_execute("COMMIT")
+                .map_err(|e| describe(&e))?;
         }
         Ok(RunResult {
-            outcome: QueryOutcome {
-                columns,
-                rows,
-                messages: log,
-            },
-            more: false,
+            statements: ranges.len(),
+            more,
         })
+    }
+
+    /// Run the `n`th statement of a run, pushing its log line and — when it
+    /// returned rows — its result set to `progress`. `paged` carries the
+    /// batch size for a lone statement, which may page its rows through a
+    /// cursor; the returned flag says whether that cursor was left open.
+    fn run_statement(
+        &mut self,
+        n: usize,
+        statement: &str,
+        paged: Option<usize>,
+        progress: &Progress,
+    ) -> Result<bool, String> {
+        let started = Instant::now();
+        let run = match paged {
+            Some(batch_size) => self.run_paged(statement, batch_size),
+            None => self
+                .client
+                .simple_query(statement)
+                .map(|results| (collect_outcome(results), false))
+                .map_err(|e| describe(&e)),
+        };
+        let (outcome, more) = match run {
+            Ok(run) => run,
+            Err(error) => {
+                // The dialog gets the full cause; the log line keeps to one
+                // line, like every other entry.
+                let first_line = error.lines().next().unwrap_or("failed");
+                let summary = format!("failed: {first_line}");
+                send(
+                    progress,
+                    RunEvent::Log(log_line(n, statement, &summary, started.elapsed())),
+                );
+                return Err(error);
+            }
+        };
+        let summary = if outcome.messages.is_empty() {
+            "ok".to_string()
+        } else {
+            outcome.messages.join("; ")
+        };
+        send(
+            progress,
+            RunEvent::Log(log_line(n, statement, &summary, started.elapsed())),
+        );
+        if !outcome.columns.is_empty() {
+            send(
+                progress,
+                RunEvent::Result(ResultSet {
+                    statement: n,
+                    label: one_line(statement),
+                    columns: outcome.columns,
+                    rows: outcome.rows,
+                }),
+            );
+        }
+        Ok(more)
+    }
+
+    /// Run a lone statement, paging a plain SELECT through a cursor. Falls
+    /// back to a direct execute for anything the cursor rejects (DML, DDL, a
+    /// data-modifying CTE).
+    fn run_paged(
+        &mut self,
+        statement: &str,
+        batch_size: usize,
+    ) -> Result<(QueryOutcome, bool), String> {
+        if let Ok(select) = export::copyable(statement)
+            && let Some(page) = self.try_cursor(select, batch_size)?
+        {
+            return Ok(page);
+        }
+        let results = self
+            .client
+            .simple_query(statement)
+            .map_err(|e| describe(&e))?;
+        Ok((collect_outcome(results), false))
     }
 
     /// Try to page `select` through a cursor. Returns `None` (the caller
     /// falls back to a plain execute) when `DECLARE CURSOR` is rejected —
     /// e.g. a data-modifying CTE. A savepoint keeps a rejected DECLARE from
-    /// aborting an open user transaction.
-    fn try_cursor(&mut self, select: &str, batch_size: usize) -> Result<Option<RunResult>, String> {
+    /// aborting an open user transaction. The flag says whether the cursor
+    /// was left open.
+    fn try_cursor(
+        &mut self,
+        select: &str,
+        batch_size: usize,
+    ) -> Result<Option<(QueryOutcome, bool)>, String> {
         let implicit = !self.in_txn && !self.implicit_txn;
         if implicit {
             self.client
@@ -406,14 +461,14 @@ impl Session {
         if !more {
             self.end_cursor()?;
         }
-        Ok(Some(RunResult {
-            outcome: QueryOutcome {
+        Ok(Some((
+            QueryOutcome {
                 columns,
                 rows,
                 messages: vec![format!("ok ({n} rows)")],
             },
             more,
-        }))
+        )))
     }
 
     /// Pull the next `batch_size` rows from the open cursor, closing it when
@@ -1089,10 +1144,56 @@ pub fn export_inserts(conn_str: &str, sql: &str, path: &Path) -> Result<usize, S
 #[cfg(test)]
 mod tests {
     use super::{
-        LOG_SQL_LEN, Session, export_csv, export_inserts, one_line, search_path, statement_ranges,
+        LOG_SQL_LEN, ResultSet, RunEvent, Session, export_csv, export_inserts, one_line,
+        search_path, statement_ranges,
     };
 
     const CONN: &str = "postgres://pgui:pgui@localhost:5433/pgui_test";
+
+    /// What a run reported: the log lines and result sets it streamed, plus
+    /// whether the cursor was left open. `Err` carries the streamed log lines
+    /// alongside the error, as the UI sees them.
+    #[derive(Debug)]
+    struct Run {
+        log: Vec<String>,
+        sets: Vec<ResultSet>,
+        more: bool,
+    }
+
+    impl Run {
+        /// The rows of the run's last result set (what the results table
+        /// shows once the run finishes).
+        fn rows(&self) -> &super::Rows {
+            &self.sets.last().expect("a result set").rows
+        }
+    }
+
+    /// Run `sql`, draining the progress channel the way the UI does.
+    fn run(
+        session: &mut Session,
+        sql: &str,
+        batch_size: usize,
+    ) -> Result<Run, (String, Vec<String>)> {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let result = session.run(sql, batch_size, true, &tx);
+        drop(tx);
+        let mut log = Vec::new();
+        let mut sets = Vec::new();
+        for event in futures::executor::block_on_stream(rx) {
+            match event {
+                RunEvent::Log(line) => log.push(line),
+                RunEvent::Result(set) => sets.push(set),
+            }
+        }
+        match result {
+            Ok(run) => Ok(Run {
+                log,
+                sets,
+                more: run.more,
+            }),
+            Err(error) => Err((error, log)),
+        }
+    }
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("pg_gui_export_{}_{name}", std::process::id()))
@@ -1142,12 +1243,10 @@ mod tests {
     #[ignore = "requires the docker compose database on localhost:5433"]
     fn cursor_fetches_in_batches() {
         let mut session = Session::connect(CONN).unwrap();
-        let page = session
-            .run("SELECT g FROM generate_series(1, 12) g", 5, true)
-            .unwrap();
-        assert_eq!(page.outcome.columns, vec!["g"]);
-        assert_eq!(page.outcome.rows.len(), 5);
-        assert_eq!(page.outcome.rows[0][0].as_deref(), Some("1"));
+        let page = run(&mut session, "SELECT g FROM generate_series(1, 12) g", 5).unwrap();
+        assert_eq!(page.sets[0].columns, vec!["g"]);
+        assert_eq!(page.rows().len(), 5);
+        assert_eq!(page.rows()[0][0].as_deref(), Some("1"));
         assert!(page.more);
 
         let (rows, more) = session.fetch_more(5).unwrap();
@@ -1166,10 +1265,8 @@ mod tests {
     #[ignore = "requires the docker compose database on localhost:5433"]
     fn cursor_exact_multiple_ends_with_empty_fetch() {
         let mut session = Session::connect(CONN).unwrap();
-        let page = session
-            .run("SELECT g FROM generate_series(1, 4) g", 4, true)
-            .unwrap();
-        assert_eq!(page.outcome.rows.len(), 4);
+        let page = run(&mut session, "SELECT g FROM generate_series(1, 4) g", 4).unwrap();
+        assert_eq!(page.rows().len(), 4);
         assert!(page.more);
         // A full first batch keeps the cursor open; the next fetch is empty.
         let (rows, more) = session.fetch_more(4).unwrap();
@@ -1183,15 +1280,11 @@ mod tests {
         let mut session = Session::connect(CONN).unwrap();
         // SELECT INTO passes copyable's first-word check but DECLARE refuses
         // it; run falls back to a plain execute (no cursor left open).
-        let page = session
-            .run("SELECT 1 INTO TEMP _pg_gui_t", 10, true)
-            .unwrap();
+        let page = run(&mut session, "SELECT 1 INTO TEMP _pg_gui_t", 10).unwrap();
         assert!(!page.more);
         // The temp table was created by the fallback execute on this session.
-        let check = session
-            .run("SELECT count(*) FROM _pg_gui_t", 10, true)
-            .unwrap();
-        assert_eq!(check.outcome.rows[0][0].as_deref(), Some("1"));
+        let check = run(&mut session, "SELECT count(*) FROM _pg_gui_t", 10).unwrap();
+        assert_eq!(check.rows()[0][0].as_deref(), Some("1"));
     }
 
     #[test]
@@ -1230,17 +1323,17 @@ mod tests {
     #[ignore = "requires the docker compose database on localhost:5433"]
     fn batch_logs_every_statement() {
         let mut session = Session::connect(CONN).unwrap();
-        let run = session
-            .run(
-                "CREATE TEMP TABLE _pg_gui_batch (x int);
-                 INSERT INTO _pg_gui_batch VALUES (1), (2);
-                 SELECT x FROM _pg_gui_batch ORDER BY x;",
-                10,
-                true,
-            )
-            .unwrap();
-        let log = &run.outcome.messages;
-        assert_eq!(log.len(), 3, "{log:?}");
+        let batch = run(
+            &mut session,
+            "CREATE TEMP TABLE _pg_gui_batch (x int);
+             INSERT INTO _pg_gui_batch VALUES (1), (2);
+             SELECT x FROM _pg_gui_batch ORDER BY x;
+             SELECT 'a' AS c;",
+            10,
+        )
+        .unwrap();
+        let log = &batch.log;
+        assert_eq!(log.len(), 4, "{log:?}");
         assert!(
             log[0].starts_with("1. CREATE TEMP TABLE _pg_gui_batch (x int);"),
             "{log:?}"
@@ -1250,37 +1343,40 @@ mod tests {
             log[2].starts_with("3. SELECT x FROM _pg_gui_batch"),
             "{log:?}"
         );
-        // The last result set that produced columns is the one shown.
-        assert_eq!(run.outcome.columns, vec!["x"]);
-        assert_eq!(run.outcome.rows.len(), 2);
-        assert!(!run.more);
+        // Each statement that returned rows keeps its own result set.
+        assert_eq!(batch.sets.len(), 2, "{:?}", batch.sets);
+        assert_eq!(batch.sets[0].statement, 3);
+        assert_eq!(batch.sets[0].columns, vec!["x"]);
+        assert_eq!(batch.sets[0].rows.len(), 2);
+        assert_eq!(batch.sets[1].statement, 4);
+        assert_eq!(batch.sets[1].rows[0][0].as_deref(), Some("a"));
+        assert!(!batch.more);
     }
 
     #[test]
     #[ignore = "requires the docker compose database on localhost:5433"]
     fn batch_failure_keeps_the_log_and_rolls_back() {
         let mut session = Session::connect(CONN).unwrap();
-        let err = session
-            .run(
-                "CREATE TEMP TABLE _pg_gui_rollback (x int);
-                 SELECT no_such_function();",
-                10,
-                true,
-            )
-            .unwrap_err();
-        assert_eq!(err.log.len(), 2, "{:?}", err.log);
-        assert!(err.log[1].contains("failed:"), "{:?}", err.log);
-        assert!(err.error.contains("no_such_function"), "{}", err.error);
+        let (error, log) = run(
+            &mut session,
+            "CREATE TEMP TABLE _pg_gui_rollback (x int);
+             SELECT no_such_function();",
+            10,
+        )
+        .unwrap_err();
+        // Both statements were reported before the run gave up.
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert!(log[1].contains("failed:"), "{log:?}");
+        assert!(error.contains("no_such_function"), "{error}");
         // Autocommit wrapped the block in a transaction, so the table the
         // first statement created is gone again.
-        let check = session
-            .run(
-                "SELECT to_regclass('pg_temp._pg_gui_rollback') IS NULL",
-                10,
-                true,
-            )
-            .unwrap();
-        assert_eq!(check.outcome.rows[0][0].as_deref(), Some("t"));
+        let check = run(
+            &mut session,
+            "SELECT to_regclass('pg_temp._pg_gui_rollback') IS NULL",
+            10,
+        )
+        .unwrap();
+        assert_eq!(check.rows()[0][0].as_deref(), Some("t"));
     }
 
     #[test]
