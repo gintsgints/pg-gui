@@ -984,6 +984,12 @@ pub struct PgGuiApp {
     /// Hash of the last scan, so an unchanged re-scan skips the rebuild
     /// (which would reset the tree's selection).
     tree_signature: u64,
+    /// The last directory scan, kept so a filter change can re-project the
+    /// tree without walking the disk again.
+    file_nodes: Vec<file_tree::FileNode>,
+    /// The files panel's filter box; its text filters scanned entries.
+    file_filter_input: Entity<InputState>,
+    file_filter: String,
     /// Split state of the database browser / editor area; the panel width is
     /// persisted to the config whenever the divider is dragged.
     db_sidebar_state: Entity<ResizableState>,
@@ -1092,6 +1098,8 @@ impl PgGuiApp {
         let resizable_state = cx.new(|_| ResizableState::default());
         let sidebar_state = cx.new(|_| ResizableState::default());
         let tree_state = cx.new(|cx| TreeState::new(cx));
+        let file_filter_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter files…"));
         let (db_sidebar_state, db_tree_state, db_filter_input) = Self::build_db_browser(window, cx);
 
         let (connections, connections_sub) = Self::build_connection_combo(&config, window, cx);
@@ -1113,6 +1121,7 @@ impl PgGuiApp {
             }),
             connections_sub,
             Self::track_expanded_dirs(&tree_state, cx),
+            Self::track_file_filter(&file_filter_input, cx),
             Self::track_db_expanded(&db_tree_state, cx),
             Self::track_db_filter(&db_filter_input, cx),
             // Follow OS light/dark switches while the theme is "System".
@@ -1143,6 +1152,9 @@ impl PgGuiApp {
             expanded_dirs: HashSet::new(),
             tree_dirs: Rc::new(HashSet::new()),
             tree_signature: 0,
+            file_nodes: Vec::new(),
+            file_filter_input,
+            file_filter: String::new(),
             db_sidebar_state,
             db_tree_state,
             db_nodes: Vec::new(),
@@ -1740,16 +1752,43 @@ impl PgGuiApp {
                     return;
                 }
                 this.tree_signature = sig;
-                let mut dirs = HashSet::new();
-                let items = file_tree::to_tree_items(&nodes, &this.expanded_dirs, &mut dirs);
-                this.tree_dirs = Rc::new(dirs);
-                this.tree_state
-                    .update(cx, |state, cx| state.set_items(items, cx));
-                cx.notify();
+                this.file_nodes = nodes;
+                this.rebuild_file_tree(cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Re-filter the files panel as its filter box changes.
+    fn track_file_filter(input: &Entity<InputState>, cx: &mut Context<Self>) -> Subscription {
+        cx.subscribe(input, |this, input, event: &InputEvent, cx| {
+            if !matches!(event, InputEvent::Change) {
+                return;
+            }
+            let text = input.read(cx).value().to_string();
+            if text == this.file_filter {
+                return;
+            }
+            this.file_filter = text;
+            this.rebuild_file_tree(cx);
+        })
+    }
+
+    /// Re-project the last scan into the files tree widget. Cheap (UI-side
+    /// only); runs after every scan or filter change.
+    fn rebuild_file_tree(&mut self, cx: &mut Context<Self>) {
+        let mut dirs = HashSet::new();
+        let items = file_tree::to_tree_items(
+            &self.file_nodes,
+            &self.expanded_dirs,
+            &self.file_filter,
+            &mut dirs,
+        );
+        self.tree_dirs = Rc::new(dirs);
+        self.tree_state
+            .update(cx, |state, cx| state.set_items(items, cx));
+        cx.notify();
     }
 
     /// Create the object browser's widgets: its resizable-split state, the
@@ -4681,6 +4720,12 @@ impl PgGuiApp {
                     .text_color(cx.theme().muted_foreground)
                     .truncate()
                     .child(folder_name),
+            )
+            .child(
+                div()
+                    .px_1()
+                    .pb_1()
+                    .child(Input::new(&self.file_filter_input).xsmall()),
             )
             .child(div().flex_1().min_h(px(0.)).px_1().child(tree(
                 &self.tree_state,

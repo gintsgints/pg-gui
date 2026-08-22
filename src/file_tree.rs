@@ -95,26 +95,64 @@ pub fn signature(nodes: &[FileNode]) -> u64 {
 /// own `is_folder()` is children-based, so an empty directory would
 /// otherwise be indistinguishable from a file when picking icons.
 /// Non-SQL files are disabled, which greys them and drops their mouse
-/// handlers.
+/// handlers. A non-empty `filter` keeps only entries whose name matches it
+/// (case-insensitive substring) plus the directories above them; a matching
+/// directory keeps its whole subtree, and every directory left standing is
+/// expanded so the matches show without clicking.
 pub fn to_tree_items(
     nodes: &[FileNode],
     expanded: &HashSet<SharedString>,
+    filter: &str,
+    dirs_out: &mut HashSet<SharedString>,
+) -> Vec<TreeItem> {
+    let needle = filter.trim().to_lowercase();
+    build(nodes, expanded, &needle, dirs_out)
+}
+
+fn build(
+    nodes: &[FileNode],
+    expanded: &HashSet<SharedString>,
+    needle: &str,
     dirs_out: &mut HashSet<SharedString>,
 ) -> Vec<TreeItem> {
     nodes
         .iter()
-        .map(|node| {
-            let id: SharedString = node.path.to_string_lossy().into_owned().into();
-            if node.is_dir {
-                dirs_out.insert(id.clone());
-                TreeItem::new(id.clone(), node.name.clone())
-                    .children(to_tree_items(&node.children, expanded, dirs_out))
-                    .expanded(expanded.contains(&id))
-            } else {
-                TreeItem::new(id, node.name.clone()).disabled(!is_sql(&node.path))
-            }
-        })
+        .filter_map(|node| project(node, expanded, needle, dirs_out))
         .collect()
+}
+
+fn project(
+    node: &FileNode,
+    expanded: &HashSet<SharedString>,
+    needle: &str,
+    dirs_out: &mut HashSet<SharedString>,
+) -> Option<TreeItem> {
+    let id: SharedString = node.path.to_string_lossy().into_owned().into();
+    let self_match = needle.is_empty() || node.name.to_lowercase().contains(needle);
+    if !node.is_dir {
+        return self_match
+            .then(|| TreeItem::new(id, node.name.clone()).disabled(!is_sql(&node.path)));
+    }
+    // A directory whose own name matches keeps its whole subtree; otherwise
+    // only matching entries below it survive, and it is dropped when none do.
+    let child_needle = if self_match { "" } else { needle };
+    let children = build(&node.children, expanded, child_needle, dirs_out);
+    if !self_match && children.is_empty() {
+        return None;
+    }
+    dirs_out.insert(id.clone());
+    // While filtering, reveal the matches instead of the user's own
+    // expansion state (which would hide them behind collapsed folders).
+    let is_expanded = if needle.is_empty() {
+        expanded.contains(&id)
+    } else {
+        !children.is_empty()
+    };
+    Some(
+        TreeItem::new(id, node.name.clone())
+            .children(children)
+            .expanded(is_expanded),
+    )
 }
 
 /// Whether the panel lets this file be opened: `.sql`, any casing.
@@ -226,7 +264,7 @@ mod tests {
         let scripts_id: SharedString = tree.0.join("scripts").to_string_lossy().into_owned().into();
         let expanded = HashSet::from([scripts_id.clone()]);
         let mut dirs = HashSet::new();
-        let items = to_tree_items(&nodes, &expanded, &mut dirs);
+        let items = to_tree_items(&nodes, &expanded, "", &mut dirs);
 
         // empty, scripts, notes.txt
         assert!(dirs.contains(&items[0].id), "empty dir recorded in dirs");
@@ -234,6 +272,46 @@ mod tests {
         assert!(items[1].is_expanded());
         assert!(!items[1].children[0].is_disabled(), "query.sql openable");
         assert!(items[2].is_disabled(), "notes.txt greyed out");
+    }
+
+    #[test]
+    fn filter_keeps_matches_and_their_folders() {
+        let tree = TempTree::new(
+            "filter",
+            &[
+                ("reports/monthly.sql", false),
+                ("reports/notes.txt", false),
+                ("scripts/query.sql", false),
+                ("top.sql", false),
+            ],
+        );
+        let nodes = tree.scan();
+        let expanded = HashSet::new();
+        let mut dirs = HashSet::new();
+        let items = to_tree_items(&nodes, &expanded, "MONTH", &mut dirs);
+
+        // Only `reports` survives, expanded, with its single match inside.
+        let labels: Vec<String> = items.iter().map(|i| i.label.to_string()).collect();
+        assert_eq!(labels, ["reports"]);
+        assert!(items[0].is_expanded(), "match revealed without clicking");
+        let children: Vec<String> = items[0]
+            .children
+            .iter()
+            .map(|i| i.label.to_string())
+            .collect();
+        assert_eq!(children, ["monthly.sql"]);
+
+        // A matching directory keeps its whole subtree.
+        let mut dirs = HashSet::new();
+        let items = to_tree_items(&nodes, &expanded, "reports", &mut dirs);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].children.len(), 2);
+
+        // A match at the root level needs no folder around it.
+        let mut dirs = HashSet::new();
+        let items = to_tree_items(&nodes, &expanded, "top", &mut dirs);
+        let labels: Vec<String> = items.iter().map(|i| i.label.to_string()).collect();
+        assert_eq!(labels, ["top.sql"]);
     }
 
     #[test]
