@@ -2716,10 +2716,14 @@ impl PgGuiApp {
             self.show_tab_result(ix, cx);
         }
         // Reveal the results panel (cmd-3) when a statement returns rows so
-        // the output isn't silently hidden.
-        if rows && !self.config.results_panel_visible {
-            self.config.results_panel_visible = true;
-            self.schedule_save(cx);
+        // the output isn't silently hidden, and switch the panel back to the
+        // table in case the log was left showing from an earlier run.
+        if rows {
+            self.bottom_view = BottomView::Data;
+            if !self.config.results_panel_visible {
+                self.config.results_panel_visible = true;
+                self.schedule_save(cx);
+            }
         }
         cx.notify();
     }
@@ -2785,6 +2789,9 @@ impl PgGuiApp {
             result.log.push(SharedString::from(err.to_string()));
             result.has_more = false;
             if ix == self.active_tab {
+                // Switch to the log so the error line the run just appended is
+                // visible instead of hiding behind the table.
+                self.bottom_view = BottomView::Log;
                 self.show_tab_result(ix, cx);
             }
         }
