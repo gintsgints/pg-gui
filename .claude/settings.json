@@ -1,1 +1,40 @@
-{}
+{
+  "permissions": {
+    "defaultMode": "default",
+    "disableBypassPermissionsMode": "disable",
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Read(./config/credentials.json)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.config/gcloud/**)",
+      "Bash(nc *)",
+      "Bash(git push *)",
+      "Bash(rm -rf *)",
+      "Bash(sudo *)",
+      "Bash(truncate *)",
+      "Bash(terraform apply *)",
+      "Bash(kubectl delete *)"
+    ],
+    "ask": [
+      "Bash(git commit:*)",
+      "Bash(docker *)",
+      "Bash(kubectl *)",
+      "Bash(gh release *)",
+      "Bash(curl *)",
+      "Bash(wget *)"
+    ],
+    "allow": [
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo check *)",
+      "Bash(cargo build *)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git log *)"
+    ]
+  }
+}
