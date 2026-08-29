@@ -3549,16 +3549,15 @@ impl PgGuiApp {
                     .gap_2()
                     .children(self.render_results_pager(cx))
                     .child(div().flex_1())
-                    // The Log switch only appears once there are messages.
-                    .children((!self.log.is_empty()).then(|| {
-                        Self::bottom_view_button(
-                            BottomView::Log,
-                            "☰",
-                            "Show log",
-                            "bottom-view-log",
-                            cx,
-                        )
-                    })),
+                    // The Log switch stays visible so the log is always one
+                    // click away, even before a run produced any messages.
+                    .child(Self::bottom_view_button(
+                        BottomView::Log,
+                        "☰",
+                        "Show log",
+                        "bottom-view-log",
+                        cx,
+                    )),
             )
     }
 
@@ -3613,18 +3612,15 @@ impl PgGuiApp {
                             })),
                     )
                     .child(div().flex_1())
-                    // The Data switch only appears once there are rows.
-                    .children(
-                        (self.results.read(cx).delegate().total_rows() > 0).then(|| {
-                            Self::bottom_view_button(
-                                BottomView::Data,
-                                "▦",
-                                "Show data",
-                                "bottom-view-data",
-                                cx,
-                            )
-                        }),
-                    ),
+                    // The Data switch stays visible so the table is always one
+                    // click away, even when the last run returned no rows.
+                    .child(Self::bottom_view_button(
+                        BottomView::Data,
+                        "▦",
+                        "Show data",
+                        "bottom-view-data",
+                        cx,
+                    )),
             )
     }
 
