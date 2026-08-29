@@ -1701,6 +1701,17 @@ impl PgGuiApp {
         )
     }
 
+    /// Where the Open Folder dialog opens: the folder currently shown in
+    /// the files panel, so re-opening starts where the user already is.
+    /// Falls back to the same directory the file dialogs use.
+    fn folder_start_dir(&self) -> PathBuf {
+        self.config
+            .working_dir
+            .as_ref()
+            .filter(|dir| dir.is_dir())
+            .map_or_else(|| self.start_dir(), PathBuf::clone)
+    }
+
     /// Adopt the directory of a file just chosen in a dialog as the start
     /// directory for the next one. Callers persist it with `save_config`.
     fn remember_dir(&mut self, path: &Path) {
@@ -3907,7 +3918,7 @@ impl PgGuiApp {
     /// Pick the working directory shown in the files side panel.
     pub fn open_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
         let dialog = rfd::AsyncFileDialog::new()
-            .set_directory(self.start_dir())
+            .set_directory(self.folder_start_dir())
             .set_title("Open folder");
 
         cx.spawn_in(window, async move |this, cx| {
