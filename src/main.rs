@@ -74,6 +74,12 @@ pub struct Connect {
     pub name: String,
 }
 
+/// Open a specific folder in the files side panel; carried by the
+/// File ▸ Open Recent Folder menu items.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = pg_gui, no_json)]
+pub struct OpenRecentFolder(pub std::path::PathBuf);
+
 /// Switch to a specific color theme; carried by the View ▸ Theme menu
 /// items.
 #[derive(Clone, PartialEq, Action)]

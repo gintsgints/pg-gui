@@ -41,11 +41,11 @@ use crate::results::ResultsDelegate;
 use crate::{
     AiComplete, CancelQuery, CloseTab, Commit, Connect, DebugContinue, DebugStepInto,
     DebugStepOver, DebugStop, EditConnection, ExportCsv, ExportInserts, FormatScript,
-    NewConnection, NewFile, NextTab, OpenConfig, OpenFile, OpenFolder, OpenGitHub, OpenSnippets,
-    PrevTab, Quit, RefreshDbTree, Rollback, RunQuery, SaveFile, SetTheme, ShowHelp, StartDebug,
-    ToggleAutocommit, ToggleComment, ToggleDbPanel, ToggleFilesPanel, ToggleFormatOnSave,
-    ToggleResultsPanel, ZoomIn, ZoomOut, ZoomReset, ai, config, db, db_tree, debug, export,
-    file_tree, lsp, snippets, statement,
+    NewConnection, NewFile, NextTab, OpenConfig, OpenFile, OpenFolder, OpenGitHub,
+    OpenRecentFolder, OpenSnippets, PrevTab, Quit, RefreshDbTree, Rollback, RunQuery, SaveFile,
+    SetTheme, ShowHelp, StartDebug, ToggleAutocommit, ToggleComment, ToggleDbPanel,
+    ToggleFilesPanel, ToggleFormatOnSave, ToggleResultsPanel, ZoomIn, ZoomOut, ZoomReset, ai,
+    config, db, db_tree, debug, export, file_tree, lsp, snippets, statement,
 };
 
 /// The project's GitHub page, opened from the About application menu.
@@ -151,6 +151,26 @@ fn record_recent(recents: &mut Vec<config::RecentConnection>, url: &str, name: &
         },
     );
     recents.truncate(MAX_RECENT_CONNECTIONS);
+}
+
+/// Number of folders kept in the File ▸ Open Recent Folder menu.
+const MAX_RECENT_FOLDERS: usize = 10;
+
+/// Move `path` to the front of the recent-folders list (dedup by path,
+/// capped).
+fn record_recent_folder(recents: &mut Vec<PathBuf>, path: &Path) {
+    recents.retain(|dir| dir != path);
+    recents.insert(0, path.to_path_buf());
+    recents.truncate(MAX_RECENT_FOLDERS);
+}
+
+/// Menu label for a recent folder: the path with the home directory
+/// shortened to `~`, since full paths are long and the menu is narrow.
+fn folder_menu_label(path: &Path) -> String {
+    let stripped = dirs::home_dir()
+        .and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
+        .map(|rest| format!("~/{}", rest.display()));
+    stripped.unwrap_or_else(|| path.display().to_string())
 }
 
 /// One entry of the title-bar connection combobox: a recent connection,
@@ -264,8 +284,28 @@ fn connection_menu(recents: &[config::RecentConnection]) -> Menu {
     }
 }
 
+/// The File ▸ Open Recent Folder submenu, one entry per remembered
+/// working folder, each carrying its path in an [`OpenRecentFolder`]
+/// action.
+fn recent_folders_menu(recent_folders: &[PathBuf]) -> MenuItem {
+    let items = if recent_folders.is_empty() {
+        vec![MenuItem::action("No recent folders", NoAction)]
+    } else {
+        recent_folders
+            .iter()
+            .map(|dir| MenuItem::action(folder_menu_label(dir), OpenRecentFolder(dir.clone())))
+            .collect()
+    };
+    MenuItem::submenu(Menu {
+        name: "Open Recent Folder".into(),
+        disabled: false,
+        items,
+    })
+}
+
 fn build_menus(
     recents: &[config::RecentConnection],
+    recent_folders: &[PathBuf],
     theme: config::ThemeSelection,
     format_on_save: bool,
 ) -> Vec<Menu> {
@@ -286,6 +326,7 @@ fn build_menus(
             items: vec![
                 MenuItem::action("Open…", OpenFile),
                 MenuItem::action("Open Folder…", OpenFolder),
+                recent_folders_menu(recent_folders),
                 MenuItem::action("Save", SaveFile),
                 MenuItem::separator(),
                 MenuItem::action("New Tab", NewFile),
@@ -1097,7 +1138,12 @@ impl PgGuiApp {
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         snippets::ensure_dir();
-        let config = Self::launch_config();
+        let mut config = Self::launch_config();
+        // The folder already open predates the recent list (or was set by
+        // hand in config.json); seed it so the menu isn't empty.
+        if let Some(dir) = config.working_dir.clone() {
+            record_recent_folder(&mut config.recent_folders, &dir);
+        }
 
         // Set the theme before anything reads it: the editors pick up
         // highlighting from it and the base font sizes below come from it.
@@ -3031,6 +3077,7 @@ impl PgGuiApp {
     fn refresh_menus(&self, cx: &mut Context<Self>) {
         cx.set_menus(build_menus(
             &self.config.recent_connections,
+            &self.config.recent_folders,
             self.config.theme,
             self.config.format_on_save,
         ));
@@ -3040,6 +3087,7 @@ impl PgGuiApp {
         {
             let menus = build_menus(
                 &self.config.recent_connections,
+                &self.config.recent_folders,
                 self.config.theme,
                 self.config.format_on_save,
             )
@@ -3929,18 +3977,44 @@ impl PgGuiApp {
             // items' paths) is consistent across scans.
             let path = folder.path();
             let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            this.update_in(cx, |this, _, cx| {
-                this.config.working_dir = Some(path);
-                this.config.files_panel_visible = true;
-                this.expanded_dirs.clear();
-                this.tree_signature = 0;
-                this.load_tree(cx);
-                this.save_config();
-                cx.notify();
-            })
-            .ok();
+            this.update_in(cx, |this, _, cx| this.set_working_dir(path, cx))
+                .ok();
         })
         .detach();
+    }
+
+    /// Re-open a folder picked from File ▸ Open Recent Folder. A folder
+    /// that has since been deleted or moved is dropped from the list
+    /// instead of leaving the panel pointed at nothing.
+    pub fn open_recent_folder(
+        &mut self,
+        action: &OpenRecentFolder,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = action.0.clone();
+        if !path.is_dir() {
+            self.config.recent_folders.retain(|dir| dir != &path);
+            self.save_config();
+            self.refresh_menus(cx);
+            self.set_status(format!("Folder is gone: {}", path.display()), cx);
+            return;
+        }
+        self.set_working_dir(path, cx);
+    }
+
+    /// Show `path` in the files side panel and remember it as a recent
+    /// folder; shared by the Open Folder dialog and the recent-folders menu.
+    fn set_working_dir(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        record_recent_folder(&mut self.config.recent_folders, &path);
+        self.config.working_dir = Some(path);
+        self.config.files_panel_visible = true;
+        self.expanded_dirs.clear();
+        self.tree_signature = 0;
+        self.load_tree(cx);
+        self.save_config();
+        self.refresh_menus(cx);
+        cx.notify();
     }
 
     /// Show or hide the files side panel (cmd-shift-e).
@@ -5589,6 +5663,7 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::prev_tab))
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(Self::open_recent_folder))
             .on_action(cx.listener(Self::toggle_files_panel))
             .on_action(cx.listener(Self::toggle_results_panel))
             .on_action(cx.listener(Self::toggle_db_panel))
@@ -5634,8 +5709,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        dialog_start_dir, glob_match, mask_credentials, suggested_name_from_mask,
-        toggle_line_comments,
+        MAX_RECENT_FOLDERS, dialog_start_dir, folder_menu_label, glob_match, mask_credentials,
+        record_recent_folder, suggested_name_from_mask, toggle_line_comments,
     };
 
     #[test]
@@ -5701,6 +5776,30 @@ mod tests {
         assert_eq!(dialog_start_dir(None, None), home);
         let missing_tab = Path::new("/pg-gui-test-does-not-exist/script.sql");
         assert_eq!(dialog_start_dir(None, Some(missing_tab)), home);
+    }
+
+    #[test]
+    fn recent_folders_dedup_and_cap() {
+        let mut recents = Vec::new();
+        for i in 0..12 {
+            record_recent_folder(&mut recents, &PathBuf::from(format!("/dir{i}")));
+        }
+        assert_eq!(recents.len(), MAX_RECENT_FOLDERS);
+        assert_eq!(recents[0], PathBuf::from("/dir11"));
+
+        record_recent_folder(&mut recents, &PathBuf::from("/dir5"));
+        assert_eq!(recents[0], PathBuf::from("/dir5"));
+        assert_eq!(
+            recents.iter().filter(|d| *d == Path::new("/dir5")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn folder_label_shortens_home() {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        assert_eq!(folder_menu_label(&home.join("sql")), "~/sql");
+        assert_eq!(folder_menu_label(Path::new("/opt/sql")), "/opt/sql");
     }
 
     #[test]

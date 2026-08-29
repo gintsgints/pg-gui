@@ -147,6 +147,10 @@ pub struct Config {
     /// Folder shown in the files side panel; set by File ▸ Open Folder….
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<PathBuf>,
+    /// Previously opened working folders, most recent first, shown in the
+    /// File ▸ Open Recent Folder submenu.
+    #[serde(default)]
+    pub recent_folders: Vec<PathBuf>,
     /// Whether the files side panel is shown (toggled with cmd-shift-e).
     #[serde(default = "default_true")]
     pub files_panel_visible: bool,
@@ -229,6 +233,7 @@ impl Default for Config {
             definition_file_mask: default_definition_file_mask(),
             last_dir: None,
             working_dir: None,
+            recent_folders: Vec::new(),
             files_panel_visible: default_true(),
             files_panel_width: None,
             results_panel_visible: default_true(),
