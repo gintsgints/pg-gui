@@ -47,6 +47,88 @@ pub fn at(text: &str, offset: usize) -> Option<Range<usize>> {
     ranges.into_iter().next()
 }
 
+/// The gutter line-number offset that makes the editor agree with the line
+/// numbers Postgres reports for a PL/pgSQL routine.
+///
+/// Postgres numbers a routine's lines relative to its body — the text between
+/// the dollar quotes — so body line 1 is whatever follows the opening `$tag$`,
+/// on the same physical line as that delimiter. Returning the negated row of
+/// that delimiter turns the gutter into body numbering: the delimiter's line
+/// becomes 1, the lines above it 0 and below.
+///
+/// Only a buffer holding exactly one routine definition is numbered this way;
+/// with none, or with several (whose bodies would each want their own origin),
+/// the offset is 0 and the gutter counts the file's own lines.
+pub fn body_line_offset(text: &str) -> i32 {
+    let mut opens = ranges(text)
+        .into_iter()
+        .filter(|range| is_routine_definition(&text[range.clone()]))
+        .filter_map(|range| body_open(text, &range));
+    let Some(open) = opens.next() else {
+        return 0;
+    };
+    if opens.next().is_some() {
+        return 0;
+    }
+    let row = text[..open].matches('\n').count();
+    -i32::try_from(row).unwrap_or(i32::MAX)
+}
+
+/// Whether `statement` creates a function or procedure, judged by its leading
+/// keywords (`CREATE [OR REPLACE] [...] FUNCTION|PROCEDURE`) — enough to tell
+/// it from the `CREATE TABLE`s and `SELECT`s it shares a buffer with.
+fn is_routine_definition(statement: &str) -> bool {
+    let mut words = strip_leading_comments(statement)
+        .split_whitespace()
+        .take(6)
+        .map(str::to_ascii_uppercase);
+    words.next().is_some_and(|word| word == "CREATE")
+        && words.any(|word| word == "FUNCTION" || word == "PROCEDURE")
+}
+
+/// `statement` without the comments it opens with — a statement range starts
+/// at the previous semicolon, so a routine's own doc comment is part of it.
+fn strip_leading_comments(statement: &str) -> &str {
+    let bytes = statement.as_bytes();
+    let mut i = 0;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes[i..].starts_with(b"--") {
+            i = skip_line_comment(bytes, i);
+        } else if bytes[i..].starts_with(b"/*") {
+            i = skip_block_comment(bytes, i);
+        } else {
+            return &statement[i..];
+        }
+    }
+}
+
+/// The byte offset of the `$tag$` that opens the routine body in `range` —
+/// the first dollar quote of the statement, since anything before it is the
+/// signature. `None` when the body is quoted some other way (a plain string
+/// literal) or the statement is unterminated.
+fn body_open(text: &str, range: &Range<usize>) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = range.start;
+    while i < range.end {
+        match bytes[i] {
+            b'\'' | b'"' => i = skip_quoted(bytes, i, bytes[i]),
+            b'-' if bytes.get(i + 1) == Some(&b'-') => i = skip_line_comment(bytes, i),
+            b'/' if bytes.get(i + 1) == Some(&b'*') => i = skip_block_comment(bytes, i),
+            b'$' => {
+                if dollar_quote_tag(text, i).is_some() {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 fn push_trimmed(text: &str, range: Range<usize>, out: &mut Vec<Range<usize>>) {
     let segment = &text[range.clone()];
     let trimmed = segment.trim_start();
@@ -106,6 +188,19 @@ fn skip_block_comment(bytes: &[u8], start: usize) -> usize {
 /// Skip a `$tag$ … $tag$` dollar-quoted region. A `$` that doesn't open one
 /// (e.g. a `$1` placeholder) is stepped over.
 fn skip_dollar_quoted(text: &str, start: usize) -> usize {
+    let Some(delimiter) = dollar_quote_tag(text, start) else {
+        return start + 1;
+    };
+    let after_open = start + delimiter.len();
+    match text[after_open..].find(delimiter) {
+        Some(pos) => after_open + pos + delimiter.len(),
+        None => text.len(),
+    }
+}
+
+/// The `$tag$` delimiter opening at `start`, or `None` when the `$` there does
+/// not open a dollar-quoted region (a `$1` placeholder, a bare `$`).
+fn dollar_quote_tag(text: &str, start: usize) -> Option<&str> {
     let bytes = text.as_bytes();
     let mut tag_end = start + 1;
     while tag_end < bytes.len()
@@ -113,21 +208,59 @@ fn skip_dollar_quoted(text: &str, start: usize) -> usize {
     {
         tag_end += 1;
     }
-    let opens_quote =
-        tag_end < bytes.len() && bytes[tag_end] == b'$' && !bytes[start + 1].is_ascii_digit();
-    if !opens_quote {
-        return start + 1;
+    if tag_end >= bytes.len() || bytes[tag_end] != b'$' || bytes[start + 1].is_ascii_digit() {
+        return None;
     }
-    let delimiter = &text[start..=tag_end];
-    match text[tag_end + 1..].find(delimiter) {
-        Some(pos) => tag_end + 1 + pos + delimiter.len(),
-        None => text.len(),
-    }
+    Some(&text[start..=tag_end])
 }
 
 #[cfg(test)]
 mod tests {
-    use super::at;
+    use super::{at, body_line_offset};
+
+    /// The sample from `sql/length_function.sql`: Postgres reports the `RETURN`
+    /// on file line 6 as line 3, because body line 1 is the `AS $function$`
+    /// line — so the gutter has to start counting three lines in.
+    #[test]
+    fn routine_body_numbering_matches_postgres() {
+        let sql = "CREATE OR REPLACE FUNCTION length(value text)\n\
+                   RETURNS int\n\
+                   LANGUAGE plpgsql\n\
+                   AS $function$\n\
+                   BEGIN\n\
+                   RETURN char_length(value);\n\
+                   END;\n\
+                   $function$;\n";
+        assert_eq!(body_line_offset(sql), -3);
+    }
+
+    #[test]
+    fn leading_comments_shift_the_body_further_down() {
+        let sql = "-- A greeting.\nCREATE FUNCTION f() RETURNS text AS $$\nBEGIN\nEND;\n$$;";
+        assert_eq!(body_line_offset(sql), -1);
+    }
+
+    #[test]
+    fn plain_sql_keeps_file_numbering() {
+        assert_eq!(body_line_offset("SELECT 1;\nSELECT 2;\n"), 0);
+        assert_eq!(body_line_offset(""), 0);
+    }
+
+    #[test]
+    fn two_routines_have_no_single_origin() {
+        let sql = "CREATE FUNCTION f() RETURNS int AS $$SELECT 1$$ LANGUAGE sql;\n\
+                   CREATE FUNCTION g() RETURNS int AS $$SELECT 2$$ LANGUAGE sql;";
+        assert_eq!(body_line_offset(sql), 0);
+    }
+
+    /// Statements around the routine don't move its body origin, and a
+    /// `CREATE TABLE` is not mistaken for one.
+    #[test]
+    fn other_statements_do_not_count_as_routines() {
+        let sql =
+            "CREATE TABLE t (id int);\n\nCREATE FUNCTION f() RETURNS int\nAS $$\nBEGIN\nEND;\n$$;";
+        assert_eq!(body_line_offset(sql), -3);
+    }
 
     #[test]
     fn cursor_inside_statement() {

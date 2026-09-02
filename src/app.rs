@@ -1311,6 +1311,9 @@ impl PgGuiApp {
                 .code_editor("sql")
                 .multi_line(true)
                 .line_number(true)
+                // A routine definition is numbered the way Postgres numbers it
+                // in error messages, i.e. relative to the body.
+                .line_number_offset(statement::body_line_offset(&tab.script))
                 .breakpoints_enabled(true)
                 .tab_size(TabSize {
                     tab_size: 2,
@@ -2418,6 +2421,9 @@ impl PgGuiApp {
             return;
         };
         let text = state.read(cx).value().to_string();
+        // The body's origin moves as lines are added above it.
+        let offset = statement::body_line_offset(&text);
+        state.update(cx, |state, cx| state.set_line_number_offset(offset, cx));
         // A change that grows the buffer by more than one character and
         // brings in braced tab-stop markers is a template landing (an
         // accepted completion suggestion, or a paste) — never plain
