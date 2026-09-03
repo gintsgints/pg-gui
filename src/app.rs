@@ -584,20 +584,78 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     pi == pattern.len()
 }
 
-/// Recursively search `dir` for a file whose name matches `pattern` (a glob
-/// with `*`/`?`, already lowercased — see [`config::Config::definition_file_mask`]).
-/// Returns the first match. Hidden directories and the usual heavy build
-/// directories are skipped, and a total-entry budget caps a runaway walk.
-fn find_sql_file(dir: &Path, pattern: &str) -> Option<PathBuf> {
+/// Characters that separate the parts of a definition file's name — folders
+/// included, so `order_utils/place_order` reads the same way as
+/// `order_utils__place_order`.
+const NAME_SEPARATORS: [char; 5] = ['_', '-', '.', '/', '\\'];
+
+/// Whether `text` ends with `word` standing on its own, i.e. preceded by a
+/// name separator or by nothing at all: `order_utils` ends
+/// `test__order_utils` but not `test__xorder_utils`. Both sides are expected
+/// already lowercased.
+fn ends_with_name_word(text: &str, word: &str) -> bool {
+    !word.is_empty()
+        && text
+            .strip_suffix(word)
+            .is_some_and(|rest| rest.is_empty() || rest.ends_with(NAME_SEPARATORS))
+}
+
+/// How well a file matching the definition mask fits the clicked object,
+/// lower being better. The mask only knows the object name, so several files
+/// can match the same glob — with the default `*_{object}.sql`, both
+/// `order_utils__place_order.sql` and
+/// `test__order_utils__place_order.sql` match object `place_order` —
+/// and the schema is what tells them apart: it must be what qualifies the
+/// object name, not merely appear somewhere in it.
+fn definition_match_rank(path: &Path, root: &Path, schema: &str, object: &str) -> u8 {
+    // The file's path below the working folder without its extension: folders
+    // qualify the object name just as filename prefixes do.
+    let rel = path.strip_prefix(root).unwrap_or(path).with_extension("");
+    let rel = rel.to_string_lossy().to_ascii_lowercase();
+    // What stands before the object name, if the name is there at all as a
+    // whole word.
+    let Some(qualifier) = rel.strip_suffix(object) else {
+        return 3;
+    };
+    if !qualifier.is_empty() && !qualifier.ends_with(NAME_SEPARATORS) {
+        return 3;
+    }
+    let qualifier = qualifier.trim_end_matches(NAME_SEPARATORS);
+    if qualifier == schema {
+        // `order_utils__place_order`, `order_utils/place_order`.
+        0
+    } else if qualifier.is_empty() {
+        // `place_order` — unqualified, so still plausibly ours.
+        1
+    } else if ends_with_name_word(qualifier, schema) {
+        // `test__order_utils__place_order` — our schema is in there, but
+        // something else qualifies it.
+        2
+    } else {
+        3
+    }
+}
+
+/// Recursively search `dir` for the file holding `schema.object`'s definition:
+/// the best [`definition_match_rank`] among the files whose name matches
+/// `pattern` (a glob with `*`/`?`, already lowercased — see
+/// [`config::Config::definition_file_mask`]), ties broken by the shallowest
+/// then alphabetically first path so the same click always opens the same
+/// file. Hidden directories and the usual heavy build directories are
+/// skipped, and a total-entry budget caps a runaway walk.
+fn find_sql_file(dir: &Path, pattern: &str, schema: &str, object: &str) -> Option<PathBuf> {
+    let schema = schema.to_ascii_lowercase();
+    let object = object.to_ascii_lowercase();
+    let mut best: Option<(u8, usize, PathBuf)> = None;
     let mut stack = vec![dir.to_path_buf()];
     let mut budget = 20_000usize;
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    'walk: while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
             continue;
         };
         for entry in entries.flatten() {
             if budget == 0 {
-                return None;
+                break 'walk;
             }
             budget -= 1;
             let Ok(file_type) = entry.file_type() else {
@@ -619,11 +677,18 @@ fn find_sql_file(dir: &Path, pattern: &str) -> Option<PathBuf> {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| glob_match(pattern, &name.to_ascii_lowercase()))
             {
-                return Some(path);
+                let candidate = (
+                    definition_match_rank(&path, dir, &schema, &object),
+                    path.components().count(),
+                    path,
+                );
+                if best.as_ref().is_none_or(|current| candidate < *current) {
+                    best = Some(candidate);
+                }
             }
         }
     }
-    None
+    best.map(|(_, _, path)| path)
 }
 
 /// Where a file dialog (Open, Save As, Export) should start: the directory
@@ -2068,8 +2133,11 @@ impl PgGuiApp {
 
         cx.spawn_in(window, async move |this, cx| {
             if let Some(dir) = working_dir {
+                let (match_schema, match_object) = (schema.clone(), stem.clone());
                 let found = cx
-                    .background_spawn(async move { find_sql_file(&dir, &pattern) })
+                    .background_spawn(async move {
+                        find_sql_file(&dir, &pattern, &match_schema, &match_object)
+                    })
                     .await;
                 if let Some(path) = found {
                     this.update_in(cx, |this, window, cx| this.open_path(&path, window, cx))
@@ -5715,9 +5783,33 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        MAX_RECENT_FOLDERS, dialog_start_dir, folder_menu_label, glob_match, mask_credentials,
-        record_recent_folder, suggested_name_from_mask, toggle_line_comments,
+        MAX_RECENT_FOLDERS, dialog_start_dir, ends_with_name_word, find_sql_file,
+        folder_menu_label, glob_match, mask_credentials, record_recent_folder,
+        suggested_name_from_mask, toggle_line_comments,
     };
+
+    /// A throwaway folder holding the given files, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str, files: &[&str]) -> Self {
+            let root = std::env::temp_dir().join(format!("pg-gui-app-{name}"));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            for file in files {
+                let path = root.join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, "select 1;").unwrap();
+            }
+            Self(root)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn suggested_name_strips_wildcards_and_leading_separators() {
@@ -5735,6 +5827,100 @@ mod tests {
         );
         // A mask that is nothing but wildcards falls back to `<object>.sql`.
         assert_eq!(suggested_name_from_mask("*", "orders"), "orders.sql");
+    }
+
+    #[test]
+    fn name_words_respect_separators() {
+        assert!(ends_with_name_word("test__order_utils", "order_utils"));
+        assert!(ends_with_name_word("test/order_utils", "order_utils"));
+        assert!(ends_with_name_word("order_utils", "order_utils"));
+        assert!(!ends_with_name_word("xorder_utils", "order_utils"));
+        assert!(!ends_with_name_word("order_utils__test", "order_utils"));
+        assert!(!ends_with_name_word("", "order_utils"));
+    }
+
+    #[test]
+    fn find_sql_file_prefers_the_clicked_schema() {
+        // Both files match the default mask's glob for `place_order`;
+        // the schema decides which one belongs to the clicked routine.
+        let dir = TempDir::new(
+            "schema-match",
+            &[
+                "order_utils__place_order.sql",
+                "test__order_utils__place_order.sql",
+            ],
+        );
+        assert_eq!(
+            find_sql_file(&dir.0, "*_place_order.sql", "order_utils", "place_order"),
+            Some(dir.0.join("order_utils__place_order.sql"))
+        );
+        // The test routine's own name only matches its own file.
+        assert_eq!(
+            find_sql_file(
+                &dir.0,
+                "*_order_utils__place_order.sql",
+                "test",
+                "order_utils__place_order"
+            ),
+            Some(dir.0.join("test__order_utils__place_order.sql"))
+        );
+    }
+
+    #[test]
+    fn find_sql_file_reads_the_schema_from_a_folder() {
+        let dir = TempDir::new(
+            "schema-folder",
+            &[
+                "test/order_utils__place_order.sql",
+                "order_utils/place_order.sql",
+            ],
+        );
+        // A mask without the leading separator, so the unprefixed file in the
+        // schema folder is a candidate too.
+        assert_eq!(
+            find_sql_file(&dir.0, "*place_order.sql", "order_utils", "place_order"),
+            Some(dir.0.join("order_utils/place_order.sql"))
+        );
+        // And the file under `test/` belongs to the `test` schema's routine.
+        assert_eq!(
+            find_sql_file(
+                &dir.0,
+                "*order_utils__place_order.sql",
+                "test",
+                "order_utils__place_order"
+            ),
+            Some(dir.0.join("test/order_utils__place_order.sql"))
+        );
+    }
+
+    #[test]
+    fn find_sql_file_prefers_an_unqualified_name_to_a_foreign_schema() {
+        let dir = TempDir::new(
+            "schema-plain",
+            &["test__order_utils__place_order.sql", "_place_order.sql"],
+        );
+        assert_eq!(
+            find_sql_file(&dir.0, "*_place_order.sql", "order_utils", "place_order"),
+            Some(dir.0.join("_place_order.sql"))
+        );
+    }
+
+    #[test]
+    fn find_sql_file_falls_back_to_a_plain_glob_match() {
+        // Nothing names the schema, so the only match still wins — and a
+        // deeper alternative loses to the shallower one.
+        let dir = TempDir::new(
+            "schema-none",
+            &["01__place_order.sql", "old/02__place_order.sql"],
+        );
+        assert_eq!(
+            find_sql_file(&dir.0, "*_place_order.sql", "shop", "place_order"),
+            Some(dir.0.join("01__place_order.sql"))
+        );
+        assert_eq!(
+            find_sql_file(&dir.0, "*_no_such_thing.sql", "shop", "no_such_thing"),
+            None
+        );
     }
 
     #[test]
