@@ -489,6 +489,22 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
     path.metadata().ok()?.modified().ok()
 }
 
+/// Replace an editor's whole buffer, keeping the gutter's origin in step.
+/// [`InputState::set_value`] deliberately emits no `Change` event, so the
+/// body-relative line numbering that [`PgGui::on_editor_event`] recomputes on
+/// every edit has to be recomputed here instead — otherwise a routine opened
+/// into an existing buffer keeps plain file numbering until the first keypress.
+fn set_editor_value(
+    state: &mut InputState,
+    text: String,
+    window: &mut Window,
+    cx: &mut Context<InputState>,
+) {
+    let offset = statement::body_line_offset(&text);
+    state.set_value(text, window, cx);
+    state.set_line_number_offset(offset, cx);
+}
+
 /// Whether an object-browser leaf of this kind has a fetchable definition.
 /// Tables are branch nodes (they expand to Indexes/Constraints), so they
 /// never reach here.
@@ -2164,9 +2180,9 @@ impl PgGuiApp {
                             this.config.tabs[i].script.clone_from(&sql);
                             this.tabs[i].saved.clone_from(&sql);
                             this.tabs[i].dirty = false;
-                            this.tabs[i]
-                                .editor
-                                .update(cx, |state, cx| state.set_value(sql, window, cx));
+                            this.tabs[i].editor.update(cx, |state, cx| {
+                                set_editor_value(state, sql, window, cx);
+                            });
                             i
                         }
                         None => this.add_tab(sql, None, window, cx),
@@ -2236,20 +2252,30 @@ impl PgGuiApp {
                 return;
             }
         };
-        // Baseline first, so the Change event set_value emits recomputes the
-        // tab as clean rather than newly dirty.
+        // Replacing the buffer emits no Change event, so the bookkeeping that
+        // one would have done — baseline, config mirror, dirty marker — is all
+        // done here.
         self.tabs[ix].saved.clone_from(&content);
         self.tabs[ix].disk_time = file_mtime(&path);
         self.tabs[ix].diverged = false;
+        self.config.tabs[ix].script.clone_from(&content);
         self.tabs[ix].editor.update(cx, |state, cx| {
             let mut offset = state.cursor().min(content.len());
             while offset > 0 && !content.is_char_boundary(offset) {
                 offset -= 1;
             }
-            state.set_value(content, window, cx);
+            set_editor_value(state, content, window, cx);
             let position = state.text().offset_to_position(offset);
             state.set_cursor_position(position, window, cx);
         });
+        self.refresh_dirty(ix, cx);
+        // The server tracks the active tab's document only.
+        if ix == self.active_tab
+            && let Some(client) = &self.lsp
+        {
+            client.document_changed(self.config.tabs[ix].script.clone());
+        }
+        self.schedule_save(cx);
     }
 
     fn check_config_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4025,7 +4051,7 @@ impl PgGuiApp {
             self.tabs[ix].saved.clone_from(&content);
             self.tabs[ix].dirty = false;
             self.tabs[ix].editor.update(cx, |state, cx| {
-                state.set_value(content, window, cx);
+                set_editor_value(state, content, window, cx);
             });
             ix
         } else {
