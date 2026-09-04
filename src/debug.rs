@@ -14,7 +14,7 @@
 //! spawns the target thread once the entry breakpoint is armed.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use anyhow::{Context as _, Result, anyhow};
@@ -220,11 +220,20 @@ fn controller(launch: Launch) -> Result<()> {
     };
 
     status(&format!("Connecting to {}…", describe_addr(&config)));
-    let mut session = DebugSession::connect(&config)
+    // The control connection is tagged so a target that finishes without ever
+    // trapping can find and cancel the controller's `pldbg_wait_for_target`.
+    let control_tag = control_tag();
+    let mut control_config = config.clone();
+    control_config.application_name(&control_tag);
+    let mut session = DebugSession::connect(&control_config)
         .with_context(|| format!("connecting to {}", describe_addr(&config)))?;
     status(&format!("Resolving {signature}…"));
     let target = session.resolve_target(&signature)?;
     let oid = target.oid;
+
+    // Refuse up front the two setups that can never trap, instead of arming a
+    // breakpoint and waiting forever for a routine that runs straight through.
+    preflight(&config, oid, &target.fq_name)?;
 
     // Arm the entry breakpoint before the target starts, so the very first
     // statement traps and hands control to us. A `false` result means
@@ -237,19 +246,39 @@ fn controller(launch: Launch) -> Result<()> {
         ));
     }
 
+    // Set once the target traps, so the target thread can tell "stepped" from
+    // "ran straight through"; `target_done` marks the routine as finished, so a
+    // cancelled wait is recognised as expected rather than reported as a fault.
+    let attached = Arc::new(AtomicBool::new(false));
+    let target_done = Arc::new(AtomicBool::new(false));
+
     // Now that the trap is set, launch the routine on its own connection.
-    {
-        let event_tx = event_tx.clone();
-        let aborting = aborting.clone();
-        let config = config.clone();
-        let fq_name = target.fq_name.clone();
-        std::thread::Builder::new()
-            .name("pg-debug-target".into())
-            .spawn(move || run_target(&config, oid, &fq_name, &args, &event_tx, &aborting))?;
-    }
+    std::thread::Builder::new()
+        .name("pg-debug-target".into())
+        .spawn({
+            let run = TargetRun {
+                config: config.clone(),
+                oid,
+                fq_name: target.fq_name.clone(),
+                args,
+                control_tag,
+                event_tx: event_tx.clone(),
+                aborting: aborting.clone(),
+                attached: attached.clone(),
+                target_done: target_done.clone(),
+            };
+            move || run_target(&run)
+        })?;
 
     status(&format!("Waiting for {} to be called…", target.fq_name));
-    let pid = session.wait_for_target()?;
+    let pid = match session.wait_for_target() {
+        Ok(pid) => pid,
+        // The routine finished without trapping and cancelled our wait; it has
+        // already reported why, so end quietly.
+        Err(_) if target_done.load(Ordering::SeqCst) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    attached.store(true, Ordering::SeqCst);
     status(&format!("Target attached (pid {pid}); reading state…"));
 
     // Attached at entry: map the editor-relative breakpoint lines to body
@@ -257,14 +286,26 @@ fn controller(launch: Launch) -> Result<()> {
     // in the editor buffer, so its starting line locates the offset.
     if !breakpoints.is_empty() {
         let body = session.get_source(oid).unwrap_or_default();
-        if let Some(base) = body_base_line(&editor_text, &body) {
-            let base = i32::try_from(base).unwrap_or(0);
+        let base = body_base_line(&editor_text, &body).and_then(|base| i32::try_from(base).ok());
+        let mut armed = 0usize;
+        if let Some(base) = base {
             for &editor_line in &breakpoints {
                 let body_line = editor_line - base + 1;
-                if body_line >= 1 {
-                    let _ = session.set_breakpoint(oid, body_line);
+                if body_line >= 1 && session.set_breakpoint(oid, body_line).unwrap_or(false) {
+                    armed += 1;
                 }
             }
+        }
+        // Silently arming nothing is how a "Continue" ends up running the whole
+        // routine, so say it out loud.
+        if armed == 0 {
+            let _ = event_tx.unbounded_send(DebugEvent::Error(format!(
+                "none of the {} editor breakpoint(s) could be armed — the buffer does not \
+                 contain the installed body of {} verbatim, or those lines carry no \
+                 executable statement; set breakpoints in the debug panel gutter instead",
+                breakpoints.len(),
+                target.fq_name
+            )));
         }
     }
 
@@ -419,50 +460,176 @@ fn body_base_line(editor_text: &str, body: &str) -> Option<usize> {
     Some(editor_text[..byte].bytes().filter(|&b| b == b'\n').count())
 }
 
+/// Everything the target thread needs, owned so the spawn closure is `'static`.
+struct TargetRun {
+    config: Config,
+    oid: i32,
+    fq_name: String,
+    args: String,
+    /// `application_name` of the control connection, so a run that never traps
+    /// can cancel the controller's wait instead of leaving it parked forever.
+    control_tag: String,
+    event_tx: async_mpsc::UnboundedSender<DebugEvent>,
+    aborting: Arc<AtomicBool>,
+    attached: Arc<AtomicBool>,
+    target_done: Arc<AtomicBool>,
+}
+
+/// How the target's invocation ended, which decides what the controller and the
+/// panel are told next.
+enum Outcome {
+    /// The routine returned normally (its result was already reported).
+    Completed,
+    /// Connecting, building the call, or the call itself failed (reported).
+    Failed,
+    /// A Stop aborted the call; the controller is tearing the session down.
+    Aborted,
+}
+
 /// The target thread: opens a fresh connection and runs the routine, which
 /// blocks in the backend until the controller continues or aborts it.
-fn run_target(
-    config: &Config,
-    oid: i32,
-    fq_name: &str,
-    args: &str,
-    event_tx: &async_mpsc::UnboundedSender<DebugEvent>,
-    aborting: &AtomicBool,
-) {
-    let mut client = match config.connect(NoTls) {
+fn run_target(run: &TargetRun) {
+    let outcome = invoke_target(run);
+    run.target_done.store(true, Ordering::SeqCst);
+
+    if matches!(outcome, Outcome::Aborted) || run.attached.load(Ordering::SeqCst) {
+        return;
+    }
+
+    // The routine ran (or failed) without the debugger ever attaching: the
+    // controller is still blocked in `pldbg_wait_for_target` and would stay
+    // there for good, so explain the miss and cancel that wait.
+    if matches!(outcome, Outcome::Completed) {
+        let _ = run.event_tx.unbounded_send(DebugEvent::Error(format!(
+            "{} ran to completion without ever trapping — the debugger never attached. \
+             pldebugger only traps when its plugin is loaded into the backend running the \
+             routine: check `SHOW shared_preload_libraries` for plugin_debugger, and that \
+             the call above hits the same routine the breakpoint was armed on (overloads \
+             resolve independently).",
+            run.fq_name
+        )));
+    }
+    cancel_control_wait(&run.config, &run.control_tag);
+    let _ = run.event_tx.unbounded_send(DebugEvent::Terminated);
+}
+
+/// Connect, build the call, run it, and report its result or failure.
+fn invoke_target(run: &TargetRun) -> Outcome {
+    let mut client = match run.config.connect(NoTls) {
         Ok(client) => client,
         Err(err) => {
-            let _ = event_tx.unbounded_send(DebugEvent::Error(format!(
+            let _ = run.event_tx.unbounded_send(DebugEvent::Error(format!(
                 "target connection failed: {}",
                 crate::db::describe(&err)
             )));
-            return;
+            return Outcome::Failed;
         }
     };
 
-    let sql = match build_call_sql(&mut client, oid, fq_name, args) {
+    let sql = match build_call_sql(&mut client, run.oid, &run.fq_name, &run.args) {
         Ok(sql) => sql,
         Err(err) => {
-            let _ = event_tx.unbounded_send(DebugEvent::Error(format!("{err:#}")));
-            return;
+            let _ = run
+                .event_tx
+                .unbounded_send(DebugEvent::Error(format!("{err:#}")));
+            return Outcome::Failed;
         }
     };
-    let _ = event_tx.unbounded_send(DebugEvent::Status(format!("Running target: {sql}")));
+    let _ = run
+        .event_tx
+        .unbounded_send(DebugEvent::Status(format!("Running target: {sql}")));
 
     // Simple query so every column comes back as text, regardless of the
     // routine's return/INOUT types (same reason `db.rs` uses it).
     match client.simple_query(&sql) {
         Ok(messages) => {
-            let _ = event_tx.unbounded_send(DebugEvent::Output(render_messages(&messages)));
+            let _ = run
+                .event_tx
+                .unbounded_send(DebugEvent::Output(render_messages(&messages)));
+            Outcome::Completed
         }
         // A Stop aborts the target mid-call; that error is expected.
-        Err(err) if aborting.load(Ordering::SeqCst) => {
+        Err(err) if run.aborting.load(Ordering::SeqCst) => {
             let _ = err;
+            Outcome::Aborted
         }
         Err(err) => {
-            let _ = event_tx.unbounded_send(DebugEvent::Error(crate::db::describe(&err)));
+            let _ = run
+                .event_tx
+                .unbounded_send(DebugEvent::Error(crate::db::describe(&err)));
+            Outcome::Failed
         }
     }
+}
+
+/// A per-session `application_name` for the control connection.
+fn control_tag() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "pg-gui-debug-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Cancel the controller's `pldbg_wait_for_target`, found by the
+/// `application_name` its connection was tagged with. Best-effort: a server
+/// that will not signal the backend just leaves the wait parked as before.
+fn cancel_control_wait(config: &Config, control_tag: &str) {
+    let Ok(mut client) = config.connect(NoTls) else {
+        return;
+    };
+    let _ = client.execute(
+        "SELECT pg_cancel_backend(pid) FROM pg_stat_activity \
+         WHERE application_name = $1 AND pid <> pg_backend_pid()",
+        &[&control_tag],
+    );
+}
+
+/// The setups pldebugger cannot ever trap on, checked before a breakpoint is
+/// armed: a routine in another language (an SQL one is inlined by the planner
+/// and never enters the plugin at all), and a server whose backends never load
+/// `plugin_debugger`, where the `pldbg_*` calls all succeed but nothing stops.
+fn preflight(config: &Config, oid: i32, fq_name: &str) -> Result<()> {
+    let mut client = config
+        .connect(NoTls)
+        .with_context(|| "opening a preflight connection")?;
+
+    let row = client
+        .query_one(
+            "SELECT l.lanname AS lang FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang \
+             WHERE p.oid = $1::int4::oid",
+            &[&oid],
+        )
+        .with_context(|| format!("looking up the language of {fq_name}"))?;
+    let lang: String = row.get("lang");
+    if lang != "plpgsql" {
+        return Err(anyhow!(
+            "{fq_name} is a LANGUAGE {lang} routine; pldebugger can only step PL/pgSQL, \
+             so it would run to completion without ever stopping"
+        ));
+    }
+
+    // The GUC is superuser-only on many servers; not being able to read it is
+    // no reason to refuse to start.
+    if let Ok(row) = client.query_one("SHOW shared_preload_libraries", &[]) {
+        let libs: String = row.get(0);
+        if !libs.contains("plugin_debugger") {
+            let listed = if libs.trim().is_empty() {
+                "the server preloads none".to_string()
+            } else {
+                format!("the server preloads {libs}")
+            };
+            return Err(anyhow!(
+                "plugin_debugger is not in shared_preload_libraries ({listed}). The pldbgapi \
+                 functions all work without it — the library loads on demand here — but \
+                 PL/pgSQL only picks up the debugger hook at backend start, so the routine \
+                 runs straight through instead of trapping. Add plugin_debugger to \
+                 shared_preload_libraries and restart the server"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Build the statement that invokes the routine. Procedures need `CALL`;
