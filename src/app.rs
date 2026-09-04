@@ -4769,14 +4769,29 @@ impl PgGuiApp {
             .child(
                 // Results table with pager — replaced by the debug panel while
                 // a debug session is active.
-                resizable_panel().child(if debugging {
-                    self.render_debug_panel(cx).into_any_element()
-                } else {
-                    match self.bottom_view {
-                        BottomView::Data => self.render_data_view(cx).into_any_element(),
-                        BottomView::Log => self.render_log(cx).into_any_element(),
-                    }
-                }),
+                //
+                // The content sits out of the panel's flow (the panel itself is
+                // `relative`) and clips: a stepped routine's source, or a long
+                // message log, is taller than the panel, and in flow that
+                // height becomes the panel's own layout size — which squeezes
+                // the editor above and leaves the content painting over it.
+                // Absolute keeps the panel at the height the splitter gave it,
+                // and the background covers anything the editor spills into it.
+                resizable_panel().child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .overflow_hidden()
+                        .bg(cx.theme().background)
+                        .child(if debugging {
+                            self.render_debug_panel(cx).into_any_element()
+                        } else {
+                            match self.bottom_view {
+                                BottomView::Data => self.render_data_view(cx).into_any_element(),
+                                BottomView::Log => self.render_log(cx).into_any_element(),
+                            }
+                        }),
+                ),
             )
             .into_any_element()
     }
@@ -5561,21 +5576,31 @@ impl PgGuiApp {
         let body = h_flex()
             .flex_1()
             .min_h(px(0.))
+            .overflow_hidden()
             .gap_2()
             .child(
                 div()
                     .flex_1()
                     .min_w(px(0.))
+                    .h_full()
+                    .overflow_hidden()
                     .child(self.render_debug_source(cx)),
             )
             .child(
                 div()
                     .w(px(360.))
                     .flex_none()
+                    .h_full()
+                    .overflow_hidden()
                     .child(self.render_debug_sidebar(cx)),
             );
+        // A long routine's result is one line; keep it from growing the panel.
         let output = dbg.output.as_ref().map(|out| {
             div()
+                .id("dbg-output")
+                .flex_none()
+                .max_h(px(64.))
+                .overflow_y_scroll()
                 .px_2()
                 .py_1()
                 .text_sm()
