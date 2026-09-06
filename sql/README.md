@@ -22,7 +22,9 @@ file per object:
 09 matviews/     materialized views, created WITH NO DATA
 10 constraints/  FK/CHECK/UNIQUE as ALTER TABLE ADD, so a circular FK is expressible
 11 triggers/     needs both the table and the trigger function
-12 data/         the rows loaded into those tables
+12 upgrade/      the rows loaded into those tables, and every later change to
+                 an object already created above — `ALTER TABLE`, `UPDATE`,
+                 backfills
 13 indexes/      built once over the loaded data, not maintained row by row
 14 refresh/      REFRESH MATERIALIZED VIEW, once the data is in
 15 grants/       privileges, and the pgui search_path setting
@@ -36,7 +38,7 @@ Naming — one scheme, `V` or `R` picking how the file is applied:
 `<V|R>.<reserved>.<object_order>.<dependency_order>.<n>__<name>.sql`
 
 - `V` — versioned, applied once (schemas, types, sequences, tables,
-  constraints, data, indexes).
+  constraints, upgrades, indexes).
 - `R` — repeatable, safe to re-apply (extensions, routines, views, triggers,
   grants). Every `V` in a folder runs before that folder's first `R`.
 - `reserved` — always `0` for now; held back for a release or branch number.
@@ -44,12 +46,13 @@ Naming — one scheme, `V` or `R` picking how the file is applied:
   its position once the file is read out of its folder.
 - `dependency_order` — order within the folder: `orders` (02) is created after
   the `customers` (01) it references.
-- `n` — successive migrations of that one object, starting at `1`. Altering the
-  `customers` table later adds `V.0.06.01.2__customers.sql` beside it. `R`
-  scripts stay at `1`: a repeatable script is revised in place, since re-running
-  it is the whole point.
+- `n` — successive migrations of that one object, starting at `1`. `R` scripts
+  stay at `1`: a repeatable script is revised in place, since re-running it is
+  the whole point.
 - Numbers are zero-padded to two digits because the scripts are sorted
   `LC_ALL=C`, where `10` sorts before `2`.
+
+`upgrade/` is the one folder that names its files differently — see below.
 
 `00-run-init.sh` is the entry point. The postgres entrypoint globs
 `/docker-entrypoint-initdb.d/*` and **ignores directories**, so it never sees
@@ -57,9 +60,43 @@ these folders; the script walks them itself, in the dependency order listed
 above, and runs each folder's `V*` scripts before its `R*` ones. Adding a file
 to an existing folder needs no change to the script; a new folder does.
 
+`upgrade/` is where a schema stops being a fresh create. A `CREATE` file under
+`tables/`, `types/`, `views/`, … describes the object as it was first written,
+and is never edited afterwards once a database exists that already ran it;
+every later change to that object — `ALTER TABLE ADD COLUMN`, a type widening,
+a backfill `UPDATE`, as well as the initial `INSERT`s — is a new `V` file in
+`upgrade/`:
+
+`V.<YYYY>.<MM>.<DD>.<HH>.<MI>__<name>.sql`
+
+Nothing but a UTC timestamp, minute precision — no `reserved`, no
+`object_order`, no `n`:
+
+```
+V.2026.09.06.10.42__customers.sql
+```
+
+- The other folders pick the next free `dependency_order` by looking at what is
+  already there, which is exactly what two branches do independently before
+  both claiming `05`. A timestamp is read off the clock instead, so parallel
+  work lands on distinct names and merges without a rename. `upgrade/` is the
+  only folder that grows on every branch, which is why only it needs this.
+- The dropped fields carried no information here. `object_order` recorded the
+  folder, and there is only one folder whose files look like this; `n` numbered
+  successive migrations of one object, and the timestamp already orders and
+  separates them.
+- Timestamps sort chronologically under `LC_ALL=C` (every field fixed width and
+  all digits), and chronological is the correct run order: an upgrade can only
+  touch objects that already exist when it is written. Two upgrades in the same
+  minute — bump one by a minute.
+
+`R` files in `upgrade/` would be a contradiction — a one-time change re-applied
+— so the folder holds `V` only. A routine or view that is *rewritten* is not an
+upgrade at all: edit its `R` file in `functions/` or `views/` in place.
+
 Two placements are deliberate and worth keeping:
 
-- `constraints` before `data`, so the seed rows are validated on the way in.
+- `constraints` before `upgrade`, so the seed rows are validated on the way in.
   Flip the two only if loading gets slow.
 - `functions` before `views`, because a view may call a function. A
   `LANGUAGE sql` function body *is* parsed at creation, so such a function over

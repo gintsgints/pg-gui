@@ -2,7 +2,9 @@
 # Runs the seed scripts laid out under sql/: one folder per object type, one
 # file per object, named
 # <V|R>.<reserved>.<object_order>.<dependency_order>.<n>__<name>.sql — V for
-# things created once, R for things that are safe to re-apply.
+# things created once, R for things that are safe to re-apply. Files in
+# upgrade/ are named V.<YYYY>.<MM>.<DD>.<HH>.<MI>__<name>.sql instead, so
+# branches never claim the same number; they still sort in run order.
 #
 # The postgres entrypoint globs /docker-entrypoint-initdb.d/* and ignores
 # directories, so this script is the single entry point it does see; it walks
@@ -30,7 +32,7 @@ folders=(
     matviews    # 09
     constraints # 10
     triggers    # 11
-    data        # 12
+    upgrade     # 12
     indexes     # 13
     refresh     # 14
     grants      # 15
