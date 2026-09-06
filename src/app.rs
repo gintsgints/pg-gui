@@ -745,8 +745,8 @@ fn definition_name(words: &[String], keyword: usize) -> Option<&str> {
 }
 
 /// How well a file's *contents* fit the clicked object, lower being better.
-/// The filename alone cannot tell `tables/V.0.0.1.1__customers.sql` from
-/// `data/V.0.0.1.1__customers.sql`; the statement in the body can.
+/// The filename alone cannot tell `tables/V.0.06.01.1__customers.sql` from
+/// `data/V.0.12.01.1__customers.sql`; the statement in the body can.
 ///
 /// - 0 — the file defines this very object.
 /// - 1 — the file defines no object of this kind, so it says nothing either
@@ -6176,11 +6176,11 @@ mod tests {
             "content-rank",
             &[
                 (
-                    "data/V.0.0.1.1__customers.sql",
+                    "data/V.0.12.01.1__customers.sql",
                     "INSERT INTO customers (name) SELECT 'x';",
                 ),
                 (
-                    "tables/V.0.0.1.1__customers.sql",
+                    "tables/V.0.06.01.1__customers.sql",
                     "CREATE TABLE customers (\n    id serial PRIMARY KEY\n);",
                 ),
             ],
@@ -6193,7 +6193,7 @@ mod tests {
                 "public",
                 "customers"
             ),
-            Some(dir.0.join("tables/V.0.0.1.1__customers.sql"))
+            Some(dir.0.join("tables/V.0.06.01.1__customers.sql"))
         );
     }
 

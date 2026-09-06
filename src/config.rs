@@ -137,7 +137,7 @@ pub struct Config {
     /// `*` matches any run of characters, `?` any single one; matching is
     /// case-insensitive. Default `*_{object}.sql`, which matches both
     /// single- and double-underscore separators (e.g. `R__001_add.sql`
-    /// and `01__place_order.sql`). When several files match, their bodies pick
+    /// and `R.0.07.04.1__place_order.sql`). When several files match, their bodies pick
     /// between them first: the file carrying the object's own `CREATE`
     /// statement wins, and one defining some *other* object of the same kind
     /// loses to one that defines nothing at all. Files their bodies cannot

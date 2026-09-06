@@ -6,7 +6,7 @@ procedure step by step.
 
 ## The target
 
-`place_order` (from `sql/functions/R__004_place_order.sql`) is a plpgsql procedure with
+`place_order` (from `sql/functions/R.0.07.04.1__place_order.sql`) is a plpgsql procedure with
 two statements: it inserts a row into `orders`, then a row into `order_events`.
 
 ```sql
@@ -125,7 +125,7 @@ Session B now unblocks and `CALL` returns with `p_order_id` set.
   `SELECT pldbg_oid_debug('place_order'::regproc::oid);` before the `CALL`; the
   backend then waits for a debugger to attach. Global mode is what a GUI uses.
 - **Schema** — the extension installs into `public` (no `SCHEMA` clause in
-  `sql/extensions/R__002_pldbgapi.sql`), so unqualified `pldbg_*` names
+  `sql/extensions/R.0.01.02.1__pldbgapi.sql`), so unqualified `pldbg_*` names
   resolve. If
   moved to a dedicated schema, qualify every call (`debug.pldbg_*`).
 - **Cleanup** — `SELECT pldbg_abort_target(1);` kills a trapped execution instead

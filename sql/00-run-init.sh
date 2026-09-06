@@ -1,8 +1,8 @@
 #!/bin/bash
 # Runs the seed scripts laid out under sql/: one folder per object type, one
-# file per object, versioned (V.<version>__<name>.sql) scripts for things
-# created once and repeatable (R__<nnn>_<name>.sql) scripts for things that are
-# safe to re-apply.
+# file per object, named
+# <V|R>.<reserved>.<object_order>.<dependency_order>.<n>__<name>.sql — V for
+# things created once, R for things that are safe to re-apply.
 #
 # The postgres entrypoint globs /docker-entrypoint-initdb.d/* and ignores
 # directories, so this script is the single entry point it does see; it walks
@@ -12,10 +12,29 @@ set -euo pipefail
 
 init_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Dependency order, not alphabetical: extensions first, then the schemas and
-# tables the data is loaded into, then the routines over those tables, and
-# finally role settings.
-folders=(extensions schemas tables data functions roles)
+# Dependency order, not alphabetical: extensions first, then the roles and
+# schemas everything else is owned by, the types and tables the data is loaded
+# into, the routines and views over those tables, and finally the privileges.
+# A folder's position here is the `<object_order>` field of its V scripts'
+# names; keep the two in step when adding one. Missing folders are skipped, so
+# a folder only has to exist once it holds a file.
+folders=(
+    extensions  # 01
+    roles       # 02
+    schemas     # 03
+    types       # 04
+    sequences   # 05
+    tables      # 06
+    functions   # 07
+    views       # 08
+    matviews    # 09
+    constraints # 10
+    triggers    # 11
+    data        # 12
+    indexes     # 13
+    refresh     # 14
+    grants      # 15
+)
 
 run_file() {
     printf '%s: running %s\n' "$0" "${1#"$init_dir"/}"
