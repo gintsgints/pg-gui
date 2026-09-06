@@ -45,9 +45,16 @@ pub enum DebugEvent {
 
 /// A snapshot of the paused target: the source being stepped, the current
 /// line, the call stack, and the variables of the active frame.
+///
+/// Everything but `stack` describes the *selected* frame, which is the
+/// innermost one at every stop but follows [`Session::select_frame`] after
+/// that — so inspecting a caller shows that caller's source, line and
+/// variables, not the innermost frame's.
 pub struct StopState {
     pub line: i32,
     pub source: String,
+    /// Level of the frame `line`/`source`/`variables` belong to.
+    pub frame: i32,
     pub stack: Vec<Frame>,
     pub variables: Vec<Var>,
 }
@@ -57,10 +64,15 @@ enum Command {
     StepOver,
     StepInto,
     Continue,
-    SetBreakpoint(i32),
-    DropBreakpoint(i32),
+    /// 0-based editor row; mapped to a body line by the controller, which is
+    /// the side that knows the entry routine's installed source.
+    SetBreakpoint(usize),
+    DropBreakpoint(usize),
     SelectFrame(i32),
-    Deposit { name: String, value: String },
+    Deposit {
+        name: String,
+        value: String,
+    },
     Stop,
 }
 
@@ -92,7 +104,7 @@ impl Session {
         conn_str: &str,
         signature: &str,
         args: &str,
-        breakpoints: &[i32],
+        breakpoints: &[usize],
         editor_text: &str,
         stop_on_entry: bool,
     ) -> Result<(Self, DebugEventReceiver)> {
@@ -151,12 +163,14 @@ impl Session {
         let _ = self.cmd_tx.send(Command::Continue);
     }
 
-    pub fn set_breakpoint(&self, line: i32) {
-        let _ = self.cmd_tx.send(Command::SetBreakpoint(line));
+    /// Arm a breakpoint on a 0-based editor row of the debugged buffer.
+    pub fn set_breakpoint(&self, row: usize) {
+        let _ = self.cmd_tx.send(Command::SetBreakpoint(row));
     }
 
-    pub fn drop_breakpoint(&self, line: i32) {
-        let _ = self.cmd_tx.send(Command::DropBreakpoint(line));
+    /// Clear the breakpoint on a 0-based editor row of the debugged buffer.
+    pub fn drop_breakpoint(&self, row: usize) {
+        let _ = self.cmd_tx.send(Command::DropBreakpoint(row));
     }
 
     pub fn select_frame(&self, level: i32) {
@@ -190,7 +204,7 @@ struct Launch {
     signature: String,
     args: String,
     /// Editor-relative 0-based line numbers, mapped to body lines after attach.
-    breakpoints: Vec<i32>,
+    breakpoints: Vec<usize>,
     /// The editor buffer, used to map editor lines to `pldbg` body lines.
     editor_text: String,
     stop_on_entry: bool,
@@ -283,17 +297,17 @@ fn controller(launch: Launch) -> Result<()> {
 
     // Attached at entry: map the editor-relative breakpoint lines to body
     // lines and arm them. The body source (`pldbg_get_source`) appears verbatim
-    // in the editor buffer, so its starting line locates the offset.
+    // in the editor buffer, so its starting line locates the offset. Kept for
+    // the whole session, so gutter toggles during the run map the same way.
+    let entry_body = session.get_source(oid).unwrap_or_default();
     if !breakpoints.is_empty() {
-        let body = session.get_source(oid).unwrap_or_default();
-        let base = body_base_line(&editor_text, &body).and_then(|base| i32::try_from(base).ok());
         let mut armed = 0usize;
-        if let Some(base) = base {
-            for &editor_line in &breakpoints {
-                let body_line = editor_line - base + 1;
-                if body_line >= 1 && session.set_breakpoint(oid, body_line).unwrap_or(false) {
-                    armed += 1;
-                }
+        for &row in &breakpoints {
+            let Some(body_line) = body_line_of(&editor_text, &entry_body, row) else {
+                continue;
+            };
+            if session.set_breakpoint(oid, body_line).unwrap_or(false) {
+                armed += 1;
             }
         }
         // Silently arming nothing is how a "Continue" ends up running the whole
@@ -302,7 +316,7 @@ fn controller(launch: Launch) -> Result<()> {
             let _ = event_tx.unbounded_send(DebugEvent::Error(format!(
                 "none of the {} editor breakpoint(s) could be armed — the buffer does not \
                  contain the installed body of {} verbatim, or those lines carry no \
-                 executable statement; set breakpoints in the debug panel gutter instead",
+                 executable statement",
                 breakpoints.len(),
                 target.fq_name
             )));
@@ -321,7 +335,11 @@ fn controller(launch: Launch) -> Result<()> {
 
     command_loop(
         &mut session,
-        oid,
+        &Entry {
+            oid,
+            editor_text,
+            body: entry_body,
+        },
         &config,
         pid,
         &cmd_rx,
@@ -330,40 +348,60 @@ fn controller(launch: Launch) -> Result<()> {
     )
 }
 
+/// The routine the session was launched on, plus the two texts the controller
+/// maps gutter rows through: the editor buffer as it was at launch, and that
+/// routine's installed body. Breakpoints are always armed on this routine,
+/// whichever frame the panel is inspecting.
+struct Entry {
+    oid: i32,
+    editor_text: String,
+    /// The routine's installed body, as `pldbg_get_source` returns it.
+    body: String,
+}
+
 /// Serve control commands until the target finishes, the user stops, or the
 /// handle is dropped.
 fn command_loop(
     session: &mut DebugSession,
-    oid: i32,
+    entry: &Entry,
     config: &Config,
     pid: i32,
     cmd_rx: &Receiver<Command>,
     event_tx: &async_mpsc::UnboundedSender<DebugEvent>,
     aborting: &AtomicBool,
 ) -> Result<()> {
+    // Which frame the panel is inspecting. A step or continue lands in the
+    // innermost frame again, and pldebugger resets its own selection with it.
+    let mut selected = 0;
     while let Ok(cmd) = cmd_rx.recv() {
         let stepped = match cmd {
             Command::StepOver => Some(session.step_over()?),
             Command::StepInto => Some(session.step_into()?),
             Command::Continue => Some(session.continue_()?),
-            Command::SetBreakpoint(line) => {
-                let _ = session.set_breakpoint(oid, line);
+            Command::SetBreakpoint(row) => {
+                if let Some(line) = body_line_of(&entry.editor_text, &entry.body, row) {
+                    let _ = session.set_breakpoint(entry.oid, line);
+                }
                 None
             }
-            Command::DropBreakpoint(line) => {
-                let _ = session.drop_breakpoint(oid, line);
+            Command::DropBreakpoint(row) => {
+                if let Some(line) = body_line_of(&entry.editor_text, &entry.body, row) {
+                    let _ = session.drop_breakpoint(entry.oid, line);
+                }
                 None
             }
             Command::SelectFrame(level) => {
                 if session.select_frame(level).is_ok() {
-                    report_top(session, event_tx);
+                    selected = level;
+                    report_frame(session, event_tx, selected);
                 }
                 None
             }
             Command::Deposit { name, value } => {
                 let _ = session.deposit_value(&name, -1, &value);
-                // Re-read so the changed value shows immediately.
-                report_top(session, event_tx);
+                // Re-read so the changed value shows immediately — of the frame
+                // being inspected, which is the one the value was edited in.
+                report_frame(session, event_tx, selected);
                 None
             }
             Command::Stop => {
@@ -378,6 +416,7 @@ fn command_loop(
         // A step/continue that returned `None` (or ran off an empty stack) means
         // the target is done.
         if let Some(stop) = stepped {
+            selected = 0;
             let alive = stop.is_some() && report_top(session, event_tx);
             if !alive {
                 finish(event_tx);
@@ -393,24 +432,44 @@ fn command_loop(
     Ok(())
 }
 
-/// Gather stack + source + variables for the current stop and emit a
-/// [`DebugEvent::Stopped`]. Returns `false` when the stack is empty (the target
-/// has run off the end), so the caller can terminate.
+/// [`report_frame`] for the innermost frame — where every fresh stop lands.
 fn report_top(
     session: &mut DebugSession,
     event_tx: &async_mpsc::UnboundedSender<DebugEvent>,
 ) -> bool {
+    report_frame(session, event_tx, 0)
+}
+
+/// Gather the stack, plus the source, line and variables of frame `level`, and
+/// emit a [`DebugEvent::Stopped`]. Returns `false` when the stack is empty (the
+/// target has run off the end), so the caller can terminate.
+///
+/// `pldbg_get_variables` reports the frame `pldbg_select_frame` last selected,
+/// so `level` must be that frame for the source and variables to describe the
+/// same one.
+fn report_frame(
+    session: &mut DebugSession,
+    event_tx: &async_mpsc::UnboundedSender<DebugEvent>,
+    level: i32,
+) -> bool {
     let stack = session.get_stack().unwrap_or_default();
-    let Some(top) = stack.first() else {
+    // A level the stack no longer has (it shrank under us) falls back to the
+    // innermost frame rather than reporting nothing.
+    let Some(frame) = stack
+        .iter()
+        .find(|frame| frame.level == level)
+        .or_else(|| stack.first())
+    else {
         return false;
     };
-    let line = top.line;
-    let source = session.get_source(top.func_oid).unwrap_or_default();
+    let (line, func_oid, frame) = (frame.line, frame.func_oid, frame.level);
+    let source = session.get_source(func_oid).unwrap_or_default();
     let variables = session.get_variables().unwrap_or_default();
     event_tx
         .unbounded_send(DebugEvent::Stopped(StopState {
             line,
             source,
+            frame,
             stack,
             variables,
         }))
@@ -458,6 +517,30 @@ fn body_base_line(editor_text: &str, body: &str) -> Option<usize> {
     }
     let byte = editor_text.find(body)?;
     Some(editor_text[..byte].bytes().filter(|&b| b == b'\n').count())
+}
+
+/// The 0-based editor line showing body line `body_line` of `body` — the
+/// inverse of the breakpoint mapping above, used to walk the editor cursor
+/// along with the debugger.
+///
+/// `None` when the buffer does not hold that body verbatim: the routine was
+/// stepped into from another file, or the buffer was edited since it was
+/// installed. Guessing a line there would highlight the wrong statement, so
+/// the caller leaves the cursor where it is instead.
+pub fn editor_line_of(editor_text: &str, body: &str, body_line: i32) -> Option<usize> {
+    let base = body_base_line(editor_text, body)?;
+    let line = usize::try_from(body_line).ok()?;
+    Some(base + line.checked_sub(1)?)
+}
+
+/// The `pldbg` body line shown on 0-based editor `row` — the mapping the launch
+/// breakpoints and the gutter toggles during a run are both armed through.
+///
+/// `None` when the row sits above the body, or when the buffer does not hold
+/// that body verbatim.
+fn body_line_of(editor_text: &str, body: &str, row: usize) -> Option<i32> {
+    let base = body_base_line(editor_text, body)?;
+    i32::try_from(row.checked_sub(base)? + 1).ok()
 }
 
 /// Everything the target thread needs, owned so the spawn closure is `'static`.
@@ -679,5 +762,55 @@ fn render_messages(messages: &[SimpleQueryMessage]) -> String {
         "(no rows)".to_string()
     } else {
         rows.join("; ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{body_line_of, editor_line_of};
+
+    /// `pldbg_get_source` returns the body starting right after the opening
+    /// `$function$`, so its body line 1 is the line carrying that delimiter —
+    /// the same origin the editor gutter counts from.
+    #[test]
+    fn body_lines_map_back_onto_editor_rows() {
+        let editor = "CREATE OR REPLACE FUNCTION f()\n\
+                      RETURNS int\n\
+                      LANGUAGE plpgsql\n\
+                      AS $function$\n\
+                      BEGIN\n\
+                      RETURN 1;\n\
+                      END;\n\
+                      $function$;\n";
+        let body = "\nBEGIN\nRETURN 1;\nEND;\n";
+        // Body line 1 is the `AS $function$` row (0-based row 3).
+        assert_eq!(editor_line_of(editor, body, 1), Some(3));
+        assert_eq!(editor_line_of(editor, body, 3), Some(5));
+    }
+
+    /// Gutter toggles map the other way, back onto the lines the launch
+    /// breakpoints are armed on.
+    #[test]
+    fn editor_rows_map_onto_body_lines() {
+        let editor =
+            "CREATE FUNCTION f() RETURNS int\nAS $function$\nBEGIN\nRETURN 1;\nEND;\n$function$;\n";
+        let body = "\nBEGIN\nRETURN 1;\nEND;\n";
+        assert_eq!(body_line_of(editor, body, 1), Some(1));
+        assert_eq!(body_line_of(editor, body, 3), Some(3));
+        // Rows above the body have no body line.
+        assert_eq!(body_line_of(editor, body, 0), None);
+    }
+
+    #[test]
+    fn a_body_the_buffer_does_not_hold_has_no_row() {
+        assert_eq!(editor_line_of("SELECT 1;\n", "\nBEGIN\nEND;\n", 2), None);
+        assert_eq!(editor_line_of("SELECT 1;\n", "", 1), None);
+    }
+
+    /// Line 0 is pldebugger's "no line" marker, not a row above the body.
+    #[test]
+    fn line_zero_has_no_row() {
+        let editor = "AS $$\nBEGIN\nEND;\n$$;\n";
+        assert_eq!(editor_line_of(editor, "\nBEGIN\nEND;\n", 0), None);
     }
 }

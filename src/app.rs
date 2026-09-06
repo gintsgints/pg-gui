@@ -1208,13 +1208,13 @@ impl TabResult {
 /// replaces the results table while active.
 struct DebugState {
     session: debug::Session,
+    /// Id of the tab the session was launched from, so each stop can move that
+    /// editor's cursor onto the line being executed even if tabs were
+    /// reordered or the user switched away.
+    tab_id: u64,
     /// The most recent stop (source, current line, stack, variables). `None`
     /// before the first stop.
     stop: Option<debug::StopState>,
-    /// Breakpoint lines the user has toggled — body-relative to the debugged
-    /// source, matching `pldbg_get_source` line numbers. Drawn in the gutter
-    /// and mirrored to the session.
-    breakpoints: HashSet<i32>,
     /// The debugged routine's result once it returns.
     output: Option<String>,
     /// The latest progress note shown in the panel before the first stop
@@ -2659,6 +2659,7 @@ impl PgGuiApp {
             let set = state.read(cx).breakpoints().contains(line);
             let verb = if set { "set" } else { "cleared" };
             self.set_status(format!("Breakpoint {verb}: line {}", line + 1), cx);
+            self.sync_debug_breakpoint(state, *line, set);
             return;
         }
         if !matches!(event, InputEvent::Change) {
@@ -5482,15 +5483,12 @@ impl PgGuiApp {
         cx: &mut Context<Self>,
     ) {
         let conn = self.config.connection_string.clone();
+        let tab_id = self.tabs[self.active_tab].id;
         // Breakpoints set in the editor gutter (0-based buffer lines) plus the
         // buffer itself, so the session can map them to pldbg body lines.
         let (editor_text, breakpoints) = {
             let editor = self.editor().read(cx);
-            let mut lines: Vec<i32> = editor
-                .breakpoints()
-                .iter()
-                .filter_map(|&line| i32::try_from(line).ok())
-                .collect();
+            let mut lines: Vec<usize> = editor.breakpoints().iter().copied().collect();
             lines.sort_unstable();
             (editor.value().to_string(), lines)
         };
@@ -5509,7 +5507,7 @@ impl PgGuiApp {
                 })
                 .await;
             this.update(cx, |this, cx| match result {
-                Ok((session, events)) => this.attach_debug(session, events, cx),
+                Ok((session, events)) => this.attach_debug(session, tab_id, events, cx),
                 Err(err) => this.set_status(format!("Debug failed to start: {err:#}"), cx),
             })
             .ok();
@@ -5521,13 +5519,14 @@ impl PgGuiApp {
     fn attach_debug(
         &mut self,
         session: debug::Session,
+        tab_id: u64,
         mut events: debug::DebugEventReceiver,
         cx: &mut Context<Self>,
     ) {
         self.debug = Some(DebugState {
             session,
+            tab_id,
             stop: None,
-            breakpoints: HashSet::new(),
             output: None,
             status: "Starting…".to_string(),
             terminated: false,
@@ -5553,9 +5552,13 @@ impl PgGuiApp {
         };
         let mut status = None;
         let mut keep = true;
+        let mut stopped = false;
         match event {
             debug::DebugEvent::Status(note) => dbg.status = note,
-            debug::DebugEvent::Stopped(stop) => dbg.stop = Some(stop),
+            debug::DebugEvent::Stopped(stop) => {
+                dbg.stop = Some(stop);
+                stopped = true;
+            }
             debug::DebugEvent::Output(output) => dbg.output = Some(output),
             debug::DebugEvent::Error(err) => {
                 dbg.output = Some(err.clone());
@@ -5567,11 +5570,46 @@ impl PgGuiApp {
                 keep = false;
             }
         }
+        if stopped {
+            self.select_debug_line(cx);
+        }
         if let Some(status) = status {
             self.set_status(status, cx);
         }
         cx.notify();
         keep
+    }
+
+    /// Select the line the debugger is parked on in the editor the session was
+    /// launched from, so stepping walks the cursor through the source and
+    /// scrolls it into view alongside the debug panel.
+    ///
+    /// Silently does nothing when the stop is not locatable in that buffer —
+    /// a routine stepped into from elsewhere, or a buffer edited since the
+    /// routine was installed.
+    fn select_debug_line(&mut self, cx: &mut Context<Self>) {
+        let Some(dbg) = self.debug.as_ref() else {
+            return;
+        };
+        let Some(stop) = dbg.stop.as_ref() else {
+            return;
+        };
+        let line = stop.line;
+        let source = stop.source.clone();
+        let Some(ix) = self.tab_index_by_id(dbg.tab_id) else {
+            return;
+        };
+        self.tabs[ix].editor.clone().update(cx, |state, cx| {
+            let Some(row) = debug::editor_line_of(&state.value(), &source, line) else {
+                return;
+            };
+            let text = state.text();
+            if row >= text.lines_len() {
+                return;
+            }
+            let range = text.line_start_offset(row)..text.line_end_offset(row);
+            state.set_selected_range(range, cx);
+        });
     }
 
     pub fn debug_step_over(&mut self, _: &DebugStepOver, _: &mut Window, _: &mut Context<Self>) {
@@ -5607,16 +5645,27 @@ impl PgGuiApp {
         cx.notify();
     }
 
-    /// Toggle a breakpoint on a body-relative source line from the gutter.
-    fn toggle_breakpoint(&mut self, line: i32, cx: &mut Context<Self>) {
-        if let Some(dbg) = self.debug.as_mut() {
-            if dbg.breakpoints.remove(&line) {
-                dbg.session.drop_breakpoint(line);
-            } else {
-                dbg.breakpoints.insert(line);
-                dbg.session.set_breakpoint(line);
-            }
-            cx.notify();
+    /// Mirror an editor gutter toggle onto a live session, so breakpoints can
+    /// be added and removed mid-run and not only at launch.
+    ///
+    /// The row is sent as-is: the controller owns the row → `pldbg` body-line
+    /// mapping, because only it knows the entry routine's installed source —
+    /// the frame the panel happens to be inspecting is not necessarily the
+    /// routine a breakpoint would be armed on.
+    fn sync_debug_breakpoint(&self, editor: &Entity<InputState>, row: usize, set: bool) {
+        let Some(dbg) = self.debug.as_ref().filter(|dbg| !dbg.terminated) else {
+            return;
+        };
+        let Some(ix) = self.tab_index_by_id(dbg.tab_id) else {
+            return;
+        };
+        if self.tabs[ix].editor != *editor {
+            return;
+        }
+        if set {
+            dbg.session.set_breakpoint(row);
+        } else {
+            dbg.session.drop_breakpoint(row);
         }
     }
 
@@ -5726,27 +5775,17 @@ impl PgGuiApp {
                         this.debug_stop(&DebugStop, window, cx);
                     })),
             );
-        let body = h_flex()
+        // The stepped source lives in the editor itself — the selection follows
+        // each stop — so the panel only carries the state around it.
+        let body = div()
             .flex_1()
             .min_h(px(0.))
             .overflow_hidden()
-            .gap_2()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .h_full()
-                    .overflow_hidden()
-                    .child(self.render_debug_source(cx)),
-            )
-            .child(
-                div()
-                    .w(px(360.))
-                    .flex_none()
-                    .h_full()
-                    .overflow_hidden()
-                    .child(self.render_debug_sidebar(cx)),
-            );
+            .child(if dbg.stop.is_some() {
+                self.render_debug_sidebar(cx)
+            } else {
+                self.render_debug_status(cx)
+            });
         // A long routine's result is one line; keep it from growing the panel.
         let output = dbg.output.as_ref().map(|out| {
             div()
@@ -5768,85 +5807,55 @@ impl PgGuiApp {
             .into_any_element()
     }
 
-    /// The stepped source with a line-number/breakpoint gutter and the current
-    /// line highlighted. Lines are body-relative, matching `pldbg_get_source`.
-    fn render_debug_source(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// What the session is doing before its first stop (connecting, waiting
+    /// for the target to trap), plus any output or error, so a run that never
+    /// traps is visible rather than silent. Once stopped, the panel shows the
+    /// variables/stack instead and the source is read in the editor.
+    fn render_debug_status(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(dbg) = self.debug.as_ref() else {
             return div().into_any_element();
         };
-        let Some(stop) = dbg.stop.as_ref() else {
-            // No stop yet: show the live phase, plus any output/error so a
-            // failure or a target that never trapped is visible, not silent.
-            let mut pane = v_flex()
-                .p_2()
-                .gap_2()
-                .text_color(cx.theme().muted_foreground);
-            pane = pane.child(if dbg.terminated {
-                format!("Session ended before stopping. {}", dbg.status)
-            } else {
-                format!("{}…", dbg.status.trim_end_matches('…'))
-            });
-            if let Some(output) = &dbg.output {
-                pane = pane.child(div().child(format!("Target: {output}")));
-            }
-            return pane.into_any_element();
-        };
-        let current = stop.line;
-        let mut lines = v_flex()
-            .p_1()
-            .font_family(cx.theme().mono_font_family.clone())
-            .text_size(cx.theme().mono_font_size);
-        for (index, text) in stop.source.lines().enumerate() {
-            let lineno = i32::try_from(index).unwrap_or(0) + 1;
-            let has_bp = dbg.breakpoints.contains(&lineno);
-            let mut row = h_flex().gap_2();
-            if lineno == current {
-                row = row.bg(cx.theme().list_active);
-            }
-            let gutter_color = if has_bp {
-                cx.theme().danger
-            } else {
-                cx.theme().muted_foreground
-            };
-            lines = lines.child(
-                row.child(
-                    div()
-                        .w(px(52.))
-                        .flex_none()
-                        .text_right()
-                        .pr_2()
-                        .cursor_pointer()
-                        .text_color(gutter_color)
-                        .child(if has_bp {
-                            format!("● {lineno}")
-                        } else {
-                            lineno.to_string()
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| this.toggle_breakpoint(lineno, cx)),
-                        ),
-                )
-                .child(div().whitespace_nowrap().child(text.to_string())),
-            );
+        let mut pane = v_flex()
+            .p_2()
+            .gap_2()
+            .text_color(cx.theme().muted_foreground);
+        pane = pane.child(if dbg.terminated {
+            format!("Session ended before stopping. {}", dbg.status)
+        } else {
+            format!("{}…", dbg.status.trim_end_matches('…'))
+        });
+        if let Some(output) = &dbg.output {
+            pane = pane.child(div().child(format!("Target: {output}")));
         }
-        div()
-            .id("dbg-source")
-            .size_full()
-            .overflow_scroll()
-            .child(lines)
-            .into_any_element()
+        pane.into_any_element()
     }
 
     /// Variables of the active frame (click to change) over the call stack
     /// (click a frame to inspect it).
-    fn render_debug_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_debug_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(stop) = self.debug.as_ref().and_then(|d| d.stop.as_ref()) else {
             return div().into_any_element();
         };
-        let mut vars = v_flex()
-            .gap_0()
-            .child(div().font_semibold().px_1().py_1().child("Variables"));
+        // A narrow marker column down the left, mirroring the editor's gutter:
+        // it carries the arrow on the frame being inspected and nothing else,
+        // so every name in both lists starts at the same x.
+        let muted = cx.theme().muted_foreground;
+        let gutter = move |label: &'static str| {
+            div()
+                .w(px(14.))
+                .flex_none()
+                .text_center()
+                .text_color(muted)
+                .child(label)
+        };
+        let mut vars = v_flex().gap_0().child(
+            h_flex()
+                .gap_2()
+                .px_1()
+                .py_1()
+                .child(gutter(""))
+                .child(div().font_semibold().child("Variables")),
+        );
         for var in &stop.variables {
             let (name, value) = (var.name.clone(), var.value.clone());
             vars = vars.child(
@@ -5854,6 +5863,7 @@ impl PgGuiApp {
                     .gap_2()
                     .px_1()
                     .cursor_pointer()
+                    .child(gutter(""))
                     .child(
                         div()
                             .w(px(130.))
@@ -5878,20 +5888,30 @@ impl PgGuiApp {
             );
         }
         let mut stack = v_flex().gap_0().child(
-            div()
-                .font_semibold()
+            h_flex()
+                .gap_2()
                 .px_1()
                 .py_1()
                 .mt_2()
-                .child("Call stack"),
+                .child(gutter(""))
+                .child(div().font_semibold().child("Call stack")),
         );
         for frame in &stop.stack {
             let level = frame.level;
+            // Mark the frame the panel is showing — the innermost one at every
+            // stop, or whichever the user clicked into since.
+            let marker = if level == stop.frame { "▸" } else { "" };
             stack = stack.child(
-                div()
+                h_flex()
+                    .gap_2()
                     .px_1()
                     .cursor_pointer()
-                    .child(format!("{} :{}", frame.target_name, frame.line))
+                    .child(gutter(marker))
+                    .child(
+                        div()
+                            .truncate()
+                            .child(format!("{} :{}", frame.target_name, frame.line)),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, _| {
@@ -5906,6 +5926,10 @@ impl PgGuiApp {
             .id("dbg-sidebar")
             .size_full()
             .overflow_scroll()
+            // Left gutter, so the names line up off the panel edge rather than
+            // against it.
+            .pl_3()
+            .pr_2()
             .text_size(cx.theme().mono_font_size)
             .child(vars)
             .child(stack)
