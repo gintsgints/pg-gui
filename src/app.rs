@@ -5401,28 +5401,31 @@ impl PgGuiApp {
                 .default_value(signature)
         });
         let args = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. 1, 99.50"));
+        sig.update(cx, |state, cx| state.focus(window, cx));
         let stop_on_entry = cx.new(|_| true);
         let app = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, cx| {
             let (sig, args, stop_on_entry) = (sig.clone(), args.clone(), stop_on_entry.clone());
-            let start = {
+            // Shared by the Debug button and the dialog's Enter binding: reads
+            // the inputs and launches, reporting whether the dialog may close.
+            let start: Rc<dyn Fn(&mut App) -> bool> = {
                 let (app, sig, args, stop_on_entry) = (
                     app.clone(),
                     sig.clone(),
                     args.clone(),
                     stop_on_entry.clone(),
                 );
-                move |window: &mut Window, cx: &mut App| {
+                Rc::new(move |cx: &mut App| {
                     let signature = sig.read(cx).value().trim().to_string();
                     if signature.is_empty() {
-                        return;
+                        return false;
                     }
                     let args = args.read(cx).value().trim().to_string();
                     let stop = *stop_on_entry.read(cx);
-                    window.close_dialog(cx);
                     app.update(cx, |this, cx| this.launch_debug(signature, args, stop, cx))
                         .ok();
-                }
+                    true
+                })
             };
             let labeled = |label: &str, input: &Entity<InputState>, cx: &mut App| {
                 v_flex()
@@ -5437,40 +5440,48 @@ impl PgGuiApp {
             };
             let checked = *stop_on_entry.read(cx);
             let toggle = stop_on_entry.clone();
-            dialog.title("Debug routine").w(px(480.)).child(
-                v_flex()
-                    .gap_4()
-                    .pb_2()
-                    .child(labeled("Routine", &sig, cx))
-                    .child(labeled("Arguments", &args, cx))
-                    .child(
-                        Checkbox::new("stop-on-entry")
-                            .label("Stop on entry")
-                            .checked(checked)
-                            .on_click(move |checked, _, cx| {
-                                toggle.update(cx, |state, cx| {
-                                    *state = *checked;
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .justify_end()
-                            .child(Button::new("cancel").label("Cancel").on_click(
-                                |_, window, cx| {
-                                    window.close_dialog(cx);
-                                },
-                            ))
-                            .child(
-                                Button::new("start")
-                                    .primary()
-                                    .label("Debug")
-                                    .on_click(move |_, window, cx| start(window, cx)),
-                            ),
-                    ),
-            )
+            let confirm = start.clone();
+            dialog
+                .title("Debug routine")
+                .w(px(480.))
+                // Enter starts the session, Escape closes (the dialog's own
+                // `escape` binding); both bubble up out of the inputs.
+                .on_ok(move |_, _, cx| confirm(cx))
+                .child(
+                    v_flex()
+                        .gap_4()
+                        .pb_2()
+                        .child(labeled("Routine", &sig, cx))
+                        .child(labeled("Arguments", &args, cx))
+                        .child(
+                            Checkbox::new("stop-on-entry")
+                                .label("Stop on entry")
+                                .checked(checked)
+                                .on_click(move |checked, _, cx| {
+                                    toggle.update(cx, |state, cx| {
+                                        *state = *checked;
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(Button::new("cancel").label("Cancel").on_click(
+                                    |_, window, cx| {
+                                        window.close_dialog(cx);
+                                    },
+                                ))
+                                .child(Button::new("start").primary().label("Debug").on_click(
+                                    move |_, window, cx| {
+                                        if start(cx) {
+                                            window.close_dialog(cx);
+                                        }
+                                    },
+                                )),
+                        ),
+                )
         });
     }
 
