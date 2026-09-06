@@ -137,11 +137,15 @@ pub struct Config {
     /// `*` matches any run of characters, `?` any single one; matching is
     /// case-insensitive. Default `*_{object}.sql`, which matches both
     /// single- and double-underscore separators (e.g. `R__001_add.sql`
-    /// and `01__place_order.sql`). When several files match, the object's
-    /// schema picks between them: a file the schema itself qualifies
-    /// (`order_utils__place_order.sql`, `order_utils/place_order.sql`)
-    /// wins over an unqualified one, which in turn wins over one qualified by
-    /// something else (`test__order_utils__place_order.sql`).
+    /// and `01__place_order.sql`). When several files match, their bodies pick
+    /// between them first: the file carrying the object's own `CREATE`
+    /// statement wins, and one defining some *other* object of the same kind
+    /// loses to one that defines nothing at all. Files their bodies cannot
+    /// separate are then ranked by the object's schema: a file the schema
+    /// itself qualifies (`order_utils__place_order.sql`,
+    /// `order_utils/place_order.sql`) wins over an unqualified one, which in
+    /// turn wins over one qualified by something else
+    /// (`test__order_utils__place_order.sql`).
     #[serde(default = "default_definition_file_mask")]
     pub definition_file_mask: String,
     /// Directory the file dialogs (Open, Save As, Export) start in; set to

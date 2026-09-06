@@ -652,17 +652,169 @@ fn definition_match_rank(path: &Path, root: &Path, schema: &str, object: &str) -
     }
 }
 
-/// Recursively search `dir` for the file holding `schema.object`'s definition:
-/// the best [`definition_match_rank`] among the files whose name matches
-/// `pattern` (a glob with `*`/`?`, already lowercased — see
-/// [`config::Config::definition_file_mask`]), ties broken by the shallowest
-/// then alphabetically first path so the same click always opens the same
-/// file. Hidden directories and the usual heavy build directories are
-/// skipped, and a total-entry budget caps a runaway walk.
-fn find_sql_file(dir: &Path, pattern: &str, schema: &str, object: &str) -> Option<PathBuf> {
+/// Words allowed between `CREATE` and the keyword naming the object kind, so
+/// `CREATE OR REPLACE VIEW`, `CREATE UNLOGGED TABLE` and
+/// `CREATE CONSTRAINT TRIGGER` are all still read as definitions.
+const CREATE_MODIFIERS: [&str; 12] = [
+    "or",
+    "replace",
+    "unique",
+    "temp",
+    "temporary",
+    "global",
+    "local",
+    "unlogged",
+    "foreign",
+    "recursive",
+    "materialized",
+    "constraint",
+];
+
+/// Words allowed between the keyword naming the object kind and the object's
+/// own name.
+const NAME_PREFIXES: [&str; 4] = ["if", "not", "exists", "concurrently"];
+
+/// Upper bound on a candidate file read while looking for its `CREATE`
+/// statement. Anything bigger is left undecided rather than stalling the walk.
+const MAX_DEFINITION_SCAN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The keyword that names this object kind in the statement defining it, or
+/// nothing for kinds that are not objects with a definition.
+fn definition_keywords(kind: db_tree::NodeKind) -> &'static [&'static str] {
+    use db_tree::NodeKind::{
+        Constraint, Function, Index, MatView, Sequence, TableDefinition, Trigger, Type, View,
+    };
+    match kind {
+        TableDefinition => &["table"],
+        View | MatView => &["view"],
+        // A routine leaf covers both, and neither keyword tells them apart
+        // before the name is read.
+        Function => &["function", "procedure"],
+        Sequence => &["sequence"],
+        Type => &["type"],
+        Index => &["index"],
+        Trigger => &["trigger"],
+        Constraint => &["constraint"],
+        _ => &[],
+    }
+}
+
+/// Whether the kind keyword at `i` is the one in a statement that *defines*
+/// the object, rather than one that drops, alters or merely mentions it.
+fn introduces_definition(words: &[String], i: usize, kind: db_tree::NodeKind) -> bool {
+    use db_tree::NodeKind::{Constraint, MatView, View};
+    let previous = i.checked_sub(1).map(|p| words[p].as_str());
+    match kind {
+        // Constraints are defined both inline in a `CREATE TABLE` and by
+        // `ALTER TABLE … ADD CONSTRAINT`, so there is no `CREATE` to find;
+        // only `DROP CONSTRAINT` names one without defining it.
+        Constraint => previous != Some("drop"),
+        // The same `view` keyword ends `CREATE VIEW` and `CREATE MATERIALIZED
+        // VIEW`, so the word before it is what tells the two kinds apart.
+        MatView if previous != Some("materialized") => false,
+        View if previous == Some("materialized") => false,
+        _ => {
+            // Walk back over the modifiers to the `create` they qualify.
+            let mut at = i;
+            while let Some(previous) = at.checked_sub(1) {
+                match words[previous].as_str() {
+                    "create" => return true,
+                    word if CREATE_MODIFIERS.contains(&word) => at = previous,
+                    _ => return false,
+                }
+            }
+            false
+        }
+    }
+}
+
+/// The name defined by the statement whose kind keyword sits at `keyword`:
+/// the next word that is not one of the modifiers a name may hide behind,
+/// stripped of the argument or column list that follows it.
+fn definition_name(words: &[String], keyword: usize) -> Option<&str> {
+    let mut at = keyword + 1;
+    while NAME_PREFIXES.contains(&words.get(at)?.as_str()) {
+        at += 1;
+    }
+    let word = words.get(at)?;
+    let end = word.find('(').unwrap_or(word.len());
+    let name = word[..end].trim_matches([',', ';', '"']);
+    // `CREATE INDEX ON t (…)` leaves the index unnamed; the keyword that
+    // follows is not its name.
+    (!name.is_empty() && name != "on").then_some(name)
+}
+
+/// How well a file's *contents* fit the clicked object, lower being better.
+/// The filename alone cannot tell `tables/V.0.0.1.1__customers.sql` from
+/// `data/V.0.0.1.1__customers.sql`; the statement in the body can.
+///
+/// - 0 — the file defines this very object.
+/// - 1 — the file defines no object of this kind, so it says nothing either
+///   way (a data script full of `INSERT`s, a scratch query).
+/// - 2 — the file defines objects of this kind, but other ones.
+///
+/// `schema` and `object` are expected already lowercased.
+fn definition_content_rank(sql: &str, kind: db_tree::NodeKind, schema: &str, object: &str) -> u8 {
+    let keywords = definition_keywords(kind);
+    if keywords.is_empty() {
+        return 1;
+    }
+    let stripped = strip_sql_comments(sql);
+    let words: Vec<String> = stripped
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let qualified = format!("{schema}.{object}");
+    let mut defines_another = false;
+    for i in 0..words.len() {
+        if !keywords.contains(&words[i].as_str()) || !introduces_definition(&words, i, kind) {
+            continue;
+        }
+        let Some(name) = definition_name(&words, i) else {
+            continue;
+        };
+        if name == object || name == qualified {
+            return 0;
+        }
+        defines_another = true;
+    }
+    u8::from(defines_another) + 1
+}
+
+/// [`definition_content_rank`] for a file on disk. One that cannot be read, or
+/// that is far too big to be a hand-written definition, is left undecided.
+fn file_content_rank(path: &Path, kind: db_tree::NodeKind, schema: &str, object: &str) -> u8 {
+    if path
+        .metadata()
+        .is_ok_and(|meta| meta.len() > MAX_DEFINITION_SCAN_BYTES)
+    {
+        return 1;
+    }
+    std::fs::read_to_string(path)
+        .map_or(1, |sql| definition_content_rank(&sql, kind, schema, object))
+}
+
+/// Recursively search `dir` for the file holding `schema.object`'s definition,
+/// among the files whose name matches `pattern` (a glob with `*`/`?`, already
+/// lowercased — see [`config::Config::definition_file_mask`]). The body decides
+/// first ([`definition_content_rank`]): a file carrying the object's `CREATE`
+/// statement beats one that merely shares its name, which is what keeps a click
+/// on `customers` off the `INSERT INTO customers` script sitting beside it.
+/// Files whose bodies are equally (un)informative fall back to
+/// [`definition_match_rank`], then to the shallowest and alphabetically first
+/// path so the same click always opens the same file. Hidden directories and
+/// the usual heavy build directories are skipped, and a total-entry budget caps
+/// a runaway walk.
+fn find_sql_file(
+    dir: &Path,
+    pattern: &str,
+    kind: db_tree::NodeKind,
+    schema: &str,
+    object: &str,
+) -> Option<PathBuf> {
     let schema = schema.to_ascii_lowercase();
     let object = object.to_ascii_lowercase();
-    let mut best: Option<(u8, usize, PathBuf)> = None;
+    let mut best: Option<(u8, u8, usize, PathBuf)> = None;
     let mut stack = vec![dir.to_path_buf()];
     let mut budget = 20_000usize;
     'walk: while let Some(current) = stack.pop() {
@@ -694,6 +846,7 @@ fn find_sql_file(dir: &Path, pattern: &str, schema: &str, object: &str) -> Optio
                 .is_some_and(|name| glob_match(pattern, &name.to_ascii_lowercase()))
             {
                 let candidate = (
+                    file_content_rank(&path, kind, &schema, &object),
                     definition_match_rank(&path, dir, &schema, &object),
                     path.components().count(),
                     path,
@@ -704,7 +857,7 @@ fn find_sql_file(dir: &Path, pattern: &str, schema: &str, object: &str) -> Optio
             }
         }
     }
-    best.map(|(_, _, path)| path)
+    best.map(|(_, _, _, path)| path)
 }
 
 /// Where a file dialog (Open, Save As, Export) should start: the directory
@@ -2152,7 +2305,7 @@ impl PgGuiApp {
                 let (match_schema, match_object) = (schema.clone(), stem.clone());
                 let found = cx
                     .background_spawn(async move {
-                        find_sql_file(&dir, &pattern, &match_schema, &match_object)
+                        find_sql_file(&dir, &pattern, kind, &match_schema, &match_object)
                     })
                     .await;
                 if let Some(path) = found {
@@ -5834,23 +5987,31 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        MAX_RECENT_FOLDERS, dialog_start_dir, ends_with_name_word, find_sql_file,
-        folder_menu_label, glob_match, mask_credentials, record_recent_folder,
+        MAX_RECENT_FOLDERS, definition_content_rank, dialog_start_dir, ends_with_name_word,
+        find_sql_file, folder_menu_label, glob_match, mask_credentials, record_recent_folder,
         suggested_name_from_mask, toggle_line_comments,
     };
+    use crate::db_tree::NodeKind;
 
     /// A throwaway folder holding the given files, removed on drop.
     struct TempDir(PathBuf);
 
     impl TempDir {
         fn new(name: &str, files: &[&str]) -> Self {
+            // Bodies that say nothing about any object, so these files are
+            // ranked on their names alone.
+            let files: Vec<(&str, &str)> = files.iter().map(|f| (*f, "select 1;")).collect();
+            Self::with_contents(name, &files)
+        }
+
+        fn with_contents(name: &str, files: &[(&str, &str)]) -> Self {
             let root = std::env::temp_dir().join(format!("pg-gui-app-{name}"));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
-            for file in files {
+            for (file, body) in files {
                 let path = root.join(file);
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(&path, "select 1;").unwrap();
+                std::fs::write(&path, body).unwrap();
             }
             Self(root)
         }
@@ -5902,7 +6063,13 @@ mod tests {
             ],
         );
         assert_eq!(
-            find_sql_file(&dir.0, "*_place_order.sql", "order_utils", "place_order"),
+            find_sql_file(
+                &dir.0,
+                "*_place_order.sql",
+                NodeKind::Function,
+                "order_utils",
+                "place_order"
+            ),
             Some(dir.0.join("order_utils__place_order.sql"))
         );
         // The test routine's own name only matches its own file.
@@ -5910,6 +6077,7 @@ mod tests {
             find_sql_file(
                 &dir.0,
                 "*_order_utils__place_order.sql",
+                NodeKind::Function,
                 "test",
                 "order_utils__place_order"
             ),
@@ -5929,7 +6097,13 @@ mod tests {
         // A mask without the leading separator, so the unprefixed file in the
         // schema folder is a candidate too.
         assert_eq!(
-            find_sql_file(&dir.0, "*place_order.sql", "order_utils", "place_order"),
+            find_sql_file(
+                &dir.0,
+                "*place_order.sql",
+                NodeKind::Function,
+                "order_utils",
+                "place_order"
+            ),
             Some(dir.0.join("order_utils/place_order.sql"))
         );
         // And the file under `test/` belongs to the `test` schema's routine.
@@ -5937,6 +6111,7 @@ mod tests {
             find_sql_file(
                 &dir.0,
                 "*order_utils__place_order.sql",
+                NodeKind::Function,
                 "test",
                 "order_utils__place_order"
             ),
@@ -5951,7 +6126,13 @@ mod tests {
             &["test__order_utils__place_order.sql", "_place_order.sql"],
         );
         assert_eq!(
-            find_sql_file(&dir.0, "*_place_order.sql", "order_utils", "place_order"),
+            find_sql_file(
+                &dir.0,
+                "*_place_order.sql",
+                NodeKind::Function,
+                "order_utils",
+                "place_order"
+            ),
             Some(dir.0.join("_place_order.sql"))
         );
     }
@@ -5965,12 +6146,250 @@ mod tests {
             &["01__place_order.sql", "old/02__place_order.sql"],
         );
         assert_eq!(
-            find_sql_file(&dir.0, "*_place_order.sql", "shop", "place_order"),
+            find_sql_file(
+                &dir.0,
+                "*_place_order.sql",
+                NodeKind::Function,
+                "shop",
+                "place_order"
+            ),
             Some(dir.0.join("01__place_order.sql"))
         );
         assert_eq!(
-            find_sql_file(&dir.0, "*_no_such_thing.sql", "shop", "no_such_thing"),
+            find_sql_file(
+                &dir.0,
+                "*_no_such_thing.sql",
+                NodeKind::Function,
+                "shop",
+                "no_such_thing"
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn find_sql_file_prefers_the_file_that_defines_the_object() {
+        // The seed layout that motivated this: the table and the data loaded
+        // into it are two files of the same name in sibling folders, and only
+        // the body tells them apart.
+        let dir = TempDir::with_contents(
+            "content-rank",
+            &[
+                (
+                    "data/V.0.0.1.1__customers.sql",
+                    "INSERT INTO customers (name) SELECT 'x';",
+                ),
+                (
+                    "tables/V.0.0.1.1__customers.sql",
+                    "CREATE TABLE customers (\n    id serial PRIMARY KEY\n);",
+                ),
+            ],
+        );
+        assert_eq!(
+            find_sql_file(
+                &dir.0,
+                "*_customers.sql",
+                NodeKind::TableDefinition,
+                "public",
+                "customers"
+            ),
+            Some(dir.0.join("tables/V.0.0.1.1__customers.sql"))
+        );
+    }
+
+    #[test]
+    fn find_sql_file_demotes_a_file_defining_another_object() {
+        // `a_orders.sql` sorts first and both names match the glob equally,
+        // so without reading the bodies the wrong file would win.
+        let dir = TempDir::with_contents(
+            "content-other",
+            &[
+                ("a_orders.sql", "CREATE TABLE archived_orders (id int);"),
+                ("z_orders.sql", "CREATE TABLE orders (id int);"),
+            ],
+        );
+        assert_eq!(
+            find_sql_file(
+                &dir.0,
+                "*_orders.sql",
+                NodeKind::TableDefinition,
+                "public",
+                "orders"
+            ),
+            Some(dir.0.join("z_orders.sql"))
+        );
+    }
+
+    #[test]
+    fn definition_content_rank_reads_the_create_statement() {
+        // The object's own definition, plain and schema-qualified.
+        assert_eq!(
+            definition_content_rank(
+                "CREATE TABLE customers (id serial);",
+                NodeKind::TableDefinition,
+                "public",
+                "customers"
+            ),
+            0
+        );
+        assert_eq!(
+            definition_content_rank(
+                "CREATE TABLE IF NOT EXISTS app.feature_flags (id serial);",
+                NodeKind::TableDefinition,
+                "app",
+                "feature_flags"
+            ),
+            0
+        );
+        // No definition of this kind at all — uninformative, not wrong.
+        assert_eq!(
+            definition_content_rank(
+                "INSERT INTO customers (name) VALUES ('x');",
+                NodeKind::TableDefinition,
+                "public",
+                "customers"
+            ),
+            1
+        );
+        // A definition, but of something else.
+        assert_eq!(
+            definition_content_rank(
+                "CREATE TABLE orders (id serial);",
+                NodeKind::TableDefinition,
+                "public",
+                "customers"
+            ),
+            2
+        );
+        // Dropping the object is not defining it.
+        assert_eq!(
+            definition_content_rank(
+                "DROP TABLE customers;",
+                NodeKind::TableDefinition,
+                "public",
+                "customers"
+            ),
+            1
+        );
+        // Comments naming the object do not count as a definition.
+        assert_eq!(
+            definition_content_rank(
+                "-- create table customers\nSELECT 1;",
+                NodeKind::TableDefinition,
+                "public",
+                "customers"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn definition_content_rank_covers_the_other_kinds() {
+        // A routine, named right against its argument list.
+        assert_eq!(
+            definition_content_rank(
+                "CREATE OR REPLACE FUNCTION public.add(a int, b int)\nRETURNS int",
+                NodeKind::Function,
+                "public",
+                "add"
+            ),
+            0
+        );
+        assert_eq!(
+            definition_content_rank(
+                "CREATE PROCEDURE place_order(p_customer int) LANGUAGE plpgsql",
+                NodeKind::Function,
+                "app",
+                "place_order"
+            ),
+            0
+        );
+        // `view` ends both kinds of view definition; the word before it is
+        // what separates them.
+        assert_eq!(
+            definition_content_rank(
+                "CREATE MATERIALIZED VIEW sales AS SELECT 1;",
+                NodeKind::MatView,
+                "public",
+                "sales"
+            ),
+            0
+        );
+        assert_eq!(
+            definition_content_rank(
+                "CREATE MATERIALIZED VIEW sales AS SELECT 1;",
+                NodeKind::View,
+                "public",
+                "sales"
+            ),
+            1
+        );
+        assert_eq!(
+            definition_content_rank(
+                "CREATE OR REPLACE VIEW sales AS SELECT 1;",
+                NodeKind::View,
+                "public",
+                "sales"
+            ),
+            0
+        );
+        // Indexes carry modifiers on both sides of their name.
+        assert_eq!(
+            definition_content_rank(
+                "CREATE UNIQUE INDEX CONCURRENTLY orders_pkey ON orders (id);",
+                NodeKind::Index,
+                "public",
+                "orders_pkey"
+            ),
+            0
+        );
+        // An unnamed index does not lend its `ON` to the next object.
+        assert_eq!(
+            definition_content_rank(
+                "CREATE INDEX ON orders (id);",
+                NodeKind::Index,
+                "public",
+                "on"
+            ),
+            1
+        );
+        // Constraints are defined with no `CREATE` of their own, inline or by
+        // `ALTER TABLE`, but dropping one still does not define it.
+        assert_eq!(
+            definition_content_rank(
+                "ALTER TABLE orders ADD CONSTRAINT orders_customer_fk FOREIGN KEY (c);",
+                NodeKind::Constraint,
+                "public",
+                "orders_customer_fk"
+            ),
+            0
+        );
+        assert_eq!(
+            definition_content_rank(
+                "CREATE TABLE orders (\n  CONSTRAINT orders_pk PRIMARY KEY (id)\n);",
+                NodeKind::Constraint,
+                "public",
+                "orders_pk"
+            ),
+            0
+        );
+        assert_eq!(
+            definition_content_rank(
+                "ALTER TABLE orders DROP CONSTRAINT orders_pk;",
+                NodeKind::Constraint,
+                "public",
+                "orders_pk"
+            ),
+            1
+        );
+        assert_eq!(
+            definition_content_rank(
+                "CREATE CONSTRAINT TRIGGER audit AFTER INSERT ON orders",
+                NodeKind::Trigger,
+                "public",
+                "audit"
+            ),
+            0
         );
     }
 
