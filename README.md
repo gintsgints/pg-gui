@@ -94,9 +94,12 @@ postgres://pgui:pgui@localhost:5433/pgui_test
 ```
 
 Preloaded libraries: `pg_stat_statements` and `plugin_debugger`. Seed scripts
-live in `docker/init/` and run on first start — they enable the
-`pg_stat_statements` and `pldbgapi` extensions. `docker compose down -v` resets
-the data.
+live in `sql/`, which is mounted as the container's init directory and runs on
+first start — they enable the `pg_stat_statements` and `pldbgapi` extensions and
+create the sample schema. One folder per object type, one file per object,
+`V.<version>__<name>.sql` for what is applied once and `R__<nnn>_<name>.sql` for
+what is safe to re-apply, driven by `sql/00-run-init.sh` (see `sql/README.md`).
+`docker compose down -v` resets the data.
 
 ## AI completion
 

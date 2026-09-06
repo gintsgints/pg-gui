@@ -1,9 +1,7 @@
-CREATE OR REPLACE PROCEDURE
-public.cancel_stale_orders(
-  IN p_older_than interval DEFAULT CAST('90 days' AS interval)
-)
+-- A procedure that commits in batches: cancel stale pending orders.
+CREATE OR REPLACE PROCEDURE cancel_stale_orders(IN p_older_than interval DEFAULT '90 days')
 LANGUAGE plpgsql
-AS $procedure$
+AS $$
 DECLARE
     v_batch integer;
 BEGIN
@@ -25,4 +23,4 @@ BEGIN
         COMMIT;
     END LOOP;
 END;
-$procedure$;
+$$;

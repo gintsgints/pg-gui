@@ -218,7 +218,7 @@ fn dollar_quote_tag(text: &str, start: usize) -> Option<&str> {
 mod tests {
     use super::{at, body_line_offset};
 
-    /// The sample from `sql/length_function.sql`: Postgres reports the `RETURN`
+    /// The sample from `sql/examples/length_function.sql`: Postgres reports the `RETURN`
     /// on file line 6 as line 3, because body line 1 is the `AS $function$`
     /// line — so the gutter has to start counting three lines in.
     #[test]

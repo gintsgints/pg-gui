@@ -11,13 +11,14 @@ services:
       POSTGRES_PASSWORD: pgui
       POSTGRES_DB: pgui_test
     # pg_stat_statements and plugin_debugger (pldebugger) must be preloaded at
-    # server start; the extensions themselves are created in docker/init/.
+    # server start; the extensions themselves are created in
+    # sql/extensions/ (see sql/README.md for the layout).
     command: postgres -c shared_preload_libraries=pg_stat_statements,plugin_debugger
     # 5433 on the host to avoid clashing with the locally running Postgres on 5432
     ports:
       - "5433:5432"
     volumes:
-      - ./docker/init:/docker-entrypoint-initdb.d:ro
+      - ./sql:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U pgui -d pgui_test"]
       interval: 2s
