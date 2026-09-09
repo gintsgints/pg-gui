@@ -42,6 +42,15 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
   inserting, `tab` visits each stop in order with its placeholder selected.
   Snippets also appear in the editor's completion menu: type words of the
   name or the SQL's leading words ("create seq…") and accept the suggestion
+- **Run scripts from the files panel** (`cmd-shift-enter` or Connection ▸ Run
+  Selected Scripts): click a `.sql` file, shift-click another to take the
+  range, cmd-click to add or drop one, then run them all against the current
+  connection. They run in the order the tree lists them (which for
+  timestamp-named migration files is the order they were written), each file
+  headed by its own line in the message log, and the batch stops at the first
+  file that fails — the same rule as `psql -v ON_ERROR_STOP=1`. The run uses
+  the active tab's session, so it sees that tab's autocommit setting and any
+  transaction it is holding open
 - **Themes**: Catppuccin Mocha (dark) and Latte (light), switchable from
   View ▸ Theme (light / dark / follow the system)
 - **AI completion** (optional): completes the SQL at the cursor using the Claude API
@@ -130,6 +139,7 @@ or `F1` (Linux) in the app to see this list in a dialog. On Linux, `cmd` is
 | Key | Action |
 | --- | --- |
 | `cmd-enter` / `ctrl-enter` | Run the selection or the statement at the cursor |
+| `cmd-shift-enter` / `ctrl-shift-enter` | Run the scripts selected in the files panel |
 | `cmd-i` / `ctrl-space` | AI complete at cursor |
 | `cmd-shift-f` | Format the script |
 | `cmd-/` | Comment or uncomment the line / selection |

@@ -26,6 +26,7 @@ actions!(
     pg_gui,
     [
         RunQuery,
+        RunScripts,
         ToggleAutocommit,
         Commit,
         Rollback,
@@ -144,6 +145,8 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("secondary-enter", RunQuery, None),
             KeyBinding::new("ctrl-enter", RunQuery, None),
+            KeyBinding::new("secondary-shift-enter", RunScripts, None),
+            KeyBinding::new("ctrl-shift-enter", RunScripts, None),
             KeyBinding::new("secondary-i", AiComplete, None),
             KeyBinding::new("ctrl-space", AiComplete, None),
             KeyBinding::new("secondary-t", NewFile, None),

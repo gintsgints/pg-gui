@@ -8,10 +8,10 @@ use std::time::{Duration, SystemTime};
 use futures::StreamExt as _;
 use gpui::Subscription;
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, EntityInputHandler as _, Focusable as _,
-    Hsla, InteractiveElement as _, IntoElement, Menu, MenuItem, MouseButton, NoAction,
-    ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Window, div, px,
+    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EntityInputHandler as _,
+    Focusable as _, Hsla, InteractiveElement as _, IntoElement, Menu, MenuItem, MouseButton,
+    NoAction, ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, IndexPath, Root, Sizable as _, StyledExt as _, Theme,
@@ -29,7 +29,7 @@ use gpui_component::{
     tab::{Tab, TabBar},
     table::{DataTable, TableState},
     tooltip::Tooltip,
-    tree::{TreeEvent, TreeState, tree},
+    tree::{TreeEvent, TreeItem, TreeState, tree},
     v_flex,
 };
 // Linux and Windows have no OS-native menu bar, so an in-window one is drawn
@@ -42,8 +42,8 @@ use crate::{
     AiComplete, CancelQuery, CloseTab, Commit, Connect, DebugContinue, DebugStepInto,
     DebugStepOver, DebugStop, EditConnection, ExportCsv, ExportInserts, FormatScript,
     NewConnection, NewFile, NextTab, OpenConfig, OpenFile, OpenFolder, OpenGitHub,
-    OpenRecentFolder, OpenSnippets, PrevTab, Quit, RefreshDbTree, Rollback, RunQuery, SaveFile,
-    SetTheme, ShowHelp, StartDebug, ToggleAutocommit, ToggleComment, ToggleDbPanel,
+    OpenRecentFolder, OpenSnippets, PrevTab, Quit, RefreshDbTree, Rollback, RunQuery, RunScripts,
+    SaveFile, SetTheme, ShowHelp, StartDebug, ToggleAutocommit, ToggleComment, ToggleDbPanel,
     ToggleFilesPanel, ToggleFormatOnSave, ToggleResultsPanel, ZoomIn, ZoomOut, ZoomReset, ai,
     config, db, db_tree, debug, definitions, export, file_tree, lsp, snippets, statement,
 };
@@ -71,6 +71,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "cmd-enter / ctrl-enter",
         "Run the selection or the statement at the cursor",
     ),
+    (
+        "cmd-shift-enter",
+        "Run the scripts selected in the files panel",
+    ),
     ("cmd-i / ctrl-space", "AI-complete SQL at the cursor"),
     ("cmd-shift-f", "Format the script"),
     ("cmd-/", "Comment or uncomment the line / selection"),
@@ -96,6 +100,10 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "ctrl-enter",
         "Run the selection or the statement at the cursor",
+    ),
+    (
+        "ctrl-shift-enter",
+        "Run the scripts selected in the files panel",
     ),
     ("ctrl-i / ctrl-space", "AI-complete SQL at the cursor"),
     ("ctrl-shift-f", "Format the script"),
@@ -277,6 +285,7 @@ fn connection_menu(recents: &[config::RecentConnection]) -> Menu {
             }),
             MenuItem::separator(),
             MenuItem::action("Run Query", RunQuery),
+            MenuItem::action("Run Selected Scripts", RunScripts),
             MenuItem::separator(),
             MenuItem::action("Export as CSV…", ExportCsv),
             MenuItem::action("Export as INSERT…", ExportInserts),
@@ -1269,6 +1278,18 @@ pub struct PgGuiApp {
     /// Ids of every directory in the tree. The tree's own `is_folder()` is
     /// children-based, so empty directories need this to get a folder icon.
     tree_dirs: Rc<HashSet<SharedString>>,
+    /// The `TreeItem`s last handed to [`Self::tree_state`]. Their expanded
+    /// flags live behind a shared `Rc`, so this copy tracks the user's own
+    /// expanding and collapsing; flattening it (`file_tree::visible_ids`)
+    /// reproduces the row order the tree draws, which is how a shift-click
+    /// resolves the rows between the anchor and the clicked one.
+    tree_items: Vec<TreeItem>,
+    /// Scripts picked in the files panel, run together by [`RunScripts`].
+    /// Ids (absolute paths), unordered — the run order comes from the tree.
+    selected_scripts: HashSet<SharedString>,
+    /// The row a plain click last landed on; a shift-click selects the
+    /// range from here to the row it hits.
+    select_anchor: Option<SharedString>,
     /// Hash of the last scan, so an unchanged re-scan skips the rebuild
     /// (which would reset the tree's selection).
     tree_signature: u64,
@@ -1334,6 +1355,32 @@ pub struct PgGuiApp {
     /// opens; only ever written, never read.
     #[allow(dead_code)]
     connection_dialog_subs: Vec<Subscription>,
+}
+
+/// Run each of `files` on `session` in turn, heading every file with its
+/// own log line — statement numbering restarts per file, so without that
+/// line the log lines below it could not be told apart. Stops at the first
+/// file that fails to be read or that a statement fails in, and reports it
+/// named. Blocking; called on the background executor.
+fn run_files(
+    session: &mut db::Session,
+    files: Vec<(String, PathBuf)>,
+    batch_size: usize,
+    autocommit: bool,
+    progress: &db::Progress,
+) -> Result<db::RunResult, String> {
+    let mut statements = 0;
+    let mut more = false;
+    for (label, path) in files {
+        let sql = std::fs::read_to_string(&path).map_err(|err| format!("{label}: {err}"))?;
+        let _ = progress.unbounded_send(db::RunEvent::Log(format!("▶ {label}")));
+        let run = session
+            .run(&sql, batch_size, autocommit, progress)
+            .map_err(|err| format!("{label}: {err}"))?;
+        statements += run.statements;
+        more = run.more;
+    }
+    Ok(db::RunResult { statements, more })
 }
 
 impl PgGuiApp {
@@ -1448,6 +1495,9 @@ impl PgGuiApp {
             tree_state,
             expanded_dirs: HashSet::new(),
             tree_dirs: Rc::new(HashSet::new()),
+            tree_items: Vec::new(),
+            selected_scripts: HashSet::new(),
+            select_anchor: None,
             tree_signature: 0,
             file_nodes: Vec::new(),
             file_filter_input,
@@ -2085,6 +2135,13 @@ impl PgGuiApp {
                 }
                 this.tree_signature = sig;
                 this.file_nodes = nodes;
+                // A script that was deleted or renamed since it was picked
+                // can no longer be run; drop it rather than fail the batch.
+                if !this.selected_scripts.is_empty() {
+                    let mut scanned = HashSet::new();
+                    file_tree::scanned_ids(&this.file_nodes, &mut scanned);
+                    this.selected_scripts.retain(|id| scanned.contains(id));
+                }
                 this.rebuild_file_tree(cx);
             })
             .ok();
@@ -2118,9 +2175,83 @@ impl PgGuiApp {
             &mut dirs,
         );
         self.tree_dirs = Rc::new(dirs);
+        // Keep the items as well as handing them over: cloning a `TreeItem`
+        // shares its expanded flag, so this copy stays in step with the
+        // widget and can be flattened into the drawn row order.
+        self.tree_items.clone_from(&items);
         self.tree_state
             .update(cx, |state, cx| state.set_items(items, cx));
         cx.notify();
+    }
+
+    /// Forget every picked script.
+    fn clear_script_selection(&mut self) {
+        self.selected_scripts.clear();
+        self.select_anchor = None;
+    }
+
+    /// A plain click on a script row: it becomes the whole selection and
+    /// the anchor a later shift-click extends from. (The file also opens —
+    /// that is the caller's job.)
+    fn select_script(&mut self, id: &SharedString) {
+        self.selected_scripts.clear();
+        self.selected_scripts.insert(id.clone());
+        self.select_anchor = Some(id.clone());
+    }
+
+    /// A cmd/ctrl-click on a script row: add or drop just that one, and
+    /// re-anchor there so a following shift-click extends from it.
+    fn toggle_script(&mut self, id: &SharedString) {
+        if !self.selected_scripts.remove(id) {
+            self.selected_scripts.insert(id.clone());
+        }
+        self.select_anchor = Some(id.clone());
+    }
+
+    /// A shift-click on a script row: select every script between the
+    /// anchor row and this one. Rows in between that are folders or
+    /// non-SQL files are skipped, and the anchor stays where it was so
+    /// the range can be re-dragged. Without an anchor this is a plain
+    /// click.
+    fn extend_script_selection(&mut self, id: &SharedString) {
+        let Some(anchor) = self.select_anchor.clone() else {
+            self.select_script(id);
+            return;
+        };
+        let rows = file_tree::visible_ids(&self.tree_items);
+        let (Some(from), Some(to)) = (
+            rows.iter().position(|row| row == &anchor),
+            rows.iter().position(|row| row == id),
+        ) else {
+            // The anchor scrolled out of the tree (collapsed folder, or a
+            // filter that no longer matches it); start over from here.
+            self.select_script(id);
+            return;
+        };
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        self.selected_scripts.clear();
+        for row in &rows[lo..=hi] {
+            if self.is_selectable_script(row) {
+                self.selected_scripts.insert(row.clone());
+            }
+        }
+    }
+
+    /// Whether a tree row is a script the batch runner can execute: a file
+    /// (not a directory) with a `.sql` name.
+    fn is_selectable_script(&self, id: &SharedString) -> bool {
+        !self.tree_dirs.contains(id) && file_tree::is_sql(Path::new(id.as_ref()))
+    }
+
+    /// The picked scripts as paths, in the order the tree lists them —
+    /// folders first, then names, which is the order the timestamp-named
+    /// files under `sql/upgrade` have to run in.
+    fn selected_script_paths(&self) -> Vec<PathBuf> {
+        file_tree::ordered_ids(&self.tree_items)
+            .into_iter()
+            .filter(|id| self.selected_scripts.contains(id))
+            .map(|id| PathBuf::from(id.to_string()))
+            .collect()
     }
 
     /// Create the object browser's widgets: its resizable-split state, the
@@ -2590,6 +2721,7 @@ impl PgGuiApp {
 
         if self.config.working_dir != old.working_dir {
             self.expanded_dirs.clear();
+            self.clear_script_selection();
             self.tree_signature = 0;
             self.load_tree(cx);
         }
@@ -3062,6 +3194,141 @@ impl PgGuiApp {
         .detach();
     }
 
+    /// The picked scripts as `(label, path)`, in run order. The label is
+    /// the path relative to the working folder — what the panel shows —
+    /// since the absolute path is mostly noise in a log line.
+    fn selected_script_batch(&self) -> Vec<(String, PathBuf)> {
+        let root = self.config.working_dir.as_ref();
+        self.selected_script_paths()
+            .into_iter()
+            .map(|path| {
+                let label = root
+                    .and_then(|root| path.strip_prefix(root).ok())
+                    .unwrap_or(path.as_path())
+                    .display()
+                    .to_string();
+                (label, path)
+            })
+            .collect()
+    }
+
+    /// A batch reads its scripts from disk, so a tab still holding unsaved
+    /// edits to one of them would run something other than what its editor
+    /// shows; note that in the log rather than silently running the old
+    /// text.
+    fn note_unsaved_scripts(&mut self, ix: usize, files: &[(String, PathBuf)]) {
+        let unsaved: Vec<String> = files
+            .iter()
+            .filter(|(_, path)| {
+                self.tabs
+                    .iter()
+                    .any(|tab| tab.dirty && tab.path.as_deref() == Some(path.as_path()))
+            })
+            .map(|(label, _)| label.clone())
+            .collect();
+        for label in unsaved {
+            self.tabs[ix].result.log.push(SharedString::from(format!(
+                "note: {label} has unsaved edits in a tab — the file on disk is what runs"
+            )));
+        }
+    }
+
+    /// Run the scripts picked in the files panel, in tree order, on the
+    /// active tab's session — so they see that tab's autocommit setting,
+    /// its open transaction, and report into its log next to ordinary Runs.
+    /// Each file is a separate `Session::run`, headed by its own log line,
+    /// and the batch stops at the first file that fails (like
+    /// `psql -v ON_ERROR_STOP=1`, which is how `sql/00-run-init.sh` applies
+    /// the same files). Files that already ran stay committed unless the
+    /// tab is holding a transaction open.
+    pub fn run_scripts(&mut self, _: &RunScripts, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        if tab.running {
+            return;
+        }
+        let files = self.selected_script_batch();
+        if files.is_empty() {
+            self.set_status("No scripts selected", cx);
+            return;
+        }
+        let count = files.len();
+
+        let conn = self.config.connection_string.clone();
+        let ix = self.active_tab;
+        let tab_id = self.tabs[ix].id;
+        let autocommit = self.tabs[ix].autocommit;
+        let batch_size = self.config.fetch_size.max(1);
+        let epoch = self.db_epoch;
+        let session = self.tabs[ix].session.take();
+        self.tabs[ix].running = true;
+        self.tabs[ix].result.results.clear();
+        self.tabs[ix].result.selected = 0;
+        self.tabs[ix].result.has_more = false;
+        self.note_unsaved_scripts(ix, &files);
+        // The per-file lines are the point of a batch; show the log rather
+        // than whatever table the tab was left on, and reveal the panel if
+        // it was hidden — otherwise the run reports into nothing visible.
+        self.bottom_view = BottomView::Log;
+        if !self.config.results_panel_visible {
+            self.config.results_panel_visible = true;
+            self.schedule_save(cx);
+        }
+        self.show_tab_result(ix, cx);
+        self.set_status(format!("Running {count} script(s)…"), cx);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let started = std::time::Instant::now();
+            let opened = cx
+                .background_spawn(async move {
+                    match session {
+                        Some(session) => Ok(session),
+                        None => db::Session::connect(&conn)
+                            .map_err(|e| format!("connection failed: {}", db::describe(&e))),
+                    }
+                })
+                .await;
+            let mut session = match opened {
+                Ok(session) => session,
+                Err(err) => {
+                    this.update_in(cx, |this, window, cx| {
+                        this.on_query_error(tab_id, epoch, None, &err, window, cx);
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            let token = session.cancel_token();
+            this.update(cx, |this, _| {
+                if let Some(ix) = this.tab_index_by_id(tab_id) {
+                    this.tabs[ix].cancel = Some(token);
+                }
+            })
+            .ok();
+
+            let (tx, mut events) = futures::channel::mpsc::unbounded();
+            let running = cx.background_spawn(async move {
+                let result = run_files(&mut session, files, batch_size, autocommit, &tx);
+                (session, result)
+            });
+            while let Some(event) = events.next().await {
+                this.update(cx, |this, cx| this.on_run_event(tab_id, epoch, event, cx))
+                    .ok();
+            }
+            let (session, result) = running.await;
+            let elapsed = started.elapsed();
+            let scope = format!("{count} script(s)");
+
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(run) => this.on_query_ok(tab_id, epoch, session, &run, &scope, elapsed, cx),
+                Err(err) => this.on_query_error(tab_id, epoch, Some(session), &err, window, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Put a finished query's session back on its tab and clear the running
     /// state. Returns the tab index to display the result on, or `None` when
     /// the tab was closed, the connection changed underneath it, or the
@@ -3133,7 +3400,7 @@ impl PgGuiApp {
         epoch: u64,
         session: db::Session,
         run: &db::RunResult,
-        scope: &'static str,
+        scope: &str,
         elapsed: std::time::Duration,
         cx: &mut Context<Self>,
     ) {
@@ -4354,6 +4621,7 @@ impl PgGuiApp {
         self.config.working_dir = Some(path);
         self.config.files_panel_visible = true;
         self.expanded_dirs.clear();
+        self.clear_script_selection();
         self.tree_signature = 0;
         self.load_tree(cx);
         self.save_config();
@@ -5253,27 +5521,62 @@ impl PgGuiApp {
         }
     }
 
+    /// The files panel before a working folder has been picked.
+    fn render_no_folder(cx: &mut Context<Self>) -> gpui::Div {
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No folder open"),
+            )
+            .child(
+                Button::new("open-folder")
+                    .outline()
+                    .small()
+                    .label("Open Folder…")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_folder(&OpenFolder, window, cx);
+                    })),
+            )
+    }
+
+    /// The files panel's "Run N script(s)" bar, shown while scripts are
+    /// picked: runs them in tree order, or drops the selection.
+    fn render_script_run_bar(picked: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        h_flex()
+            .px_1()
+            .pb_1()
+            .gap_1()
+            .child(
+                Button::new("run-scripts")
+                    .primary()
+                    .xsmall()
+                    .flex_1()
+                    .label(format!("▶ Run {picked} script(s)"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.run_scripts(&RunScripts, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("clear-scripts")
+                    .ghost()
+                    .xsmall()
+                    .tooltip("Clear the selection")
+                    .label("×")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.clear_script_selection();
+                        cx.notify();
+                    })),
+            )
+    }
+
     fn render_files_panel(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let Some(root) = self.config.working_dir.clone() else {
-            return v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .child(
-                    div()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("No folder open"),
-                )
-                .child(
-                    Button::new("open-folder")
-                        .outline()
-                        .small()
-                        .label("Open Folder…")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_folder(&OpenFolder, window, cx);
-                        })),
-                );
+            return Self::render_no_folder(cx);
         };
 
         let folder_name = root.file_name().map_or_else(
@@ -5281,6 +5584,8 @@ impl PgGuiApp {
             |name| name.to_string_lossy().into_owned(),
         );
         let dirs = self.tree_dirs.clone();
+        let selected: Rc<HashSet<SharedString>> = Rc::new(self.selected_scripts.clone());
+        let picked = selected.len();
         let view = cx.entity();
         v_flex()
             .size_full()
@@ -5299,6 +5604,12 @@ impl PgGuiApp {
                     .pb_1()
                     .child(Input::new(&self.file_filter_input).xsmall()),
             )
+            // Only shown once a *batch* is picked: a plain click selects
+            // the one file it opens, so a bar at one script would be up
+            // permanently for anyone who never selects a range.
+            .when(picked > 1, |this| {
+                this.child(Self::render_script_run_bar(picked, cx))
+            })
             .child(div().flex_1().min_h(px(0.)).px_1().child(tree(
                 &self.tree_state,
                 move |ix, entry, _selected, _window, cx| {
@@ -5316,11 +5627,17 @@ impl PgGuiApp {
                         } else {
                             "▸"
                         };
+                        // The tree owns its own single selection (and
+                        // overwrites `ListItem::selected` after this
+                        // closure returns), so a picked script is marked
+                        // with its own background instead.
+                        let is_picked = selected.contains(&item.id);
                         let list_item = ListItem::new(ix)
                             .w_full()
                             .rounded(cx.theme().radius)
                             .px_2()
                             .pl(px(14.) * entry.depth() + px(8.))
+                            .when(is_picked, |this| this.bg(cx.theme().accent))
                             .child(
                                 h_flex()
                                     .gap_1()
@@ -5339,10 +5656,27 @@ impl PgGuiApp {
                             // click handling.
                             list_item
                         } else {
+                            // Plain click opens the script and re-anchors;
+                            // shift-click takes the range from the anchor,
+                            // cmd/ctrl-click toggles the one row. Only a
+                            // plain click opens a tab — extending a
+                            // selection shouldn't fill the tab bar.
+                            let id = item.id.clone();
                             let path = PathBuf::from(item.id.to_string());
-                            list_item.on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_path(&path, window, cx);
-                            }))
+                            list_item.on_click(cx.listener(
+                                move |this, event: &ClickEvent, window, cx| {
+                                    let modifiers = event.modifiers();
+                                    if modifiers.shift {
+                                        this.extend_script_selection(&id);
+                                    } else if modifiers.secondary() {
+                                        this.toggle_script(&id);
+                                    } else {
+                                        this.select_script(&id);
+                                        this.open_path(&path, window, cx);
+                                    }
+                                    cx.notify();
+                                },
+                            ))
                         }
                     })
                 },
@@ -6059,6 +6393,7 @@ impl Render for PgGuiApp {
             .capture_action(cx.listener(Self::on_editor_tab))
             .capture_action(cx.listener(Self::on_editor_escape))
             .on_action(cx.listener(Self::run_query))
+            .on_action(cx.listener(Self::run_scripts))
             .on_action(cx.listener(Self::toggle_autocommit))
             .on_action(cx.listener(Self::commit_txn))
             .on_action(cx.listener(Self::rollback_txn))

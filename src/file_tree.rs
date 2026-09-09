@@ -155,6 +155,52 @@ fn project(
     )
 }
 
+/// The ids of `items` in the order the tree draws them: pre-order, and a
+/// folder's children only while it is expanded. `TreeItem` keeps its
+/// expanded flag behind a shared `Rc`, so this reads the *live* state of
+/// the items handed to `TreeState::set_items` and stays index-aligned with
+/// the row index the tree passes its renderer — which is what lets a
+/// shift-click resolve the rows between two clicks without the tree
+/// exposing its own entry list.
+pub fn visible_ids(items: &[TreeItem]) -> Vec<SharedString> {
+    fn walk(items: &[TreeItem], out: &mut Vec<SharedString>) {
+        for item in items {
+            out.push(item.id.clone());
+            if item.is_expanded() {
+                walk(&item.children, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(items, &mut out);
+    out
+}
+
+/// Every id in `items`, pre-order, whether or not its folder is expanded.
+/// Unlike [`visible_ids`] this is not index-aligned with the drawn rows; it
+/// exists to order a set of picked scripts the way the tree lists them,
+/// including any that sit inside a folder the user has since collapsed.
+pub fn ordered_ids(items: &[TreeItem]) -> Vec<SharedString> {
+    fn walk(items: &[TreeItem], out: &mut Vec<SharedString>) {
+        for item in items {
+            out.push(item.id.clone());
+            walk(&item.children, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(items, &mut out);
+    out
+}
+
+/// Every path the last scan found, so selections whose file has since been
+/// deleted or renamed can be dropped.
+pub fn scanned_ids(nodes: &[FileNode], out: &mut HashSet<SharedString>) {
+    for node in nodes {
+        out.insert(node.path.to_string_lossy().into_owned().into());
+        scanned_ids(&node.children, out);
+    }
+}
+
 /// Whether the panel lets this file be opened: `.sql`, any casing.
 pub fn is_sql(path: &Path) -> bool {
     path.extension()
@@ -312,6 +358,66 @@ mod tests {
         let items = to_tree_items(&nodes, &expanded, "top", &mut dirs);
         let labels: Vec<String> = items.iter().map(|i| i.label.to_string()).collect();
         assert_eq!(labels, ["top.sql"]);
+    }
+
+    #[test]
+    fn visible_ids_follow_expansion_and_ordered_ids_do_not() {
+        let tree = TempTree::new(
+            "visible",
+            &[
+                ("scripts/one.sql", false),
+                ("scripts/two.sql", false),
+                ("top.sql", false),
+            ],
+        );
+        let nodes = tree.scan();
+        let scripts_id: SharedString = tree.0.join("scripts").to_string_lossy().into_owned().into();
+        let mut dirs = HashSet::new();
+        let items = to_tree_items(&nodes, &HashSet::new(), "", &mut dirs);
+
+        // Collapsed: the folder's children are not drawn…
+        let names = |ids: Vec<SharedString>| -> Vec<String> {
+            ids.iter()
+                .map(|id| {
+                    Path::new(id.as_ref())
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect()
+        };
+        assert_eq!(names(visible_ids(&items)), ["scripts", "top.sql"]);
+        // …but they still order as the tree lists them.
+        assert_eq!(
+            names(ordered_ids(&items)),
+            ["scripts", "one.sql", "two.sql", "top.sql"]
+        );
+
+        // Expanding is what a click does: it mutates the shared state of
+        // the very items handed to the widget, so `visible_ids` sees it
+        // without a rebuild.
+        let expanded = to_tree_items(&nodes, &HashSet::from([scripts_id]), "", &mut dirs);
+        assert_eq!(
+            names(visible_ids(&expanded)),
+            ["scripts", "one.sql", "two.sql", "top.sql"]
+        );
+    }
+
+    #[test]
+    fn scanned_ids_covers_every_entry() {
+        let tree = TempTree::new(
+            "scanned",
+            &[("scripts/one.sql", false), ("notes.txt", false)],
+        );
+        let mut ids = HashSet::new();
+        scanned_ids(&tree.scan(), &mut ids);
+        let id =
+            |rel: &str| -> SharedString { tree.0.join(rel).to_string_lossy().into_owned().into() };
+        assert!(ids.contains(&id("scripts")));
+        assert!(ids.contains(&id("scripts/one.sql")));
+        assert!(ids.contains(&id("notes.txt")));
+        assert!(!ids.contains(&id("gone.sql")));
     }
 
     #[test]
