@@ -4574,6 +4574,48 @@ impl PgGuiApp {
         self.set_status(format!("Opened {}", path.display()), cx);
     }
 
+    /// Create a new script under `dir` — the "+" on a folder row in the
+    /// files panel — and open it in a tab. The name comes from the
+    /// platform's save dialog (which can also land the file elsewhere);
+    /// anything it returns is forced to `.sql`, since the panel only opens
+    /// and runs those. An existing file is never clobbered.
+    fn new_script_in(dir: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_new_path(dir, Some("script.sql"));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(path))) = rx.await else {
+                return;
+            };
+            let path = if file_tree::is_sql(&path) {
+                path
+            } else {
+                path.with_extension("sql")
+            };
+            // `create_new` rather than `write`: the dialog's own overwrite
+            // confirmation was for the name it returned, which the `.sql`
+            // above may have changed underneath it.
+            let created = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map(|_| ());
+
+            this.update_in(cx, |this, window, cx| match created {
+                Ok(()) => {
+                    // The panel re-scans on a timer; show the file now.
+                    this.tree_signature = 0;
+                    this.load_tree(cx);
+                    this.open_path(&path, window, cx);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    this.set_status(format!("{} already exists", path.display()), cx);
+                }
+                Err(err) => this.set_status(format!("Create failed: {err}"), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Pick the working directory shown in the files side panel.
     pub fn open_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
         let dialog = rfd::AsyncFileDialog::new()
@@ -5544,6 +5586,80 @@ impl PgGuiApp {
             )
     }
 
+    /// A folder row in the files panel: the tree's own click handling
+    /// expands it, so the row only adds the "+" that creates a script
+    /// inside it, hidden until the row is hovered.
+    fn render_folder_row(
+        list_item: ListItem,
+        label_row: gpui::Div,
+        id: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> ListItem {
+        let dir = PathBuf::from(id.to_string());
+        list_item.child(
+            h_flex()
+                .group("file-row")
+                .w_full()
+                .justify_between()
+                .items_center()
+                .child(label_row)
+                .child(
+                    div()
+                        .invisible()
+                        .group_hover("file-row", gpui::Styled::visible)
+                        // The tree toggles a row on mouse-down; swallow it
+                        // here so pressing "+" doesn't also collapse the
+                        // folder.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            Button::new(SharedString::from(format!("new-script-{id}")))
+                                .ghost()
+                                .xsmall()
+                                .tooltip("New script here")
+                                .label("+")
+                                .on_click(cx.listener(move |_, _, window, cx| {
+                                    cx.stop_propagation();
+                                    Self::new_script_in(&dir, window, cx);
+                                })),
+                        ),
+                ),
+        )
+    }
+
+    /// The files panel's title row: the working folder's name, and the "+"
+    /// that creates a script directly inside it — the root has no row of
+    /// its own in the tree, where every other folder carries its own.
+    fn render_files_header(
+        root: PathBuf,
+        folder_name: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        h_flex()
+            .px_2()
+            .py_1()
+            .justify_between()
+            .items_center()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .truncate()
+                    .child(folder_name),
+            )
+            .child(
+                Button::new("new-script-root")
+                    .ghost()
+                    .xsmall()
+                    .tooltip("New script in this folder")
+                    .label("+")
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        Self::new_script_in(&root, window, cx);
+                    })),
+            )
+    }
+
     /// The files panel's "Run N script(s)" bar, shown while scripts are
     /// picked: runs them in tree order, or drops the selection.
     fn render_script_run_bar(picked: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -5589,15 +5705,7 @@ impl PgGuiApp {
         let view = cx.entity();
         v_flex()
             .size_full()
-            .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .truncate()
-                    .child(folder_name),
-            )
+            .child(Self::render_files_header(root, folder_name, cx))
             .child(
                 div()
                     .px_1()
@@ -5632,29 +5740,25 @@ impl PgGuiApp {
                         // closure returns), so a picked script is marked
                         // with its own background instead.
                         let is_picked = selected.contains(&item.id);
+                        let label_row = h_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .w_4()
+                                    .flex_none()
+                                    .text_center()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(glyph),
+                            )
+                            .child(item.label.clone());
                         let list_item = ListItem::new(ix)
                             .w_full()
                             .rounded(cx.theme().radius)
                             .px_2()
                             .pl(px(14.) * entry.depth() + px(8.))
-                            .when(is_picked, |this| this.bg(cx.theme().accent))
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .w_4()
-                                            .flex_none()
-                                            .text_center()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(glyph),
-                                    )
-                                    .child(item.label.clone()),
-                            );
+                            .when(is_picked, |this| this.bg(cx.theme().accent));
                         if is_dir {
-                            // Folders expand through the tree's own
-                            // click handling.
-                            list_item
+                            Self::render_folder_row(list_item, label_row, &item.id, cx)
                         } else {
                             // Plain click opens the script and re-anchors;
                             // shift-click takes the range from the anchor,
@@ -5663,7 +5767,7 @@ impl PgGuiApp {
                             // selection shouldn't fill the tab bar.
                             let id = item.id.clone();
                             let path = PathBuf::from(item.id.to_string());
-                            list_item.on_click(cx.listener(
+                            list_item.child(label_row).on_click(cx.listener(
                                 move |this, event: &ClickEvent, window, cx| {
                                     let modifiers = event.modifiers();
                                     if modifiers.shift {

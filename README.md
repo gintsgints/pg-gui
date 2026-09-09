@@ -42,6 +42,10 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
   inserting, `tab` visits each stop in order with its placeholder selected.
   Snippets also appear in the editor's completion menu: type words of the
   name or the SQL's leading words ("create seq…") and accept the suggestion
+- **New scripts in place**: the "+" on the files panel's title row creates a
+  script in the working folder, and the one that appears on a folder row when
+  you hover it creates one inside that folder; the file opens in a tab as soon
+  as it is made
 - **Run scripts from the files panel** (`cmd-shift-enter` or Connection ▸ Run
   Selected Scripts): click a `.sql` file, shift-click another to take the
   range, cmd-click to add or drop one, then run them all against the current
