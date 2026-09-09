@@ -45,7 +45,7 @@ use crate::{
     OpenRecentFolder, OpenSnippets, PrevTab, Quit, RefreshDbTree, Rollback, RunQuery, SaveFile,
     SetTheme, ShowHelp, StartDebug, ToggleAutocommit, ToggleComment, ToggleDbPanel,
     ToggleFilesPanel, ToggleFormatOnSave, ToggleResultsPanel, ZoomIn, ZoomOut, ZoomReset, ai,
-    config, db, db_tree, debug, export, file_tree, lsp, snippets, statement,
+    config, db, db_tree, debug, definitions, export, file_tree, lsp, snippets, statement,
 };
 
 /// The project's GitHub page, opened from the About application menu.
@@ -988,7 +988,7 @@ impl ConnectionFields {
 
 /// Percent-decode the reserved characters we encode in [`ConnectionParts::to_url`];
 /// leaves any other `%`-sequence (or a lone `%`) untouched.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -1010,7 +1010,7 @@ fn percent_decode(s: &str) -> String {
 /// Percent-encode the characters that would otherwise be read as URL
 /// delimiters, so a username/password/database containing `@`, `:`, `/`,
 /// etc. round-trips through the connection string.
-fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -1315,6 +1315,10 @@ pub struct PgGuiApp {
     base_mono_font_size: Pixels,
     save_generation: usize,
     lsp: Option<lsp::Client>,
+    /// Symbols already resolved for Go to Definition. Lives here, not in the
+    /// per-editor provider, so every tab shares one cache and a reconnect or
+    /// a browser refresh can drop it in one place.
+    definition_cache: definitions::Cache,
     /// The title-bar connection picker, mirroring `config.recent_connections`
     /// with the active connection selected.
     connections: Entity<ComboboxState<SearchableVec<ConnectionItem>>>,
@@ -1466,6 +1470,7 @@ impl PgGuiApp {
             base_mono_font_size: cx.theme().mono_font_size,
             save_generation: 0,
             lsp: None,
+            definition_cache: definitions::Cache::default(),
             connections,
             #[cfg(not(target_os = "macos"))]
             app_menu_bar: AppMenuBar::new(cx),
@@ -1558,8 +1563,22 @@ impl PgGuiApp {
         });
         // Snippet suggestions work from the start; the language server's
         // richer provider replaces this once (and whenever) it connects.
+        //
+        // Go to Definition is the app's own catalog lookup, so it is wired
+        // here rather than with the language server's providers: cmd-hover
+        // resolves the symbol, and the `show_document` hook takes the jump
+        // away from the editor (which could only move the cursor inside this
+        // buffer) so the object opens in its file or a definition tab.
+        let weak = cx.weak_entity();
         editor.update(cx, |state, _| {
             state.lsp.completion_provider = Some(Rc::new(lsp::SnippetCompletions));
+            state.lsp.definition_provider = Some(Rc::new(definitions::Provider::new(weak.clone())));
+            state.lsp.show_document = Some(Rc::new(move |params, window, cx| {
+                weak.update(cx, |this, cx| {
+                    this.show_definition_document(params, window, cx)
+                })
+                .unwrap_or(false)
+            }));
         });
         let subscription = cx.subscribe_in(&editor, window, Self::on_editor_event);
         let disk_time = tab.file.as_deref().and_then(file_mtime);
@@ -2169,6 +2188,9 @@ impl PgGuiApp {
     fn load_db_schemas(&mut self, cx: &mut Context<Self>) {
         self.db_nodes.clear();
         self.db_expanded.clear();
+        // Objects may have been created or dropped since the last browse, and
+        // a Go to Definition miss is cached; a refresh re-asks for both.
+        self.definition_cache.clear();
         let conn = self.config.connection_string.clone();
         if conn.is_empty() {
             self.db_schema_load = DbSchemaLoad::Ready;
@@ -2268,6 +2290,45 @@ impl PgGuiApp {
         self.rebuild_db_tree(cx);
     }
 
+    /// The connection Go to Definition resolves symbols against.
+    pub(crate) fn connection_string(&self) -> &str {
+        &self.config.connection_string
+    }
+
+    /// What the Go to Definition cache knows about a symbol.
+    pub(crate) fn definition_cache_get(
+        &mut self,
+        conn: &str,
+        key: &(String, String),
+    ) -> definitions::Cached {
+        self.definition_cache.get(conn, key)
+    }
+
+    /// Remember a Go to Definition lookup, hit or miss.
+    pub(crate) fn definition_cache_insert(
+        &mut self,
+        conn: &str,
+        key: (String, String),
+        target: Option<definitions::Target>,
+    ) {
+        self.definition_cache.insert(conn, key, target);
+    }
+
+    /// Open the object a `pggui:` link names, i.e. follow a Go to Definition
+    /// from the editor. Returns whether the link was ours to handle.
+    fn show_definition_document(
+        &mut self,
+        params: &lsp_types::ShowDocumentParams,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(target) = definitions::parse_uri(&params.uri) else {
+            return false;
+        };
+        self.open_object(target.kind, &target.schema, &target.object, "", window, cx);
+        true
+    }
+
     /// Handle a click on an object leaf in the database browser: open the
     /// object's `.sql` file if one exists in the working directory, otherwise
     /// fetch its definition and open that in a new tab. Folders and
@@ -2276,13 +2337,34 @@ impl PgGuiApp {
         let Some(node) = db_tree::find(&self.db_nodes, id) else {
             return;
         };
-        let kind = node.kind;
+        let (kind, schema, object, relation) = (
+            node.kind,
+            node.schema.to_string(),
+            node.object.to_string(),
+            node.relation.to_string(),
+        );
+        self.open_object(kind, &schema, &object, &relation, window, cx);
+    }
+
+    /// Open a database object identified by kind, schema and name: its `.sql`
+    /// file from the working directory when one matches, otherwise its
+    /// definition fetched from the catalog into a tab. Shared by the object
+    /// browser and Go to Definition, which name the same objects the same way
+    /// (a routine's `object` is its `name(identity arguments)` signature).
+    fn open_object(
+        &mut self,
+        kind: db_tree::NodeKind,
+        schema: &str,
+        object: &str,
+        relation: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !object_kind_has_definition(kind) {
             return;
         }
-        let schema = node.schema.to_string();
-        let object = node.object.to_string();
-        let relation = node.relation.to_string();
+        let (schema, object, relation) =
+            (schema.to_string(), object.to_string(), relation.to_string());
         // A function leaf's `object` is a `name(args)` signature; the file is
         // named after the bare routine name.
         let stem = object

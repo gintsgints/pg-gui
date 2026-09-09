@@ -679,6 +679,74 @@ pub fn list_functions(conn_str: &str, schema: &str) -> Result<Vec<String>, Strin
         .collect())
 }
 
+/// One object a bare name in the editor could refer to: its kind (as the
+/// browser's `relkind`-style tag), schema, and the name the definition
+/// queries expect — a `name(identity arguments)` signature for a routine,
+/// the plain name for a relation.
+pub struct ObjectRef {
+    pub kind: String,
+    pub schema: String,
+    pub object: String,
+}
+
+/// Resolve an identifier written in a script to the routine or relation it
+/// names, for Go to Definition. `schema` is the qualifier the identifier
+/// carried, if any; without one, `search_path` visibility decides between
+/// same-named objects (`pg_*_is_visible`), so a call resolves the way the
+/// server would resolve it.
+///
+/// Routines win over relations of the same name, matching what a click on a
+/// call site means. An unquoted identifier is folded to lower case by the
+/// server, so both the text as written and its lowercased form are tried.
+pub fn find_object(
+    conn_str: &str,
+    schema: Option<&str>,
+    name: &str,
+) -> Result<Option<ObjectRef>, String> {
+    let names = format!(
+        "({}, {})",
+        quote_literal(name),
+        quote_literal(&name.to_lowercase())
+    );
+    let schema_filter = schema.map_or(String::new(), |schema| {
+        format!(
+            " AND n.nspname IN ({}, {})",
+            quote_literal(schema),
+            quote_literal(&schema.to_lowercase())
+        )
+    });
+    let sql = format!(
+        "SELECT kind, schema, object FROM ( \
+           SELECT 'function' AS kind, n.nspname AS schema, \
+                  p.proname || '(' \
+                    || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' AS object, \
+                  pg_catalog.pg_function_is_visible(p.oid) AS visible, 0 AS rank \
+           FROM pg_catalog.pg_proc p \
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+           WHERE p.proname IN {names} \
+             AND n.nspname NOT IN ('pg_catalog', 'information_schema'){schema_filter} \
+           UNION ALL \
+           SELECT CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'matview' ELSE 'table' END, \
+                  n.nspname, c.relname, \
+                  pg_catalog.pg_table_is_visible(c.oid), 1 \
+           FROM pg_catalog.pg_class c \
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+           WHERE c.relname IN {names} \
+             AND c.relkind IN ('r', 'p', 'v', 'm') \
+             AND n.nspname NOT IN ('pg_catalog', 'information_schema'){schema_filter} \
+         ) candidates \
+         ORDER BY visible DESC, rank, schema, object \
+         LIMIT 1"
+    );
+    Ok(catalog_rows(conn_str, &sql)?.first().and_then(|row| {
+        Some(ObjectRef {
+            kind: row.get(0)?.to_string(),
+            schema: row.get(1)?.to_string(),
+            object: row.get(2)?.to_string(),
+        })
+    }))
+}
+
 /// User-defined type names in `schema` (composite, enum, domain, base),
 /// ordered. Array and implicit relation row types are excluded, matching
 /// psql's `\dT`.

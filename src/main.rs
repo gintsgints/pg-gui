@@ -7,6 +7,7 @@ mod config;
 mod db;
 mod db_tree;
 mod debug;
+mod definitions;
 mod export;
 mod file_tree;
 mod instance;
