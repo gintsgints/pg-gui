@@ -2,9 +2,10 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use postgres::error::ErrorPosition;
+use postgres::error::{DbError, ErrorPosition};
 use postgres::{Client, NoTls, SimpleQueryMessage, SimpleQueryRow};
 
 use crate::{export, statement};
@@ -14,11 +15,55 @@ use crate::{export, statement};
 /// OS-level TCP timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// Connect with [`CONNECT_TIMEOUT`] applied.
-fn connect(conn_str: &str) -> Result<Client, postgres::Error> {
+/// Where a connection's server notices (`RAISE NOTICE`/`WARNING`/`INFO`,
+/// deprecation warnings, …) pile up until the run that caused them drains
+/// them. Notices arrive out of band, on the connection's async-message
+/// stream rather than as query results, so nothing on the `simple_query`
+/// path can see them; the driver only hands them to a callback, which fires
+/// on whichever thread is driving the connection — the one running the
+/// statement.
+pub type Notices = Arc<Mutex<Vec<String>>>;
+
+/// One notice rendered for the log. Same shape as [`describe`] minus the
+/// SQLSTATE, which says nothing useful for a plain `RAISE NOTICE`.
+pub(crate) fn notice_line(notice: &DbError) -> String {
+    let mut out = format!("{}: {}", notice.severity(), notice.message());
+    if let Some(detail) = notice.detail() {
+        out.push_str(" — Detail: ");
+        out.push_str(detail);
+    }
+    if let Some(hint) = notice.hint() {
+        out.push_str(" — Hint: ");
+        out.push_str(hint);
+    }
+    out
+}
+
+/// Connect with [`CONNECT_TIMEOUT`] applied, collecting server notices into
+/// `notices` when one is given (the one-shot catalog queries below have no
+/// use for them).
+fn connect_collecting(
+    conn_str: &str,
+    notices: Option<&Notices>,
+) -> Result<Client, postgres::Error> {
     let mut config = conn_str.parse::<postgres::Config>()?;
     config.connect_timeout(CONNECT_TIMEOUT);
+    if let Some(notices) = notices {
+        let sink = Arc::clone(notices);
+        config.notice_callback(move |notice| {
+            // A poisoned lock only means a previous drain panicked; losing
+            // notices is not worth taking the connection down over.
+            if let Ok(mut sink) = sink.lock() {
+                sink.push(notice_line(&notice));
+            }
+        });
+    }
     config.connect(NoTls)
+}
+
+/// Connect with [`CONNECT_TIMEOUT`] applied, discarding server notices.
+fn connect(conn_str: &str) -> Result<Client, postgres::Error> {
+    connect_collecting(conn_str, None)
 }
 
 /// Render an error with its full cause. `postgres::Error`'s `Display` is
@@ -84,6 +129,8 @@ pub struct ResultSet {
 pub enum RunEvent {
     /// A statement finished: its log line.
     Log(String),
+    /// A statement raised a server notice while running.
+    Notice(String),
     /// A statement returned rows.
     Result(ResultSet),
 }
@@ -151,6 +198,9 @@ fn collect_outcome(results: Vec<SimpleQueryMessage>) -> QueryOutcome {
 /// cursor (autocommit on).
 pub struct Session {
     client: Client,
+    /// Notices raised by this connection since the last drain, filled by the
+    /// driver's callback while a statement runs.
+    notices: Notices,
     /// `_pg_gui_results` is declared and not yet closed.
     cursor_open: bool,
     /// A user transaction (autocommit off) is open.
@@ -227,12 +277,24 @@ impl Session {
     /// Open a session over `conn_str`. The connection stays open until the
     /// session is dropped.
     pub fn connect(conn_str: &str) -> Result<Self, postgres::Error> {
+        let notices = Notices::default();
         Ok(Self {
-            client: connect(conn_str)?,
+            client: connect_collecting(conn_str, Some(&notices))?,
+            notices,
             cursor_open: false,
             in_txn: false,
             implicit_txn: false,
         })
+    }
+
+    /// Take the notices raised since the last call. The run path drains after
+    /// every statement; [`Self::fetch_more`] and the transaction commands
+    /// leave it to the caller, which logs them the same way.
+    pub fn take_notices(&mut self) -> Vec<String> {
+        self.notices
+            .lock()
+            .map(|mut notices| std::mem::take(&mut *notices))
+            .unwrap_or_default()
     }
 
     /// A token usable from another thread to cancel the query currently
@@ -353,6 +415,11 @@ impl Session {
                 .map(|results| (collect_outcome(results), false))
                 .map_err(|e| describe(&e)),
         };
+        // Whatever the statement raised on its way through — including a
+        // statement that then failed — belongs above its log line.
+        for notice in self.take_notices() {
+            send(progress, RunEvent::Notice(notice));
+        }
         let (outcome, more) = match run {
             Ok(run) => run,
             Err(error) => {
@@ -1224,6 +1291,7 @@ mod tests {
     #[derive(Debug)]
     struct Run {
         log: Vec<String>,
+        notices: Vec<String>,
         sets: Vec<ResultSet>,
         more: bool,
     }
@@ -1246,16 +1314,19 @@ mod tests {
         let result = session.run(sql, batch_size, true, &tx);
         drop(tx);
         let mut log = Vec::new();
+        let mut notices = Vec::new();
         let mut sets = Vec::new();
         for event in futures::executor::block_on_stream(rx) {
             match event {
                 RunEvent::Log(line) => log.push(line),
+                RunEvent::Notice(line) => notices.push(line),
                 RunEvent::Result(set) => sets.push(set),
             }
         }
         match result {
             Ok(run) => Ok(Run {
                 log,
+                notices,
                 sets,
                 more: run.more,
             }),
@@ -1305,6 +1376,28 @@ mod tests {
             content.lines().next().unwrap(),
             "INSERT INTO my_table (\"name\", \"note\") VALUES ('O''Brien', NULL);"
         );
+    }
+
+    #[test]
+    #[ignore = "requires the docker compose database on localhost:5433"]
+    fn raise_notice_is_reported() {
+        let mut session = Session::connect(CONN).unwrap();
+        let raised = run(
+            &mut session,
+            "DO $$ BEGIN RAISE NOTICE 'hello %', 42; RAISE WARNING 'careful'; END $$;",
+            50,
+        )
+        .unwrap();
+        assert_eq!(
+            raised.notices,
+            vec![
+                "NOTICE: hello 42".to_string(),
+                "WARNING: careful".to_string()
+            ]
+        );
+        // Drained by the statement that raised them, so the next run is clean.
+        let quiet = run(&mut session, "SELECT 1", 50).unwrap();
+        assert!(quiet.notices.is_empty(), "{:?}", quiet.notices);
     }
 
     #[test]

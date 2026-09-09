@@ -37,6 +37,10 @@ pub enum DebugEvent {
     Stopped(StopState),
     /// The target routine returned; carries a best-effort render of its result.
     Output(String),
+    /// The debugged routine raised a server notice (`RAISE NOTICE`/`WARNING`,
+    /// …) while running. Arrives live from the target connection, so a
+    /// routine stepped through reports each notice as it is raised.
+    Notice(String),
     /// The debugged execution finished (or was aborted); the session is over.
     Terminated,
     /// The session could not start, or a control op failed hard.
@@ -598,7 +602,14 @@ fn run_target(run: &TargetRun) {
 
 /// Connect, build the call, run it, and report its result or failure.
 fn invoke_target(run: &TargetRun) -> Outcome {
-    let mut client = match run.config.connect(NoTls) {
+    // The routine's own `RAISE` output only reaches the client over this
+    // connection's async-message stream; without a sink the driver drops it.
+    let mut config = run.config.clone();
+    let notices = run.event_tx.clone();
+    config.notice_callback(move |notice| {
+        let _ = notices.unbounded_send(DebugEvent::Notice(crate::db::notice_line(&notice)));
+    });
+    let mut client = match config.connect(NoTls) {
         Ok(client) => client,
         Err(err) => {
             let _ = run.event_tx.unbounded_send(DebugEvent::Error(format!(

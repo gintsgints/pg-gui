@@ -3097,7 +3097,9 @@ impl PgGuiApp {
         };
         let mut rows = false;
         match event {
-            db::RunEvent::Log(line) => self.tabs[ix].result.log.push(SharedString::from(line)),
+            db::RunEvent::Log(line) | db::RunEvent::Notice(line) => {
+                self.tabs[ix].result.log.push(SharedString::from(line));
+            }
             db::RunEvent::Result(set) => {
                 rows = !set.rows.is_empty();
                 let result = &mut self.tabs[ix].result;
@@ -4105,12 +4107,15 @@ impl PgGuiApp {
 
         cx.spawn_in(window, async move |this, cx| {
             let started = std::time::Instant::now();
-            let (session, result) = cx
+            let (mut session, result) = cx
                 .background_spawn(async move {
                     let result = session.fetch_more(batch_size);
                     (session, result)
                 })
                 .await;
+            // The fetch runs outside the Run path's progress channel, so its
+            // notices are drained here instead.
+            let notices = session.take_notices();
             let elapsed = started.elapsed();
 
             this.update_in(cx, |this, window, cx| match result {
@@ -4120,6 +4125,9 @@ impl PgGuiApp {
                     };
                     let fetched = rows.len();
                     let result = &mut this.tabs[ix].result;
+                    result
+                        .log
+                        .extend(notices.into_iter().map(SharedString::from));
                     // Only a lone statement pages, so the cursor's rows
                     // belong to the one result set the run produced.
                     let total = match result.results.last_mut() {
@@ -5653,6 +5661,15 @@ impl PgGuiApp {
                 stopped = true;
             }
             debug::DebugEvent::Output(output) => dbg.output = Some(output),
+            // The debug panel replaces the results table, so a notice raised
+            // mid-step goes to the launching tab's message log, where the
+            // Run path's notices land too.
+            debug::DebugEvent::Notice(line) => {
+                let tab_id = dbg.tab_id;
+                if let Some(ix) = self.tab_index_by_id(tab_id) {
+                    self.tabs[ix].result.log.push(SharedString::from(line));
+                }
+            }
             debug::DebugEvent::Error(err) => {
                 dbg.output = Some(err.clone());
                 status = Some(format!("Debug error: {err}"));
