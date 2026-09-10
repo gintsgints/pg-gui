@@ -3253,6 +3253,130 @@ impl PgGuiApp {
             self.set_status("No scripts selected", cx);
             return;
         }
+        self.prompt_run_scripts(files, window, cx);
+    }
+
+    /// The name the current connection goes by in the UI — its saved name,
+    /// or its URL with the password masked when it has none.
+    fn connection_label(&self) -> String {
+        self.config
+            .recent_connections
+            .iter()
+            .find(|c| c.url == self.config.connection_string && !c.name.is_empty())
+            .map_or_else(
+                || mask_credentials(&self.config.connection_string),
+                |c| c.name.clone(),
+            )
+    }
+
+    /// Confirm a batch before it runs. A batch is the one action here that
+    /// executes files the user is not looking at — several of them, against
+    /// whatever connection the window happens to be on — so it names the
+    /// target and lists the files rather than starting on a stray
+    /// cmd-shift-enter.
+    fn prompt_run_scripts(
+        &mut self,
+        files: Vec<(String, PathBuf)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A long selection would push the buttons off-screen; the tail is
+        // summarised instead.
+        const SHOWN: usize = 12;
+
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let count = files.len();
+        let target = self.connection_label();
+        let listed: Vec<String> = files
+            .iter()
+            .take(SHOWN)
+            .map(|(label, _)| label.clone())
+            .collect();
+        let rest = count.saturating_sub(listed.len());
+        let app = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let (run, files) = (app.clone(), files.clone());
+            let mut list = v_flex().gap_0p5();
+            for label in listed.clone() {
+                list = list.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label),
+                );
+            }
+            if rest > 0 {
+                list = list.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("…and {rest} more")),
+                );
+            }
+            dialog
+                .title("Run scripts")
+                // Enter runs, Escape cancels (the dialog's own binding).
+                .on_ok({
+                    let (run, files) = (run.clone(), files.clone());
+                    move |_, window, cx| {
+                        let files = files.clone();
+                        run.update(cx, |this, cx| this.start_script_run(files, window, cx))
+                            .is_ok()
+                    }
+                })
+                .w(px(480.))
+                .child(
+                    v_flex()
+                        .gap_4()
+                        .pb_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .child(format!("Run {count} script(s) on “{target}”?")),
+                        )
+                        .child(list)
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(Button::new("cancel").label("Cancel").on_click(
+                                    |_, window, cx| {
+                                        window.close_dialog(cx);
+                                    },
+                                ))
+                                .child(
+                                    Button::new("run")
+                                        .primary()
+                                        .label(format!("Run {count} script(s)"))
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            let files = files.clone();
+                                            run.update(cx, |this, cx| {
+                                                this.start_script_run(files, window, cx);
+                                            })
+                                            .ok();
+                                        }),
+                                ),
+                        ),
+                )
+        });
+    }
+
+    /// Run a confirmed batch: see [`PgGuiApp::run_scripts`].
+    fn start_script_run(
+        &mut self,
+        files: Vec<(String, PathBuf)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        if tab.running {
+            return;
+        }
         let count = files.len();
 
         let conn = self.config.connection_string.clone();
