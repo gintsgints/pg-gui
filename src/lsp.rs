@@ -46,6 +46,16 @@ use crate::config::CaseStyle;
 /// (potentially database-touching) diagnostics analysis.
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// Stack for the document worker. Every language feature parses the statement
+/// under the cursor, and `pgls_query` parses by decoding `libpg_query`'s protobuf
+/// AST with `prost`: the generated decoder for the `Node` message — a `oneof`
+/// with hundreds of variants — has enormous stack frames, so a handful of
+/// nesting levels (a `CREATE TABLE`'s `ColumnDef` → `TypeName` is already
+/// enough) overruns a thread's default 2 MiB and aborts the process. A stack
+/// overflow cannot be caught, so [`contain_panic`] is no help here; the only
+/// defence is room. This is address space, committed page by page as used.
+const WORKER_STACK: usize = 64 * 1024 * 1024;
+
 /// Run a workspace call, containing any panic inside the `pgls_*` crates.
 /// The language server panics on some inputs (e.g. its tree-sitter scope
 /// tracker), and a panic unwinding into the background executor's
@@ -202,6 +212,7 @@ impl Client {
         let worker_path = path.clone();
         std::thread::Builder::new()
             .name("pg-lsp-document".into())
+            .stack_size(WORKER_STACK)
             .spawn(move || {
                 document_worker(&worker_workspace, &worker_path, &doc_rx, &diagnostics_tx);
             })?;
@@ -840,9 +851,22 @@ mod tests {
 
     use lsp_types::CompletionItem;
 
-    use super::{CaseStyle, Client, clamp_filter_text, contain_panic, to_text_size};
+    use super::{CaseStyle, Client, WORKER_STACK, clamp_filter_text, contain_panic, to_text_size};
     use pgls_workspace::features::completions::GetCompletionsParams;
     use pgls_workspace::features::on_hover::OnHoverParams;
+
+    /// Run a workspace probe with the stack the document worker gets. These
+    /// tests call the workspace directly instead of going through the worker,
+    /// and parsing overruns a default thread stack ([`WORKER_STACK`]) — which
+    /// aborts the test binary rather than failing a test.
+    fn on_worker_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(WORKER_STACK)
+            .spawn(f)
+            .expect("probe thread starts")
+            .join()
+            .expect("probe thread does not panic")
+    }
 
     fn item(label: &str, filter_text: Option<&str>) -> CompletionItem {
         CompletionItem {
@@ -872,6 +896,24 @@ mod tests {
         assert_eq!(items[1].filter_text.as_deref(), Some("ab"));
     }
 
+    /// Hover at every byte offset of `text`. Contained panics come back as
+    /// errors; only an uncontained panic (or an abort) fails the test.
+    fn hover_every_position(client: &Client, text: &str) {
+        let workspace = client.inner.workspace.clone();
+        let path = client.inner.path.clone();
+        let len = text.len();
+        on_worker_stack(move || {
+            for position in 0..len {
+                let _ = contain_panic(|| {
+                    workspace.on_hover(OnHoverParams {
+                        path: path.clone(),
+                        position: to_text_size(position),
+                    })
+                });
+            }
+        });
+    }
+
     /// Hovering a buffer holding snippet tab-stop markers must never take
     /// the app down: `pgls_treesitter`'s scope tracker panics on some such
     /// inputs (SIGABRT'd the app in the wild on 2026-07-12), and
@@ -888,16 +930,7 @@ mod tests {
         )
         .expect("client starts without a database");
 
-        for position in 0..text.len() {
-            // Contained panics come back as errors; only an uncontained
-            // panic (or abort) can fail this test.
-            let _ = contain_panic(|| {
-                client.inner.workspace.on_hover(OnHoverParams {
-                    path: client.inner.path.clone(),
-                    position: to_text_size(position),
-                })
-            });
-        }
+        hover_every_position(&client, text);
         client.shutdown();
     }
 
@@ -916,14 +949,7 @@ mod tests {
         )
         .expect("client starts");
 
-        for position in 0..text.len() {
-            let _ = contain_panic(|| {
-                client.inner.workspace.on_hover(OnHoverParams {
-                    path: client.inner.path.clone(),
-                    position: to_text_size(position),
-                })
-            });
-        }
+        hover_every_position(&client, text);
         client.shutdown();
     }
 
@@ -989,14 +1015,15 @@ mod tests {
         // Schema-aware completions: the public `orders` table is offered for
         // the `o` prefix, which only works if the schema cache loaded from the
         // database.
-        let completions = client
-            .inner
-            .workspace
-            .get_completions(GetCompletionsParams {
-                path: client.inner.path.clone(),
+        let workspace = client.inner.workspace.clone();
+        let path = client.inner.path.clone();
+        let completions = on_worker_stack(move || {
+            workspace.get_completions(GetCompletionsParams {
+                path,
                 position: to_text_size("SELECT * FROM o".len()),
             })
-            .expect("completions");
+        })
+        .expect("completions");
         let labels: Vec<String> = completions.into_iter().map(|item| item.label).collect();
         assert!(
             labels.iter().any(|label| label == "orders"),
