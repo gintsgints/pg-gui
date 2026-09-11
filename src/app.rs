@@ -21,7 +21,8 @@ use gpui_component::{
     combobox::{Combobox, ComboboxEvent, ComboboxState},
     h_flex,
     input::{
-        Escape as InputEscape, IndentInline, Input, InputEvent, InputState, RopeExt as _, TabSize,
+        Editor, EditorState, Escape as InputEscape, IndentInline, Input, InputEvent, InputState,
+        RopeExt as _, TabSize,
     },
     list::{List, ListEvent, ListItem, ListState},
     resizable::{ResizableState, h_resizable, resizable_panel, v_resizable},
@@ -504,10 +505,10 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
 /// every edit has to be recomputed here instead — otherwise a routine opened
 /// into an existing buffer keeps plain file numbering until the first keypress.
 fn set_editor_value(
-    state: &mut InputState,
+    state: &mut EditorState,
     text: String,
     window: &mut Window,
-    cx: &mut Context<InputState>,
+    cx: &mut Context<EditorState>,
 ) {
     let offset = statement::body_line_offset(&text);
     state.set_value(text, window, cx);
@@ -1137,7 +1138,7 @@ fn toggle_line_comments(block: &str) -> String {
 // excessive-bools lint is a false positive here.
 #[allow(clippy::struct_excessive_bools)]
 struct EditorTab {
-    editor: Entity<InputState>,
+    editor: Entity<EditorState>,
     path: Option<PathBuf>,
     /// The content last written to (or read from) disk — the baseline the
     /// buffer is compared against to decide if the tab has unsaved edits.
@@ -1596,9 +1597,8 @@ impl PgGuiApp {
         cx: &mut Context<Self>,
     ) -> EditorTab {
         let editor = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor("sql")
-                .multi_line(true)
+            EditorState::new(window, cx)
+                .language("sql")
                 .line_number(true)
                 // A routine definition is numbered the way Postgres numbers it
                 // in error messages, i.e. relative to the body.
@@ -1621,9 +1621,10 @@ impl PgGuiApp {
         // buffer) so the object opens in its file or a definition tab.
         let weak = cx.weak_entity();
         editor.update(cx, |state, _| {
-            state.lsp.completion_provider = Some(Rc::new(lsp::SnippetCompletions));
-            state.lsp.definition_provider = Some(Rc::new(definitions::Provider::new(weak.clone())));
-            state.lsp.show_document = Some(Rc::new(move |params, window, cx| {
+            state.lsp_mut().completion_provider = Some(Rc::new(lsp::SnippetCompletions));
+            state.lsp_mut().definition_provider =
+                Some(Rc::new(definitions::Provider::new(weak.clone())));
+            state.lsp_mut().show_document = Some(Rc::new(move |params, window, cx| {
                 weak.update(cx, |this, cx| {
                     this.show_definition_document(params, window, cx)
                 })
@@ -1686,7 +1687,7 @@ impl PgGuiApp {
     }
 
     /// The active tab's editor.
-    fn editor(&self) -> Entity<InputState> {
+    fn editor(&self) -> Entity<EditorState> {
         self.tabs[self.active_tab].editor.clone()
     }
 
@@ -2835,13 +2836,13 @@ impl PgGuiApp {
     /// tab's editor.
     fn attach_lsp_providers(
         client: &lsp::Client,
-        editor: &Entity<InputState>,
+        editor: &Entity<EditorState>,
         cx: &mut Context<Self>,
     ) {
         let provider = Rc::new(lsp::Provider::new(client.clone()));
         editor.update(cx, |state, _| {
-            state.lsp.completion_provider = Some(provider.clone());
-            state.lsp.hover_provider = Some(provider);
+            state.lsp_mut().completion_provider = Some(provider.clone());
+            state.lsp_mut().hover_provider = Some(provider);
         });
     }
 
@@ -2855,8 +2856,8 @@ impl PgGuiApp {
             tab.editor.update(cx, |state, _| {
                 // Fall back to snippets-only completions until the new
                 // server connects.
-                state.lsp.completion_provider = Some(Rc::new(lsp::SnippetCompletions));
-                state.lsp.hover_provider = None;
+                state.lsp_mut().completion_provider = Some(Rc::new(lsp::SnippetCompletions));
+                state.lsp_mut().hover_provider = None;
             });
         }
         self.start_lsp(cx);
@@ -2864,7 +2865,7 @@ impl PgGuiApp {
 
     fn on_editor_event(
         &mut self,
-        state: &Entity<InputState>,
+        state: &Entity<EditorState>,
         event: &InputEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -5416,7 +5417,7 @@ impl PgGuiApp {
         // The SQL editor with its tab bar; always shown.
         let editor = v_flex().size_full().child(self.render_tab_bar(cx)).child(
             div().flex_1().min_h(px(0.)).p_2().child(
-                Input::new(&self.editor())
+                Editor::new(&self.editor())
                     .h_full()
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(cx.theme().mono_font_size),
@@ -6324,7 +6325,7 @@ impl PgGuiApp {
     /// mapping, because only it knows the entry routine's installed source —
     /// the frame the panel happens to be inspecting is not necessarily the
     /// routine a breakpoint would be armed on.
-    fn sync_debug_breakpoint(&self, editor: &Entity<InputState>, row: usize, set: bool) {
+    fn sync_debug_breakpoint(&self, editor: &Entity<EditorState>, row: usize, set: bool) {
         let Some(dbg) = self.debug.as_ref().filter(|dbg| !dbg.terminated) else {
             return;
         };

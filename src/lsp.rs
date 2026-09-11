@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use futures::channel::{mpsc, oneshot};
-use gpui::{App, AppContext as _, Context, Task, Window};
-use gpui_component::input::{CompletionProvider, HoverProvider, InputState, Rope, RopeExt as _};
+use gpui::{App, AppContext as _, Task, Window};
+use gpui_component::input::{CompletionProvider, HoverProvider, Rope, RopeExt as _};
 use lsp_types::{
     CompletionContext, CompletionItemLabelDetails, CompletionResponse, CompletionTextEdit,
     DiagnosticSeverity, Hover, HoverContents, InsertTextFormat, MarkedString, NumberOrString,
@@ -511,7 +511,7 @@ impl CompletionProvider for Provider {
         offset: usize,
         trigger: CompletionContext,
         _: &mut Window,
-        cx: &mut Context<InputState>,
+        cx: &mut App,
     ) -> Task<Result<CompletionResponse>> {
         // gpui-component smuggles the query typed so far in here; keep it for
         // clamping the items' filter_text below.
@@ -558,12 +558,7 @@ impl CompletionProvider for Provider {
         })
     }
 
-    fn is_completion_trigger(
-        &self,
-        _offset: usize,
-        new_text: &str,
-        _: &mut Context<InputState>,
-    ) -> bool {
+    fn is_completion_trigger(&self, _offset: usize, new_text: &str, _: &mut App) -> bool {
         is_trigger(new_text)
     }
 }
@@ -589,7 +584,7 @@ impl CompletionProvider for SnippetCompletions {
         offset: usize,
         trigger: CompletionContext,
         _: &mut Window,
-        _: &mut Context<InputState>,
+        _: &mut App,
     ) -> Task<Result<CompletionResponse>> {
         let query = trigger.trigger_character.unwrap_or_default();
         let mut items = snippet_items(text, offset);
@@ -597,12 +592,7 @@ impl CompletionProvider for SnippetCompletions {
         Task::ready(Ok(CompletionResponse::Array(items)))
     }
 
-    fn is_completion_trigger(
-        &self,
-        _offset: usize,
-        new_text: &str,
-        _: &mut Context<InputState>,
-    ) -> bool {
+    fn is_completion_trigger(&self, _offset: usize, new_text: &str, _: &mut App) -> bool {
         is_trigger(new_text)
     }
 }

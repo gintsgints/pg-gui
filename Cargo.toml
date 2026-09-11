@@ -16,17 +16,21 @@ anyhow = "1"
 chrono = "0.4"
 dirs = "6"
 futures = "0.3"
-# gpui-component's tree-sitter-0.26 line lives only on git `main` (0.5.2), which
-# pulls gpui from the zed git tree rather than crates.io. gpui is left unpinned
-# (git, no rev) to match gpui-component's own dependency so both resolve to the
-# same gpui — the exact rev is pinned reproducibly in Cargo.lock. Needed so
-# tree-sitter resolves to 0.26 in lockstep with the pgls fork's `bump_treesitter`
-# branch (was: crates.io gpui 0.2.2 + 0.25.x).
-gpui = { git = "https://github.com/zed-industries/zed" }
+# gpui-component moved to the gpui-kit workspace (longbridge/gpui-kit), which
+# splits the editing engine into `gpui-base` and takes gpui from crates.io as
+# the `gpui-pre` family rather than the zed git tree. gpui and gpui_platform are
+# therefore the renamed crates.io packages, pinned to the same 0.3 line
+# gpui-kit's workspace uses so a single gpui resolves for the whole graph;
+# tree-sitter still lands on 0.26, in lockstep with the pgls fork's
+# `bump_treesitter` branch.
+gpui = { package = "gpui-pre", version = "0.3.1" }
 # gpui split the platform out into its own crate; `gpui_platform::application()`
-# replaces the old `Application::new()`. Features match gpui-component's own.
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
-gpui-component = { git = "https://github.com/gintsgints/gpui-component", branch = "my_fixes2", features = ["tree-sitter-languages"] }
+# replaces the old `Application::new()`. Features match gpui-kit's own.
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.1", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+# The fork carries three input patches pg-gui needs and upstream does not have:
+# the clickable breakpoint gutter, `line_number_offset` for body-relative
+# routine numbering, and the vertical-selection column fix.
+gpui-component = { git = "https://github.com/gintsgints/gpui-kit", branch = "my_fixes3", features = ["tree-sitter-languages"] }
 # Must stay in lockstep with the lsp-types version gpui-component uses,
 # so our provider impls and its editor traits share the same types.
 lsp-types = "0.97"
