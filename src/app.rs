@@ -8,10 +8,10 @@ use std::time::{Duration, SystemTime};
 use futures::StreamExt as _;
 use gpui::Subscription;
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EntityInputHandler as _,
-    Focusable as _, Hsla, InteractiveElement as _, IntoElement, Menu, MenuItem, MouseButton,
-    NoAction, ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity,
+    EntityInputHandler as _, Focusable as _, Hsla, InteractiveElement as _, IntoElement, Menu,
+    MenuItem, MouseButton, NoAction, ParentElement as _, Pixels, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, IndexPath, Root, Sizable as _, StyledExt as _, Theme,
@@ -28,7 +28,7 @@ use gpui_component::{
     resizable::{ResizableState, h_resizable, resizable_panel, v_resizable},
     searchable_list::{SearchableListItem, SearchableVec},
     tab::{Tab, TabBar},
-    table::{DataTable, TableState},
+    table::{DataTable, TableDelegate as _, TableState},
     tooltip::Tooltip,
     tree::{TreeEvent, TreeItem, TreeState, tree},
     v_flex,
@@ -40,7 +40,7 @@ use gpui_component::{GlobalState, menu::AppMenuBar};
 
 use crate::results::ResultsDelegate;
 use crate::{
-    AiComplete, CancelQuery, CloseTab, Commit, Connect, DebugContinue, DebugStepInto,
+    AiComplete, CancelQuery, CloseTab, Commit, Connect, CopyCell, DebugContinue, DebugStepInto,
     DebugStepOver, DebugStop, EditConnection, ExportCsv, ExportInserts, FormatScript,
     NewConnection, NewFile, NextTab, OpenConfig, OpenFile, OpenFolder, OpenGitHub,
     OpenRecentFolder, OpenSnippets, PrevTab, Quit, RefreshDbTree, Rollback, RunQuery, RunScripts,
@@ -89,6 +89,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cmd-1", "Show or hide the database browser"),
     ("cmd-b / cmd-2", "Show or hide the files panel"),
     ("cmd-3", "Show or hide the results panel"),
+    ("cmd-c", "Copy the selected result cell, row or column"),
     ("cmd-s", "Save the script"),
     ("cmd-,", "Open config.json in the system editor"),
     ("cmd-plus / cmd-minus", "Zoom in / out"),
@@ -119,6 +120,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("ctrl-1", "Show or hide the database browser"),
     ("ctrl-b / ctrl-2", "Show or hide the files panel"),
     ("ctrl-3", "Show or hide the results panel"),
+    ("ctrl-c", "Copy the selected result cell, row or column"),
     ("ctrl-s", "Save the script"),
     ("ctrl-,", "Open config.json in the system editor"),
     ("ctrl-plus / ctrl-minus", "Zoom in / out"),
@@ -1438,8 +1440,7 @@ impl PgGuiApp {
         let (tabs, next_tab_id) = Self::build_initial_tabs(&config, window, cx);
         let active_tab = config.active_tab;
 
-        let results =
-            cx.new(|cx| TableState::new(ResultsDelegate::new(config.page_size), window, cx));
+        let results = Self::build_results(config.page_size, window, cx);
         let resizable_state = cx.new(|_| ResizableState::default());
         let sidebar_state = cx.new(|_| ResizableState::default());
         let tree_state = cx.new(|cx| TreeState::new(cx));
@@ -1556,6 +1557,19 @@ impl PgGuiApp {
                 })
                 .unwrap_or(true)
         });
+    }
+
+    /// The results grid. Cell selection makes a single value pickable (by
+    /// click or arrow keys) so `CopyCell` has something to copy; the
+    /// row-header gutter it adds on the left selects whole rows.
+    fn build_results(
+        page_size: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TableState<ResultsDelegate>> {
+        cx.new(|cx| {
+            TableState::new(ResultsDelegate::new(page_size), window, cx).cell_selectable(true)
+        })
     }
 
     /// Create the editor for one tab and wire it into the change plumbing.
@@ -4325,6 +4339,47 @@ impl PgGuiApp {
         cx.notify();
     }
 
+    /// Copy the results grid's selection to the clipboard (cmd-c, bound in
+    /// the `DataTable` key context so it only fires while the grid has
+    /// focus): a cell as its own text, a row as its cells joined by tabs, a
+    /// column as one value per line. Only the current page is copied, since
+    /// that is what the grid holds row indices for.
+    fn copy_cell(&mut self, _: &CopyCell, _: &mut Window, cx: &mut Context<Self>) {
+        let text = {
+            let table = self.results.read(cx);
+            let delegate = table.delegate();
+            let cols = delegate.columns_count(cx);
+            let rows = delegate.rows_count(cx);
+            if let Some((row_ix, col_ix)) = table.selected_cell() {
+                Some(delegate.cell_text(row_ix, col_ix, cx))
+            } else if let Some(row_ix) = table.selected_row() {
+                Some(
+                    (0..cols)
+                        .map(|col_ix| delegate.cell_text(row_ix, col_ix, cx))
+                        .collect::<Vec<_>>()
+                        .join("\t"),
+                )
+            } else if let Some(col_ix) = table.selected_col() {
+                Some(
+                    (0..rows)
+                        .map(|row_ix| delegate.cell_text(row_ix, col_ix, cx))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            } else {
+                None
+            }
+        };
+
+        // Nothing selected: let the action fall through, so a cmd-c that
+        // reached the grid by accident still does whatever is behind it.
+        let Some(text) = text else {
+            cx.propagate();
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
     /// The results table between the result-set selector (when a run produced
     /// more than one) and a bottom row holding the pager (when present) and
     /// the Log switch button.
@@ -6629,6 +6684,7 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::cancel_query))
             .on_action(cx.listener(Self::export_csv))
             .on_action(cx.listener(Self::export_inserts))
+            .on_action(cx.listener(Self::copy_cell))
             .on_action(cx.listener(Self::ai_complete))
             .on_action(cx.listener(Self::new_connection))
             .on_action(cx.listener(Self::edit_connection))

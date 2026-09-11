@@ -32,6 +32,7 @@ actions!(
         Rollback,
         CancelQuery,
         ExportCsv,
+        CopyCell,
         ExportInserts,
         AiComplete,
         NewFile,
@@ -174,6 +175,9 @@ fn main() {
             KeyBinding::new("secondary-0", ZoomReset, None),
             KeyBinding::new(help_key, ShowHelp, None),
             KeyBinding::new("secondary-q", Quit, None),
+            // Scoped to the results grid's own key context, so cmd-c keeps
+            // meaning "copy text" everywhere else (the editors, inputs).
+            KeyBinding::new("secondary-c", CopyCell, Some("DataTable")),
         ]);
         // Global handlers run only when nothing in the window handled the
         // action, so this is the fallback for when the app view (which

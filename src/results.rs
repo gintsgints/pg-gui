@@ -83,6 +83,16 @@ impl ResultsDelegate {
     fn page_start(&self) -> usize {
         self.page * self.page_size
     }
+
+    /// The value of a cell on the current page, `None` for a SQL NULL (or a
+    /// row/column outside the result set).
+    fn cell_value(&self, row_ix: usize, col_ix: usize) -> Option<String> {
+        self.rows
+            .get(self.page_start() + row_ix)
+            .and_then(|r| r.get(col_ix))
+            .cloned()
+            .flatten()
+    }
 }
 
 impl TableDelegate for ResultsDelegate {
@@ -108,16 +118,15 @@ impl TableDelegate for ResultsDelegate {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let value = self
-            .rows
-            .get(self.page_start() + row_ix)
-            .and_then(|r| r.get(col_ix))
-            .cloned()
-            .flatten();
-
-        match value {
+        match self.cell_value(row_ix, col_ix) {
             Some(v) => div().child(v),
             None => div().text_color(cx.theme().muted_foreground).child("NULL"),
         }
+    }
+
+    /// Copy/export text of a cell. A NULL copies as the empty string, so a
+    /// pasted value is the value itself and never the word "NULL".
+    fn cell_text(&self, row_ix: usize, col_ix: usize, _: &App) -> String {
+        self.cell_value(row_ix, col_ix).unwrap_or_default()
     }
 }
