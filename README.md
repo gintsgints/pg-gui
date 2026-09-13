@@ -22,11 +22,45 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
   through a server-side cursor: only the first batch of rows is
   transferred (`fetch_size` in config.json, default 500) and a Fetch more
   button under the table pulls the next batch on demand
+- **Copy from the results grid** (`cmd-c`): click a cell to copy its value, a
+  row header to copy the row (cells joined by tabs), a column header to copy
+  the column (one value per line, the current page only). A SQL NULL copies as
+  the empty string
+- **Message log** (`cmd-3`, the Log switch under the results): one line per
+  statement with its timing, plus the server's own `RAISE NOTICE` /
+  `WARNING` output, which Postgres sends out of band and result sets never
+  carry
+- **Transactions** (Session menu): autocommit is per tab — with it off, Run
+  opens a transaction that Commit or Rollback ends; the current mode seeds new
+  tabs and survives restart. A long-running statement can be stopped with
+  Cancel Query
 - **Export results** to a file (Connection ▸ Export as CSV… / Export as
   INSERT…): re-runs the selection or the statement at the cursor and writes
   every row — CSV is produced server-side via `COPY (…) TO STDOUT` so the
   server does the quoting, INSERT generates a runnable SQL script. The save
   dialog suggests `<table>_<date>` from the query's `FROM` table
+- **Database object browser** (`cmd-1`): schemas with their tables (each
+  expanding to its `CREATE TABLE` DDL, indexes, constraints and triggers),
+  views, materialized views, functions, sequences and types, loaded lazily and
+  filterable; the System checkbox adds the catalog schemas. Clicking an object
+  opens its `.sql` file from the working folder when one matches
+  (`definition_file_mask` in config.json) and its definition fetched from the
+  catalog otherwise
+- **Go to Definition**: cmd-click a routine, table or view name in the editor
+  (or right-click ▸ Go to Definition) to open its source the same way the
+  browser does. The lookup is pg-gui's own catalog query, so it works even
+  while the language server is down, and resolves unqualified names the way
+  `search_path` would
+- **PL/pgSQL step debugging** (`cmd-shift-d`) through the server's
+  [pldebugger](https://github.com/EnterpriseDB/pldebugger) extension: the launch
+  dialog takes the routine (pre-filled from the statement at the cursor), its
+  arguments and a stop-on-entry toggle. Click the editor's gutter to set
+  breakpoints, then step over / into (`F10` / `F11`),
+  continue (`F5`) or stop (`shift-F5`) while the panel under the editor shows
+  the variables (click one to change its value) and the call stack (click a
+  frame to inspect it); each stop selects the executing line in the editor.
+  Needs `pldbgapi` installed in the database and `plugin_debugger` in the
+  server's `shared_preload_libraries`
 - **Connection manager**: create and edit connections in a per-field dialog
   with an inline Test Connection check, give them names, and switch between
   them from the combobox in the title bar or the Connection ▸ Recent menu
@@ -77,7 +111,10 @@ too, so `cmd-s` keeps writing to the same file after a restart. The config also
 holds the recent-connections list, the theme, the zoom level, and a few
 options: `format_on_save` (on by default; toggled from the `fmt:` switch in the
 status bar or Edit ▸ Format on Save), `keyword_case` / `constant_case`
-(`"lower"`/`"upper"`, used by the formatter), and the AI settings
+(`"lower"`/`"upper"`, used by the formatter), `autocommit` (the mode new tabs
+start in), `page_size` / `fetch_size` (rows per results page and per server
+fetch), `definition_file_mask` (the `.sql` name pattern a clicked database
+object is opened from, default `*_{object}.sql`), and the AI settings
 (`ai_api_key`, `ai_model`, `ai_prompt`).
 `cmd-,` (Preferences…) opens the file in the system editor.
 A `DATABASE_URL` environment variable, if set, overrides the saved connection
@@ -155,6 +192,13 @@ or `F1` (Linux) in the app to see this list in a dialog. On Linux, `cmd` is
 | `ctrl-tab` / `ctrl-shift-tab` | Next / previous tab |
 | `cmd-o` | Open a `.sql` file |
 | `cmd-s` | Save (Save As on first save) |
+| `cmd-1` | Show or hide the database browser |
+| `cmd-b` / `cmd-2` | Show or hide the files panel |
+| `cmd-3` | Show or hide the results panel |
+| `cmd-c` (results grid) | Copy the selected cell, row or column |
+| `cmd-shift-d` | Start debugging a routine |
+| `F10` / `F11` | Step over / step into |
+| `F5` / `shift-F5` | Continue / stop debugging |
 | `cmd-,` | Open `config.json` in the system editor |
 | `cmd-plus` / `cmd-minus` | Zoom in / out |
 | `cmd-0` | Reset zoom |
@@ -167,9 +211,14 @@ or `F1` (Linux) in the app to see this list in a dialog. On Linux, `cmd` is
 - `src/app.rs` — main window: menu bar, editor, results table, status bar, dialogs
 - `src/config.rs` — `config.json` load/save (connections, tabs, options)
 - `src/db.rs` — Postgres execution (blocking `postgres` client on a background thread)
+- `src/db_tree.rs` — database object browser model (lazy catalog loading)
+- `src/definitions.rs` — catalog lookup behind Go to Definition
+- `src/debug.rs` — PL/pgSQL debug session driving pldebugger through `pgdap`
+- `src/file_tree.rs` — files panel scanning, filtering and run ordering
 - `src/lsp.rs` — embedded Postgres Language Server (completions, hover, diagnostics, formatting)
 - `src/export.rs` — rendering results for export (CSV via `COPY`, INSERT scripts)
 - `src/results.rs` — table delegate rendering the result set
 - `src/statement.rs` — locating the SQL statement under the cursor
 - `src/snippets.rs` — built-in and user snippet library
+- `src/instance.rs` — single-instance lock that raises the running window
 - `src/ai.rs` — Claude Messages API client for completions
