@@ -5688,52 +5688,36 @@ impl PgGuiApp {
                                 .child(item.label.clone());
                             let list_item = ListItem::new(ix)
                                 .w_full()
+                                .h(Self::tree_row_height(cx))
                                 .rounded(cx.theme().radius)
                                 .px_2()
                                 .pl(px(14.) * entry.depth() + px(8.));
                             if entry.is_folder() {
                                 // Folders expand through the tree's own click
                                 // handling; only object leaves open. A refresh
-                                // button re-fetches this folder's contents so
+                                // action re-fetches this folder's contents so
                                 // objects created since the last load appear.
                                 let node_id = item.id.clone();
                                 list_item.child(
                                     h_flex()
                                         .group("db-row")
                                         .w_full()
-                                        .justify_between()
                                         .items_center()
-                                        .child(label_row)
-                                        .child(
-                                            // Hidden until the row is hovered.
-                                            div()
-                                                .invisible()
-                                                .group_hover("db-row", gpui::Styled::visible)
-                                                // The tree toggles a row on
-                                                // mouse-down; swallow it here so
-                                                // pressing refresh doesn't also
-                                                // collapse the folder.
-                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                    cx.stop_propagation();
-                                                })
-                                                .child(
-                                                    Button::new(SharedString::from(format!(
-                                                        "db-refresh-{}",
-                                                        item.id
-                                                    )))
-                                                    .ghost()
-                                                    .xsmall()
-                                                    .tooltip("Refresh")
-                                                    .label("↻")
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        cx.stop_propagation();
-                                                        this.refresh_db_node(node_id.clone(), cx);
-                                                    })),
-                                                ),
-                                        ),
+                                        .child(Self::clip_label(label_row.flex_1()))
+                                        .child(Self::tree_row_action(
+                                            SharedString::from(format!("db-refresh-{}", item.id)),
+                                            "db-row",
+                                            "↻",
+                                            "Refresh",
+                                            cx,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.refresh_db_node(node_id.clone(), cx);
+                                            }),
+                                        )),
                                 )
                             } else {
-                                let list_item = list_item.child(label_row);
+                                let list_item =
+                                    list_item.child(Self::clip_label(label_row.w_full()));
                                 let id = item.id.clone();
                                 list_item.on_click(cx.listener(move |this, _, window, cx| {
                                     this.open_db_object(&id, window, cx);
@@ -5769,6 +5753,88 @@ impl PgGuiApp {
             )
     }
 
+    /// The height of a tree row.
+    ///
+    /// Fixed rather than derived from the label, because a row inside a
+    /// `uniform_list` is laid out three times per frame, not once: on top of
+    /// the real pass, `UniformList::measure_item` renders and lays out a row
+    /// as its own taffy root from `request_layout` and again from `prepaint`,
+    /// both at `MaxContent` width and `MinContent` height. Every dimension
+    /// the row leaves to its content makes taffy walk the subtree again to
+    /// resolve it, on each of those passes.
+    ///
+    /// Expressed in the theme font size rather than as a constant: the
+    /// window's rem size follows `Theme::font_size` (gpui-component's `Root`
+    /// sets it every frame) and `apply_zoom` scales that. The value
+    /// reproduces what `ListItem` used to derive — a `text_base` line height
+    /// at gpui's default `phi()` leading, plus its `py_1` above and below —
+    /// so rows keep the height they had at any zoom.
+    fn tree_row_height(cx: &App) -> Pixels {
+        let font_size = cx.theme().font_size;
+        (font_size * 1.618_034).round() + font_size * 0.5
+    }
+
+    /// Keep a tree row's label on one line, clipped at the row's width.
+    ///
+    /// Deliberately not `truncate()`. That sets `text_overflow`, and in
+    /// `TextLayout::layout` a set `truncate_width` both disqualifies the
+    /// measured-layout cache ("if `truncate_width` is Some, we need to
+    /// re-layout") and adds a whole extra `shape_text` of the string just to
+    /// decide whether truncation is needed, before the real shaping. A row is
+    /// measured three times a frame inside a `uniform_list`, so that lands as
+    /// two uncached shapings per pass: profiling the ellipsis version against
+    /// this one showed `shape_text` at 2.3x the allocations — more than the
+    /// layout savings it was paired with. `whitespace_nowrap` gets the
+    /// single-line behaviour without ever setting `text_overflow`; the cost is
+    /// a hard clip instead of an "…".
+    fn clip_label(label_row: gpui::Div) -> gpui::Div {
+        label_row.overflow_hidden().whitespace_nowrap()
+    }
+
+    /// The hover-revealed action at the end of a folder row: "+" in the files
+    /// panel, "↻" in the object browser.
+    ///
+    /// A plain div rather than a `Button`, which nests four more nodes (its
+    /// base, the content flex, the label wrapper and the label itself) to
+    /// draw a single glyph — and a tree row is laid out three times a frame,
+    /// so each of those is paid for three times. The slot is fixed-width for
+    /// the same reason: pairing an auto-width child with `justify_between`
+    /// leaves the width content-derived, which is what sends taffy down
+    /// `determine_content_based_container_width`.
+    fn tree_row_action(
+        id: SharedString,
+        group: &'static str,
+        glyph: &'static str,
+        tooltip: &'static str,
+        cx: &App,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        let size = cx.theme().font_size * 1.25;
+        h_flex()
+            .id(id)
+            .w(size)
+            .h(size)
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .rounded(cx.theme().radius)
+            .invisible()
+            .group_hover(group, gpui::Styled::visible)
+            .text_color(cx.theme().muted_foreground)
+            .hover(|this| this.bg(cx.theme().tokens.list_hover))
+            .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+            // The tree toggles a row on mouse-down; swallow it here so
+            // pressing the action doesn't also collapse the folder.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_click(move |event, window, cx| {
+                cx.stop_propagation();
+                on_click(event, window, cx);
+            })
+            .child(glyph)
+    }
+
     /// A folder row in the files panel: the tree's own click handling
     /// expands it, so the row only adds the "+" that creates a script
     /// inside it, hidden until the row is hovered.
@@ -5783,31 +5849,18 @@ impl PgGuiApp {
             h_flex()
                 .group("file-row")
                 .w_full()
-                .justify_between()
                 .items_center()
-                .child(label_row)
-                .child(
-                    div()
-                        .invisible()
-                        .group_hover("file-row", gpui::Styled::visible)
-                        // The tree toggles a row on mouse-down; swallow it
-                        // here so pressing "+" doesn't also collapse the
-                        // folder.
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                            cx.stop_propagation();
-                        })
-                        .child(
-                            Button::new(SharedString::from(format!("new-script-{id}")))
-                                .ghost()
-                                .xsmall()
-                                .tooltip("New script here")
-                                .label("+")
-                                .on_click(cx.listener(move |_, _, window, cx| {
-                                    cx.stop_propagation();
-                                    Self::new_script_in(&dir, window, cx);
-                                })),
-                        ),
-                ),
+                .child(Self::clip_label(label_row.flex_1()))
+                .child(Self::tree_row_action(
+                    SharedString::from(format!("new-script-{id}")),
+                    "file-row",
+                    "+",
+                    "New script here",
+                    cx,
+                    cx.listener(move |_, _, window, cx| {
+                        Self::new_script_in(&dir, window, cx);
+                    }),
+                )),
         )
     }
 
@@ -5936,6 +5989,7 @@ impl PgGuiApp {
                             .child(item.label.clone());
                         let list_item = ListItem::new(ix)
                             .w_full()
+                            .h(Self::tree_row_height(cx))
                             .rounded(cx.theme().radius)
                             .px_2()
                             .pl(px(14.) * entry.depth() + px(8.))
@@ -5950,20 +6004,22 @@ impl PgGuiApp {
                             // selection shouldn't fill the tab bar.
                             let id = item.id.clone();
                             let path = PathBuf::from(item.id.to_string());
-                            list_item.child(label_row).on_click(cx.listener(
-                                move |this, event: &ClickEvent, window, cx| {
-                                    let modifiers = event.modifiers();
-                                    if modifiers.shift {
-                                        this.extend_script_selection(&id);
-                                    } else if modifiers.secondary() {
-                                        this.toggle_script(&id);
-                                    } else {
-                                        this.select_script(&id);
-                                        this.open_path(&path, window, cx);
-                                    }
-                                    cx.notify();
-                                },
-                            ))
+                            list_item
+                                .child(Self::clip_label(label_row.w_full()))
+                                .on_click(cx.listener(
+                                    move |this, event: &ClickEvent, window, cx| {
+                                        let modifiers = event.modifiers();
+                                        if modifiers.shift {
+                                            this.extend_script_selection(&id);
+                                        } else if modifiers.secondary() {
+                                            this.toggle_script(&id);
+                                        } else {
+                                            this.select_script(&id);
+                                            this.open_path(&path, window, cx);
+                                        }
+                                        cx.notify();
+                                    },
+                                ))
                         }
                     })
                 },
