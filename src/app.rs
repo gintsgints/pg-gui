@@ -1005,9 +1005,12 @@ pub(crate) fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        // `get` rather than a slice: the two bytes after a `%` may run past
+        // the end, or into the middle of a multi-byte character (`%aé`),
+        // either of which would panic on `&s[..]`.
         if bytes[i] == b'%'
-            && i + 3 <= bytes.len()
-            && let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && let Some(hex) = s.get(i + 1..i + 3)
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
         {
             out.push(byte);
             i += 3;
@@ -6742,8 +6745,8 @@ mod tests {
 
     use super::{
         MAX_RECENT_FOLDERS, definition_content_rank, dialog_start_dir, ends_with_name_word,
-        find_sql_file, folder_menu_label, glob_match, mask_credentials, record_recent_folder,
-        suggested_name_from_mask, toggle_line_comments,
+        find_sql_file, folder_menu_label, glob_match, mask_credentials, percent_decode,
+        record_recent_folder, suggested_name_from_mask, toggle_line_comments,
     };
     use crate::db_tree::NodeKind;
 
@@ -7313,5 +7316,21 @@ mod tests {
             mask_credentials("host=localhost user=alice password=secret dbname=db"),
             "host=localhost user=**** password=**** dbname=db"
         );
+    }
+
+    #[test]
+    fn percent_decode_decodes_escapes() {
+        assert_eq!(percent_decode("a%40b%3Ac"), "a@b:c");
+        assert_eq!(percent_decode("%C3%A9"), "é");
+    }
+
+    #[test]
+    fn percent_decode_leaves_incomplete_escapes_alone() {
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("50%z9"), "50%z9");
+        // A `%` whose next two bytes end inside a multi-byte character: the
+        // sequence is left as it stands rather than panicking on the slice.
+        assert_eq!(percent_decode("%aé"), "%aé");
+        assert_eq!(percent_decode("pass%é"), "pass%é");
     }
 }
