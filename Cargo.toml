@@ -39,6 +39,13 @@ gpui_platform = { package = "gpui-pre-platform", version = "0.3.4", features = [
 gpui-component = { git = "https://github.com/gintsgints/gpui-kit", branch = "my_fixes3", features = [
     "tree-sitter-languages",
 ] }
+# The component icon bundle (the ~100 SVGs `IconName` names), from the same
+# workspace and revision as gpui-component. Without an asset source registered,
+# every `IconName` the components draw themselves renders blank — notably the
+# editor's code-folding chevron, which gpui-component builds as an
+# `IconName::ChevronRight`/`ChevronDown` button in `set_editor_style` and which
+# an app cannot re-style from outside.
+gpui-kit-assets = { git = "https://github.com/gintsgints/gpui-kit", branch = "my_fixes3" }
 # Must stay in lockstep with the lsp-types version gpui-component uses,
 # so our provider impls and its editor traits share the same types.
 lsp-types = "0.97"

@@ -5599,6 +5599,7 @@ dependencies = [
  "dirs 7.0.0",
  "futures",
  "gpui-component",
+ "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-platform",
  "lsp-types",

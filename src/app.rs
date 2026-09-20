@@ -4278,8 +4278,8 @@ impl PgGuiApp {
 
     /// The "Prev / Next / Page x of y" bar under the results table; `None`
     /// when everything fits on one page.
-    /// A small outline button that switches the bottom panel to `view`.
-    /// gpui-component ships no icon assets, so the icon is a text glyph.
+    /// A small outline button that switches the bottom panel to `view`. The
+    /// icon is a text glyph, like the rest of the app's small controls.
     fn bottom_view_button(
         view: BottomView,
         glyph: &'static str,
@@ -5672,8 +5672,10 @@ impl PgGuiApp {
                     move |ix, entry, _selected, _window, cx| {
                         view.update(cx, |_, cx| {
                             let item = entry.item();
-                            // Text glyphs (gpui-component ships no icon assets):
+                            // A text glyph rather than an `IconName` SVG:
                             // an arrow for expandable nodes, blank for leaves.
+                            // See `tree_row_action` for why a tree row keeps
+                            // its element count down.
                             let glyph = if !entry.is_folder() {
                                 ""
                             } else if entry.is_expanded() {
@@ -5688,7 +5690,11 @@ impl PgGuiApp {
                                         .w_4()
                                         .flex_none()
                                         .text_center()
-                                        .text_color(cx.theme().muted_foreground)
+                                        // Sidebar foreground, not muted: the
+                                        // arrow is a single thin glyph and the
+                                        // muted tone all but disappears on a
+                                        // dark theme.
+                                        .text_color(cx.theme().sidebar_foreground)
                                         .child(glyph),
                                 )
                                 .child(item.label.clone());
@@ -5968,8 +5974,7 @@ impl PgGuiApp {
                         // The tree's own `is_folder()` is children-based
                         // and misses empty directories.
                         let is_dir = entry.is_folder() || dirs.contains(&item.id);
-                        // Text glyphs, like the tab bar: gpui-component
-                        // ships no icon assets, so `IconName` renders blank.
+                        // A text glyph, like the object browser's rows.
                         let glyph = if !is_dir {
                             ""
                         } else if entry.is_expanded() {
@@ -5989,7 +5994,9 @@ impl PgGuiApp {
                                     .w_4()
                                     .flex_none()
                                     .text_center()
-                                    .text_color(cx.theme().muted_foreground)
+                                    // See the database tree: muted is too dim
+                                    // for a single arrow glyph on dark.
+                                    .text_color(cx.theme().sidebar_foreground)
                                     .child(glyph),
                             )
                             .child(item.label.clone());
@@ -6035,8 +6042,7 @@ impl PgGuiApp {
     /// One tab per open script, with a "×" close button each and a
     /// trailing "+" that opens a fresh one. A tab with unsaved edits is
     /// marked with a leading "•", or "⟳" when its file also changed on disk
-    /// (diverged). gpui-component ships no icon assets, so these use text
-    /// glyphs rather than `IconName` SVGs.
+    /// (diverged). These are text glyphs rather than `IconName` SVGs.
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         TabBar::new("script-tabs")
             .small()
@@ -6069,8 +6075,8 @@ impl PgGuiApp {
     /// Session controls sitting after the tabs, next to "+": an autocommit
     /// toggle, Commit/Rollback (enabled only with an open transaction), a
     /// Cancel button (enabled while a query runs), and the new-tab "+".
-    /// They act on the active tab's session. gpui-component ships no icon
-    /// assets, so these use text glyphs rather than `IconName` SVGs.
+    /// They act on the active tab's session; the buttons are labelled with
+    /// text glyphs rather than `IconName` SVGs.
     fn render_session_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let autocommit = self.active_autocommit();
         let running = self.active_running();

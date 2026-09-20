@@ -162,7 +162,14 @@ fn main() {
     // assertion "set_focus called more than once in a single frame" the
     // moment an assistive technology activates the accessibility tree.
     // Drop back to `gpui_platform::application()` once fixed upstream.
-    let app = gpui::Application::new_inaccessible(gpui_platform::current_platform(false));
+    //
+    // The asset source is the component icon bundle: gpui-component draws
+    // some of its own controls with `IconName` SVGs, which it loads through
+    // the app's asset source — the editor's code-folding chevron among them
+    // (built in its `set_editor_style`, so an app cannot restyle it) — and
+    // without a source registered they paint nothing at all.
+    let app = gpui::Application::new_inaccessible(gpui_platform::current_platform(false))
+        .with_assets(gpui_kit_assets::Assets);
 
     app.run(move |cx: &mut App| {
         #[cfg(feature = "dhat-heap")]
