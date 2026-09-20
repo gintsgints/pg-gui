@@ -4393,6 +4393,15 @@ impl PgGuiApp {
     /// more than one) and a bottom row holding the pager (when present) and
     /// the Log switch button.
     fn render_data_view(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        // The table measures its column viewport in a layout pass, so a
+        // stretch to fill it lands on the frame after the pane resizes.
+        self.results.update(cx, |table, cx| {
+            let viewport = table.horizontal_scroll_handle.bounds().size.width;
+            if table.delegate_mut().set_viewport(viewport) {
+                table.refresh(cx);
+            }
+        });
+
         v_flex()
             .size_full()
             .p_2()

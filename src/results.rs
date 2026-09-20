@@ -24,6 +24,13 @@ const CELL_GUTTER: Pixels = px(12.);
 const MIN_COL_WIDTH: Pixels = px(48.);
 /// Keeps one long text/JSON column from pushing the rest off-screen.
 const MAX_COL_WIDTH: Pixels = px(450.);
+/// A set with fewer columns than this leaves an empty strip beside it
+/// that reads as a rendering fault, so its columns share the spare
+/// width out. Wider sets keep their fitted widths and scroll.
+const STRETCH_MAX_COLS: usize = 5;
+/// Held back from the viewport so a stretched row never rounds its way
+/// into a horizontal scrollbar.
+const STRETCH_SLACK: Pixels = px(2.);
 /// Anything longer is past `MAX_COL_WIDTH` regardless, so only this much
 /// of a value is measured.
 const MEASURE_CHARS: usize = 120;
@@ -90,6 +97,11 @@ impl CellMetrics {
 /// page at a time.
 pub struct ResultsDelegate {
     columns: Vec<Column>,
+    /// Each column's measured content width, kept apart from the width
+    /// it draws at so stretching stays idempotent and reversible.
+    fitted: Vec<Pixels>,
+    /// Width of the table's column viewport, as of the last frame.
+    viewport: Pixels,
     rows: Vec<Vec<Option<String>>>,
     page: usize,
     page_size: usize,
@@ -101,6 +113,8 @@ impl ResultsDelegate {
     pub fn new(page_size: usize) -> Self {
         Self {
             columns: Vec::new(),
+            fitted: Vec::new(),
+            viewport: px(0.),
             rows: Vec::new(),
             page: 0,
             page_size: page_size.max(1),
@@ -142,21 +156,46 @@ impl ResultsDelegate {
     /// while a run is still feeding it rows; a zoom re-fits both ways.
     pub fn measure_columns(&mut self, grow_only: bool, cx: &App) {
         let mut metrics = CellMetrics::new(cx);
-        let widths: Vec<Pixels> = self
+        self.fitted = self
             .columns
             .iter()
             .enumerate()
             .map(|(ix, col)| {
                 let fitted = self.fitted_width(ix, &col.name, &mut metrics, cx);
-                if grow_only {
-                    fitted.max(col.width)
-                } else {
-                    fitted
+                match self.fitted.get(ix) {
+                    Some(previous) if grow_only => fitted.max(*previous),
+                    _ => fitted,
                 }
             })
             .collect();
-        for (col, width) in self.columns.iter_mut().zip(widths) {
-            col.width = width;
+        self.apply_widths();
+    }
+
+    /// Record the width the table's columns are drawn into. Returns
+    /// whether that changed the column widths, i.e. whether the caller
+    /// owes the table a refresh.
+    pub fn set_viewport(&mut self, viewport: Pixels) -> bool {
+        if (viewport - self.viewport).abs() < px(1.) {
+            return false;
+        }
+        self.viewport = viewport;
+        self.apply_widths();
+        true
+    }
+
+    /// Draw the columns at their fitted widths, or — for a set narrow
+    /// enough to leave a gap — at those widths scaled up in proportion
+    /// until they fill the viewport.
+    fn apply_widths(&mut self) {
+        let total: Pixels = self.fitted.iter().copied().sum();
+        let target = self.viewport - STRETCH_SLACK;
+        let scale = if self.columns.len() < STRETCH_MAX_COLS && total > px(0.) && total < target {
+            target / total
+        } else {
+            1.
+        };
+        for (col, fitted) in self.columns.iter_mut().zip(&self.fitted) {
+            col.width = *fitted * scale;
         }
     }
 
