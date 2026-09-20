@@ -1767,7 +1767,7 @@ impl PgGuiApp {
         );
         self.log = tab.result.log.clone();
         self.results.update(cx, |table, cx| {
-            table.delegate_mut().set_data(columns, rows);
+            table.delegate_mut().set_data(columns, rows, cx);
             table.refresh(cx);
         });
     }
@@ -4596,7 +4596,7 @@ impl PgGuiApp {
                     result.has_more = more;
                     if ix == this.active_tab {
                         this.results.update(cx, |table, cx| {
-                            table.delegate_mut().append_rows(rows);
+                            table.delegate_mut().append_rows(rows, cx);
                             table.refresh(cx);
                         });
                     }
@@ -5015,6 +5015,11 @@ impl PgGuiApp {
         let theme = Theme::global_mut(cx);
         theme.font_size = self.base_font_size * zoom;
         theme.mono_font_size = self.base_mono_font_size * zoom;
+        // The result columns were fitted to the old font size.
+        self.results.update(cx, |table, cx| {
+            table.delegate_mut().measure_columns(false, cx);
+            table.refresh(cx);
+        });
         cx.refresh_windows();
     }
 
