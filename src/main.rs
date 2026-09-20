@@ -12,6 +12,7 @@ mod export;
 mod file_tree;
 mod instance;
 mod lsp;
+mod plan;
 mod results;
 mod snippets;
 mod statement;
@@ -31,6 +32,8 @@ actions!(
     [
         RunQuery,
         RunScripts,
+        ExplainPlan,
+        ExplainAnalyze,
         ToggleAutocommit,
         Commit,
         Rollback,
@@ -196,6 +199,8 @@ fn main() {
             KeyBinding::new("ctrl-enter", RunQuery, None),
             KeyBinding::new("secondary-shift-enter", RunScripts, None),
             KeyBinding::new("ctrl-shift-enter", RunScripts, None),
+            KeyBinding::new("secondary-e", ExplainPlan, None),
+            KeyBinding::new("secondary-shift-e", ExplainAnalyze, None),
             KeyBinding::new("secondary-i", AiComplete, None),
             KeyBinding::new("ctrl-space", AiComplete, None),
             KeyBinding::new("secondary-t", NewFile, None),

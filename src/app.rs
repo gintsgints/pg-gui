@@ -17,6 +17,7 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, IndexPath, Root, Sizable as _, StyledExt as _, Theme,
     ThemeMode, TitleBar, WindowExt as _,
     button::{Button, ButtonVariants as _},
+    chart::{FlameGraph, FlamePath},
     checkbox::Checkbox,
     combobox::{Combobox, ComboboxEvent, ComboboxState},
     h_flex,
@@ -41,12 +42,13 @@ use gpui_component::{GlobalState, menu::AppMenuBar};
 use crate::results::ResultsDelegate;
 use crate::{
     AiComplete, CancelQuery, CloseTab, Commit, Connect, CopyCell, DebugContinue, DebugStepInto,
-    DebugStepOver, DebugStop, EditConnection, ExportCsv, ExportInserts, FormatScript,
-    NewConnection, NewFile, NextTab, OpenConfig, OpenFile, OpenFolder, OpenGitHub,
-    OpenRecentFolder, OpenSnippets, PrevTab, Quit, RefreshDbTree, Rollback, RunQuery, RunScripts,
-    SaveFile, SetTheme, ShowHelp, StartDebug, ToggleAutocommit, ToggleComment, ToggleDbPanel,
-    ToggleFilesPanel, ToggleFormatOnSave, ToggleResultsPanel, ZoomIn, ZoomOut, ZoomReset, ai,
-    config, db, db_tree, debug, definitions, export, file_tree, lsp, snippets, statement,
+    DebugStepOver, DebugStop, EditConnection, ExplainAnalyze, ExplainPlan, ExportCsv,
+    ExportInserts, FormatScript, NewConnection, NewFile, NextTab, OpenConfig, OpenFile, OpenFolder,
+    OpenGitHub, OpenRecentFolder, OpenSnippets, PrevTab, Quit, RefreshDbTree, Rollback, RunQuery,
+    RunScripts, SaveFile, SetTheme, ShowHelp, StartDebug, ToggleAutocommit, ToggleComment,
+    ToggleDbPanel, ToggleFilesPanel, ToggleFormatOnSave, ToggleResultsPanel, ZoomIn, ZoomOut,
+    ZoomReset, ai, config, db, db_tree, debug, definitions, export, file_tree, lsp, plan, snippets,
+    statement,
 };
 
 /// The project's GitHub page, opened from the About application menu.
@@ -75,6 +77,10 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "cmd-shift-enter",
         "Run the scripts selected in the files panel",
+    ),
+    (
+        "cmd-e / cmd-shift-e",
+        "Explain the statement / explain it with ANALYZE (runs it)",
     ),
     ("cmd-i / ctrl-space", "AI-complete SQL at the cursor"),
     ("cmd-shift-f", "Format the script"),
@@ -109,6 +115,10 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "ctrl-shift-enter",
         "Run the scripts selected in the files panel",
+    ),
+    (
+        "ctrl-e / ctrl-shift-e",
+        "Explain the statement / explain it with ANALYZE (runs it)",
     ),
     ("ctrl-i / ctrl-space", "AI-complete SQL at the cursor"),
     ("ctrl-shift-f", "Format the script"),
@@ -295,6 +305,9 @@ fn connection_menu(recents: &[config::RecentConnection]) -> Menu {
             MenuItem::separator(),
             MenuItem::action("Run Query", RunQuery),
             MenuItem::action("Run Selected Scripts", RunScripts),
+            MenuItem::separator(),
+            MenuItem::action("Explain Plan", ExplainPlan),
+            MenuItem::action("Explain Analyze", ExplainAnalyze),
             MenuItem::separator(),
             MenuItem::action("Export as CSV…", ExportCsv),
             MenuItem::action("Export as INSERT…", ExportInserts),
@@ -1216,6 +1229,14 @@ struct TabResult {
     has_more: bool,
     /// Per-statement messages, shown in the Log view.
     log: Vec<SharedString>,
+    /// The last `EXPLAIN` this tab ran, drawn as a flame graph in the Plan
+    /// view. Kept per tab like the rows and the log, so switching tabs brings
+    /// each one's own plan back.
+    plan: Option<plan::Plan>,
+    /// The plan frame the flame graph is zoomed to. The chart derives the
+    /// ancestor rows, the zoomed domain and the way back out from this one
+    /// path, so it is the whole zoom state.
+    plan_focus: Option<FlamePath>,
 }
 
 impl TabResult {
@@ -1246,11 +1267,13 @@ struct DebugState {
     terminated: bool,
 }
 
-/// Which view the bottom panel shows: the returned rows or the message log.
+/// Which view the bottom panel shows: the returned rows, the message log, or
+/// the last plan's flame graph.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BottomView {
     Data,
     Log,
+    Plan,
 }
 
 /// State of the object browser's top-level schema-list fetch. The three
@@ -3218,6 +3241,177 @@ impl PgGuiApp {
         .detach();
     }
 
+    /// Explain the statement under the cursor and draw its plan as a flame
+    /// graph (cmd-e).
+    pub fn explain_plan(&mut self, _: &ExplainPlan, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_explain(false, window, cx);
+    }
+
+    /// The same, with `ANALYZE` (cmd-shift-e): the widths are then the time
+    /// actually spent per node rather than the planner's estimate — at the
+    /// price of really executing the statement, inside the tab's transaction
+    /// when autocommit is off.
+    pub fn explain_analyze(
+        &mut self,
+        _: &ExplainAnalyze,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_explain(true, window, cx);
+    }
+
+    /// Run an `EXPLAIN` on the active tab's session and hand the plan to the
+    /// Plan view. Mirrors [`Self::run_query`] — same session, same
+    /// autocommit/transaction, same cancel token — but the statement's output
+    /// is one JSON document rather than a stream of result sets, so it takes
+    /// no progress channel.
+    fn start_explain(&mut self, analyze: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        if tab.running {
+            return;
+        }
+        let conn = self.config.connection_string.clone();
+
+        let Some((sql, scope)) = self.sql_under_cursor(window, cx) else {
+            self.set_status("Nothing to explain", cx);
+            return;
+        };
+
+        let ix = self.active_tab;
+        let tab_id = self.tabs[ix].id;
+        let autocommit = self.tabs[ix].autocommit;
+        let epoch = self.db_epoch;
+        let session = self.tabs[ix].session.take();
+        self.tabs[ix].running = true;
+        let verb = if analyze {
+            "Explaining (analyze)"
+        } else {
+            "Explaining"
+        };
+        self.set_status(format!("{verb} {scope}…"), cx);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let started = std::time::Instant::now();
+            let opened = cx
+                .background_spawn(async move {
+                    match session {
+                        Some(session) => Ok(session),
+                        None => db::Session::connect(&conn)
+                            .map_err(|e| format!("connection failed: {}", db::describe(&e))),
+                    }
+                })
+                .await;
+            let mut session = match opened {
+                Ok(session) => session,
+                Err(err) => {
+                    this.update_in(cx, |this, window, cx| {
+                        this.on_query_error(tab_id, epoch, None, &err, window, cx);
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            // `EXPLAIN (ANALYZE)` runs the statement for real, so it is as
+            // cancellable as a Run.
+            let token = session.cancel_token();
+            this.update(cx, |this, _| {
+                if let Some(ix) = this.tab_index_by_id(tab_id) {
+                    this.tabs[ix].cancel = Some(token);
+                }
+            })
+            .ok();
+
+            let explained = sql.clone();
+            let (session, result) = cx
+                .background_spawn(async move {
+                    let result = session.explain(&explained, analyze, autocommit);
+                    (session, result)
+                })
+                .await;
+            let elapsed = started.elapsed();
+
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(json) => {
+                    this.on_plan_ok(tab_id, epoch, session, &json, &sql, analyze, elapsed, cx);
+                }
+                Err(err) => this.on_query_error(tab_id, epoch, Some(session), &err, window, cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Settle a finished `EXPLAIN`: put its session back, parse the plan onto
+    /// the tab and show it. A plan that will not parse is reported in the log
+    /// rather than thrown away silently — the JSON came from the server, so a
+    /// failure here is pg-gui's problem to see.
+    #[allow(clippy::too_many_arguments)]
+    fn on_plan_ok(
+        &mut self,
+        tab_id: u64,
+        epoch: u64,
+        session: db::Session,
+        json: &str,
+        sql: &str,
+        analyze: bool,
+        elapsed: std::time::Duration,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.settle_session(tab_id, epoch, session) else {
+            return;
+        };
+        // `EXPLAIN (ANALYZE)` really runs the statement, so it raises whatever
+        // notices the statement does; they belong in the log like a Run's.
+        let notices = self.tabs[ix]
+            .session
+            .as_mut()
+            .map(db::Session::take_notices)
+            .unwrap_or_default();
+        for notice in notices {
+            self.tabs[ix].result.log.push(SharedString::from(notice));
+        }
+
+        let parsed = plan::parse(json, analyze, sql);
+        let plan = match parsed {
+            Ok(plan) => plan,
+            Err(err) => {
+                let line = format!("EXPLAIN: {err}");
+                self.tabs[ix].result.log.push(SharedString::from(line));
+                self.bottom_view = BottomView::Log;
+                self.show_tab_result(ix, cx);
+                self.set_status("Could not read the plan — see the log", cx);
+                return;
+            }
+        };
+
+        let verb = if analyze {
+            "explain analyze"
+        } else {
+            "explain"
+        };
+        let status = format!(
+            "{verb}: {} node(s), {} deep — {} in {elapsed:.0?}",
+            plan.nodes, plan.depth, plan.summary,
+        );
+        self.tabs[ix]
+            .result
+            .log
+            .push(SharedString::from(status.clone()));
+        self.tabs[ix].result.plan = Some(plan);
+        // A new plan starts unzoomed; the old focus is a path into a tree that
+        // no longer exists.
+        self.tabs[ix].result.plan_focus = None;
+        self.bottom_view = BottomView::Plan;
+        if !self.config.results_panel_visible {
+            self.config.results_panel_visible = true;
+            self.schedule_save(cx);
+        }
+        self.show_tab_result(ix, cx);
+        self.set_status(status, cx);
+    }
+
     /// The picked scripts as `(label, path)`, in run order. The label is
     /// the path relative to the working folder — what the panel shows —
     /// since the absolute path is mostly noise in a log line.
@@ -4300,6 +4494,25 @@ impl PgGuiApp {
             }))
     }
 
+    /// The Plan switch button, present only once the tab holds a plan — the
+    /// view has nothing to show before the first `EXPLAIN`.
+    fn plan_view_button(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        self.tabs
+            .get(self.active_tab)?
+            .result
+            .plan
+            .as_ref()
+            .map(|_| {
+                Self::bottom_view_button(
+                    BottomView::Plan,
+                    "🔥",
+                    "Show plan",
+                    "bottom-view-plan",
+                    cx,
+                )
+            })
+    }
+
     /// The row of buttons switching between the result sets a multi-statement
     /// run produced, one per statement that returned rows. `None` when the run
     /// produced at most one.
@@ -4418,6 +4631,7 @@ impl PgGuiApp {
                     .gap_2()
                     .children(self.render_results_pager(cx))
                     .child(div().flex_1())
+                    .children(self.plan_view_button(cx))
                     // The Log switch stays visible so the log is always one
                     // click away, even before a run produced any messages.
                     .child(Self::bottom_view_button(
@@ -4481,6 +4695,7 @@ impl PgGuiApp {
                             })),
                     )
                     .child(div().flex_1())
+                    .children(self.plan_view_button(cx))
                     // The Data switch stays visible so the table is always one
                     // click away, even when the last run returned no rows.
                     .child(Self::bottom_view_button(
@@ -4491,6 +4706,144 @@ impl PgGuiApp {
                         cx,
                     )),
             )
+    }
+
+    /// The last `EXPLAIN`'s plan as a flame graph: each node as wide as its
+    /// cost (or, under ANALYZE, the time it spent), its children packed
+    /// inside it. Clicking a frame zooms to it, clicking one of the ancestor
+    /// rows above zooms back out.
+    fn render_plan_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(plan) = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.result.plan.as_ref())
+        else {
+            return v_flex()
+                .size_full()
+                .p_2()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No plan yet — cmd-e explains the statement at the cursor."),
+                )
+                .child(Self::render_plan_footer(None, cx))
+                .into_any_element();
+        };
+
+        let focus = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.result.plan_focus.clone());
+        let header = format!(
+            "{} — {}, {} node(s), {} deep · {}",
+            if plan.analyze {
+                "explain analyze"
+            } else {
+                "explain"
+            },
+            plan.unit.caption(),
+            plan.nodes,
+            plan.depth,
+            plan.summary,
+        );
+
+        v_flex()
+            .size_full()
+            .p_2()
+            .gap_1()
+            .child(
+                v_flex()
+                    .gap_0p5()
+                    .child(div().text_color(cx.theme().muted_foreground).child(header))
+                    .child(
+                        div()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(cx.theme().mono_font_size)
+                            .text_color(cx.theme().muted_foreground)
+                            .truncate()
+                            .child(plan.statement.clone()),
+                    ),
+            )
+            .child(Self::render_plan_chart(plan, focus.clone(), cx))
+            .child(Self::render_plan_footer(Some(focus.is_some()), cx))
+            .into_any_element()
+    }
+
+    /// The flame graph itself, in the scroll container that gives it room for
+    /// the whole stack: the chart fills the area it is handed and clips what
+    /// does not fit, so a plan deeper than the pane scrolls rather than
+    /// squeezing its rows.
+    fn render_plan_chart(
+        plan: &plan::Plan,
+        focus: Option<FlamePath>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let unit = plan.unit;
+        let chart = FlameGraph::shared(plan.roots.clone())
+            .id("explain-flame")
+            .children(|node: &plan::PlanNode| node.children.as_slice())
+            .value(|node: &plan::PlanNode| node.value)
+            .label(|node: &plan::PlanNode| node.label.clone())
+            .format(move |value| unit.format(value).into())
+            .focus(focus)
+            .row_height(cx.theme().mono_font_size + px(8.))
+            .on_click(cx.listener(|this, path: &FlamePath, _, cx| {
+                let active = this.active_tab;
+                if let Some(tab) = this.tabs.get_mut(active) {
+                    tab.result.plan_focus = Some(path.clone());
+                }
+                cx.notify();
+            }));
+        let height = chart.height(plan.depth);
+        div()
+            .id("plan-scroll")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .child(div().w_full().h(height).child(chart))
+    }
+
+    /// The plan view's bottom row: the switches back to the table and the log,
+    /// plus — once there is a plan to zoom — the way out of a zoom. `zoomed`
+    /// is `None` before the first `EXPLAIN`, when there is nothing to reset.
+    fn render_plan_footer(
+        zoomed: Option<bool>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        h_flex()
+            .gap_2()
+            .children(zoomed.map(|zoomed| {
+                Button::new("plan-reset-zoom")
+                    .outline()
+                    .small()
+                    .label("Reset zoom")
+                    .tooltip("Show the whole plan again")
+                    .disabled(!zoomed)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let active = this.active_tab;
+                        if let Some(tab) = this.tabs.get_mut(active) {
+                            tab.result.plan_focus = None;
+                        }
+                        cx.notify();
+                    }))
+            }))
+            .child(div().flex_1())
+            .child(Self::bottom_view_button(
+                BottomView::Data,
+                "▦",
+                "Show data",
+                "plan-view-data",
+                cx,
+            ))
+            .child(Self::bottom_view_button(
+                BottomView::Log,
+                "☰",
+                "Show log",
+                "plan-view-log",
+                cx,
+            ))
     }
 
     fn render_results_pager(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
@@ -5546,6 +5899,7 @@ impl PgGuiApp {
                             match self.bottom_view {
                                 BottomView::Data => self.render_data_view(cx).into_any_element(),
                                 BottomView::Log => self.render_log(cx).into_any_element(),
+                                BottomView::Plan => self.render_plan_view(cx),
                             }
                         }),
                 ),
@@ -6763,6 +7117,8 @@ impl Render for PgGuiApp {
             .capture_action(cx.listener(Self::on_editor_escape))
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::run_scripts))
+            .on_action(cx.listener(Self::explain_plan))
+            .on_action(cx.listener(Self::explain_analyze))
             .on_action(cx.listener(Self::toggle_autocommit))
             .on_action(cx.listener(Self::commit_txn))
             .on_action(cx.listener(Self::rollback_txn))

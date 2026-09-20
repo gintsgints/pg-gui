@@ -24,18 +24,19 @@ futures = "0.3.34"
 # on) so a single gpui resolves for the whole graph;
 # tree-sitter still lands on 0.26, in lockstep with the pgls fork's
 # `bump_treesitter` branch.
-gpui = { package = "gpui-pre", version = "0.3.4" }
+gpui = { package = "gpui-pre", version = "0.3.5" }
 # gpui split the platform out into its own crate; `gpui_platform::application()`
 # replaces the old `Application::new()`. Features match gpui-kit's own.
-gpui_platform = { package = "gpui-pre-platform", version = "0.3.4", features = [
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.5", features = [
     "font-kit",
     "x11",
     "wayland",
     "runtime_shaders",
 ] }
-# The fork carries three input patches pg-gui needs and upstream does not have:
-# the clickable breakpoint gutter, `line_number_offset` for body-relative
-# routine numbering, and the vertical-selection column fix.
+# The fork carries four patches pg-gui needs and upstream does not have: three
+# on the input (the clickable breakpoint gutter, `line_number_offset` for
+# body-relative routine numbering, and the vertical-selection column fix) plus
+# the `FlameGraph` chart the query-plan view draws.
 gpui-component = { git = "https://github.com/gintsgints/gpui-kit", branch = "my_fixes3", features = [
     "tree-sitter-languages",
 ] }

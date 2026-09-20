@@ -51,6 +51,14 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
   browser does. The lookup is pg-gui's own catalog query, so it works even
   while the language server is down, and resolves unqualified names the way
   `search_path` would
+- **Query plan flame graph** (`cmd-e`, or `cmd-shift-e` to run the statement
+  under `EXPLAIN (ANALYZE, BUFFERS)`): the plan is drawn under the editor as a
+  flame graph, each node as wide as its estimated cost — or, with ANALYZE, the
+  time it actually spent across every loop it ran. Hover a frame for its
+  measure and share of the plan, click one to zoom into it, click an ancestor
+  row (or Reset zoom) to come back out. The explain runs on the tab's own
+  session, so with autocommit off an `EXPLAIN (ANALYZE)` of a DML statement is
+  still Rollback's to undo
 - **PL/pgSQL step debugging** (`cmd-shift-d`) through the server's
   [pldebugger](https://github.com/EnterpriseDB/pldebugger) extension: the launch
   dialog takes the routine (pre-filled from the statement at the cursor), its
@@ -182,6 +190,7 @@ or `F1` (Linux) in the app to see this list in a dialog. On Linux, `cmd` is
 | `cmd-enter` / `ctrl-enter` | Run the selection or the statement at the cursor |
 | `cmd-shift-enter` / `ctrl-shift-enter` | Run the scripts selected in the files panel |
 | `cmd-i` / `ctrl-space` | AI complete at cursor |
+| `cmd-e` / `cmd-shift-e` | Explain the statement / explain it with ANALYZE (runs it) |
 | `cmd-shift-f` | Format the script |
 | `cmd-/` | Comment or uncomment the line / selection |
 | `cmd-f` / `ctrl-f` | Find in the script |
@@ -217,6 +226,7 @@ or `F1` (Linux) in the app to see this list in a dialog. On Linux, `cmd` is
 - `src/file_tree.rs` — files panel scanning, filtering and run ordering
 - `src/lsp.rs` — embedded Postgres Language Server (completions, hover, diagnostics, formatting)
 - `src/export.rs` — rendering results for export (CSV via `COPY`, INSERT scripts)
+- `src/plan.rs` — `EXPLAIN (FORMAT JSON)` parsed into the flame graph's frames
 - `src/results.rs` — table delegate rendering the result set
 - `src/statement.rs` — locating the SQL statement under the cursor
 - `src/snippets.rs` — built-in and user snippet library

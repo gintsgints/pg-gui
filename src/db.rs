@@ -538,6 +538,55 @@ impl Session {
         )))
     }
 
+    /// Explain `sql` on this session and return the JSON document
+    /// `EXPLAIN (FORMAT JSON)` produces, for [`crate::plan::parse`].
+    ///
+    /// It runs on the tab's own connection like a Run does, so a plan reflects
+    /// that session's temp tables, `SET`s and open transaction rather than a
+    /// fresh backend's. With `analyze`, the statement is genuinely executed —
+    /// `BUFFERS` comes along, since the numbers are free once it has run — and
+    /// with autocommit off that execution lands in the tab's transaction,
+    /// where Rollback can still undo it.
+    pub fn explain(
+        &mut self,
+        sql: &str,
+        analyze: bool,
+        autocommit: bool,
+    ) -> Result<String, String> {
+        self.end_cursor()?;
+        if !autocommit && !self.in_txn {
+            self.client
+                .batch_execute("BEGIN")
+                .map_err(|e| describe(&e))?;
+            self.in_txn = true;
+        }
+        let options = if analyze {
+            "ANALYZE, BUFFERS, FORMAT JSON"
+        } else {
+            "FORMAT JSON"
+        };
+        // A statement picked up under the cursor carries its terminator;
+        // `EXPLAIN (…) select 1;` is fine, but a trailing comment after the
+        // semicolon would not be, so the tail goes.
+        let statement = sql.trim().trim_end_matches(';').trim_end();
+        let results = self
+            .client
+            .simple_query(&format!("EXPLAIN ({options}) {statement}"))
+            .map_err(|e| describe(&e))?;
+        // One column, one row — but a long plan is returned as several rows on
+        // some server versions, so they are joined back together.
+        let json = collect_outcome(results)
+            .rows
+            .iter()
+            .filter_map(|row| row.first().cloned().flatten())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if json.trim().is_empty() {
+            return Err("EXPLAIN returned no plan".to_string());
+        }
+        Ok(json)
+    }
+
     /// Pull the next `batch_size` rows from the open cursor, closing it when
     /// exhausted. Returns the rows and whether more may remain.
     pub fn fetch_more(&mut self, batch_size: usize) -> Result<(Rows, bool), String> {
