@@ -8,7 +8,12 @@ edition = "2024"
 name = "pg-gui"
 identifier = "com.gintspolis.pg-gui"
 icon = ["assets/icon.icns"]
-osx_minimum_system_version = "11.0"
+
+# cargo-bundle 0.12 moved the platform keys into their own tables and rejects
+# unknown ones, so the deployment target is no longer a flat
+# `osx_minimum_system_version`.
+[package.metadata.bundle.osx]
+minimum_system_version = "11.0"
 
 [dependencies]
 anyhow = "1"
