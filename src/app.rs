@@ -14,8 +14,8 @@ use gpui::{
     StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, IndexPath, Root, Sizable as _, StyledExt as _, Theme,
-    ThemeMode, TitleBar, WindowExt as _,
+    ActiveTheme as _, Disableable as _, IndexPath, Sizable as _, StyledExt as _, Theme, ThemeMode,
+    TitleBar, WindowExt as _,
     button::{Button, ButtonVariants as _},
     chart::{FlameGraph, FlamePath},
     checkbox::Checkbox,
@@ -7105,7 +7105,9 @@ impl PgGuiApp {
 }
 
 impl Render for PgGuiApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Dialogs, sheets and notifications are drawn by gpui-component's own
+        // `Root` plugin overlay, above this element.
         v_flex()
             .size_full()
             .relative()
@@ -7171,9 +7173,6 @@ impl Render for PgGuiApp {
                     .child(self.render_workspace(cx)),
             )
             .child(self.render_status_bar(cx))
-            // Dialogs (e.g. the snippet picker) are drawn by the app's root
-            // element; gpui-component's Root only stores them.
-            .children(Root::render_dialog_layer(window, cx))
     }
 }
 
