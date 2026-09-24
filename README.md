@@ -21,7 +21,10 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
   virtualized table (handles large result sets). A single SELECT runs
   through a server-side cursor: only the first batch of rows is
   transferred (`fetch_size` in config.json, default 500) and a Fetch more
-  button under the table pulls the next batch on demand
+  button under the table pulls the next batch on demand. Columns are sized to
+  their content — the header and the first rows of each — and a result of
+  four columns or fewer stretches to fill the pane instead of leaving an
+  empty strip beside it
 - **Copy from the results grid** (`cmd-c`): click a cell to copy its value, a
   row header to copy the row (cells joined by tabs), a column header to copy
   the column (one value per line, the current page only). A SQL NULL copies as
