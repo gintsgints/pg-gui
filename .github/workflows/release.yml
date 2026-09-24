@@ -34,10 +34,13 @@ jobs:
       - name: Install cargo-bundle
         run: cargo install cargo-bundle --locked
 
+      # --locked everywhere: a release must build the dependency versions the
+      # lockfile pins, some of which are pinned to dodge a broken upstream
+      # release (find-msvc-tools 0.1.12, see Cargo.lock).
       - name: Build both architectures
         run: |
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
 
       - name: Bundle pg-gui.app
         run: cargo bundle --release --target aarch64-apple-darwin
@@ -97,7 +100,7 @@ jobs:
           tree-sitter-ref: v0.25.9
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Package tarball
         run: |
@@ -131,7 +134,7 @@ jobs:
           tree-sitter-ref: v0.25.9
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Package zip
         shell: pwsh
