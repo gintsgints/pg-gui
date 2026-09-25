@@ -122,13 +122,22 @@ pub struct ResultSet {
     pub rows: Rows,
 }
 
-/// What a run reports as it goes, one message per statement (two when the
-/// statement returned rows), pushed the moment that statement finishes so
-/// the UI can show it while the rest of the block is still running.
+/// What a run reports as it goes: one `Statement` the moment a statement is
+/// about to execute, then one message per statement (two when it returned
+/// rows) the moment it finishes, so the UI can show progress while the rest
+/// of the block is still running.
 #[derive(Debug)]
 pub enum RunEvent {
+    /// A statement is about to execute: its 1-based index in the run and the
+    /// run's statement count. Sent before the statement runs, so a long one
+    /// is attributable while it is still going.
+    Statement { n: usize, total: usize },
     /// A statement finished: its log line.
     Log(String),
+    /// A script batch moved on to a file: its label. Sent by the batch
+    /// runner, which owns the notion of a file; a run of one buffer never
+    /// sends it.
+    File(String),
     /// A statement raised a server notice while running.
     Notice(String),
     /// A statement returned rows.
@@ -374,6 +383,13 @@ impl Session {
         let mut more = false;
         for (n, range) in ranges.iter().enumerate() {
             let paged = single.then_some(batch_size);
+            send(
+                progress,
+                RunEvent::Statement {
+                    n: n + 1,
+                    total: ranges.len(),
+                },
+            );
             match self.run_statement(n + 1, &sql[range.clone()], paged, progress) {
                 Ok(left_open) => more = left_open,
                 Err(error) => {
@@ -1387,6 +1403,17 @@ mod tests {
         log: Vec<String>,
         notices: Vec<String>,
         sets: Vec<ResultSet>,
+        /// One entry per statement the run announced, in the order announced:
+        /// its 1-based index and the run's statement count.
+        statements: Vec<(usize, usize)>,
+        /// The file labels a batch run announced, in order. Empty for a run
+        /// of a single buffer, which knows nothing about files.
+        files: Vec<String>,
+        /// The `Statement` and `Log` events interleaved as they arrived, as
+        /// `"stmt 1/3"` and `"log 1"`, so a test can assert that a statement
+        /// is announced before it is logged rather than only that both
+        /// happened.
+        sequence: Vec<String>,
         more: bool,
     }
 
@@ -1410,9 +1437,20 @@ mod tests {
         let mut log = Vec::new();
         let mut notices = Vec::new();
         let mut sets = Vec::new();
+        let mut statements = Vec::new();
+        let mut files = Vec::new();
+        let mut sequence = Vec::new();
         for event in futures::executor::block_on_stream(rx) {
             match event {
-                RunEvent::Log(line) => log.push(line),
+                RunEvent::Statement { n, total } => {
+                    sequence.push(format!("stmt {n}/{total}"));
+                    statements.push((n, total));
+                }
+                RunEvent::File(label) => files.push(label),
+                RunEvent::Log(line) => {
+                    sequence.push(format!("log {}", log.len() + 1));
+                    log.push(line);
+                }
                 RunEvent::Notice(line) => notices.push(line),
                 RunEvent::Result(set) => sets.push(set),
             }
@@ -1422,6 +1460,9 @@ mod tests {
                 log,
                 notices,
                 sets,
+                statements,
+                files,
+                sequence,
                 more: run.more,
             }),
             Err(error) => Err((error, log)),
@@ -1470,6 +1511,33 @@ mod tests {
             content.lines().next().unwrap(),
             "INSERT INTO my_table (\"name\", \"note\") VALUES ('O''Brien', NULL);"
         );
+    }
+
+    #[test]
+    #[ignore = "requires the docker compose database on localhost:5433"]
+    fn each_statement_is_announced_before_it_is_logged() {
+        let mut session = Session::connect(CONN).unwrap();
+        let ran = run(&mut session, "SELECT 1; SELECT 2; SELECT 3;", 50).unwrap();
+        assert_eq!(ran.statements, vec![(1, 3), (2, 3), (3, 3)]);
+        // Each announcement lands before that statement's log line, which is
+        // the point of the event: a long statement is attributable while it
+        // is still running.
+        assert_eq!(
+            ran.sequence,
+            vec![
+                "stmt 1/3", "log 1", "stmt 2/3", "log 2", "stmt 3/3", "log 3"
+            ]
+        );
+        // A run of one buffer says nothing about files.
+        assert!(ran.files.is_empty(), "{:?}", ran.files);
+    }
+
+    #[test]
+    #[ignore = "requires the docker compose database on localhost:5433"]
+    fn a_lone_statement_reports_a_total_of_one() {
+        let mut session = Session::connect(CONN).unwrap();
+        let ran = run(&mut session, "SELECT 1;", 50).unwrap();
+        assert_eq!(ran.statements, vec![(1, 1)]);
     }
 
     #[test]

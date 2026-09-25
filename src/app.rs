@@ -28,6 +28,7 @@ use gpui_component::{
     list::{List, ListEvent, ListItem, ListState},
     resizable::{ResizableState, h_resizable, resizable_panel, v_resizable},
     searchable_list::{SearchableListItem, SearchableVec},
+    spinner::Spinner,
     tab::{Tab, TabBar},
     table::{DataTable, TableDelegate as _, TableState},
     tooltip::Tooltip,
@@ -149,6 +150,11 @@ fn default_conn() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| "postgres".to_string());
     format!("postgres://{user}@localhost:5432/postgres")
 }
+
+/// How often the status bar's clock is repainted while a run is in flight.
+/// Fast enough that a tenth-of-a-second reading moves smoothly, and the loop
+/// only exists while something is running.
+const PROGRESS_TICK: Duration = Duration::from_millis(200);
 
 /// Number of connections kept in the Recent menu.
 const MAX_RECENT_CONNECTIONS: usize = 10;
@@ -1207,12 +1213,46 @@ struct EditorTab {
     autocommit: bool,
     /// A query is in flight on this tab's session (single in-flight per tab).
     running: bool,
+    /// What that in-flight work is and how long it has been going. Set
+    /// alongside `running` and cleared with it, so the status bar can show
+    /// the tab it is looking at rather than whichever run reported last.
+    progress: Option<RunProgress>,
     /// Cancels the in-flight query; set while `running`, taken by Cancel.
     cancel: Option<postgres::CancelToken>,
     /// This tab's last query output, mirrored into the shared results table
     /// and log view while the tab is active and restored when it is
     /// reactivated.
     result: TabResult,
+}
+
+/// Work in flight on a tab, as the status bar shows it. The elapsed time is
+/// derived from `started` on every frame rather than stored, so it keeps
+/// counting while the user is on another tab.
+struct RunProgress {
+    /// What is running, in the words the finished run will use in its own
+    /// status line ("statement", "3 script(s)", "EXPLAIN ANALYZE", …).
+    scope: SharedString,
+    /// When the work started; the clock in the status bar counts from here.
+    started: std::time::Instant,
+    /// The script file being executed, for a batch run. `None` for anything
+    /// that runs the buffer.
+    file: Option<SharedString>,
+    /// The statement about to run and the run's statement count, from the
+    /// moment it is announced. `None` until the first announcement, and for
+    /// work that does not run statements (fetch, export).
+    statement: Option<(usize, usize)>,
+}
+
+impl RunProgress {
+    /// Start the clock on `scope`.
+    fn new(scope: impl Into<SharedString>) -> Self {
+        Self {
+            scope: scope.into(),
+            started: std::time::Instant::now(),
+            file: None,
+            statement: None,
+        }
+    }
 }
 
 /// A tab's last query output, mirrored into the shared results table and
@@ -1265,6 +1305,13 @@ struct DebugState {
     /// Set once the session reports termination; the panel stays up (showing
     /// the final output) until the user starts another or stops.
     terminated: bool,
+    /// The session is working and not parked at a line: starting up, waiting
+    /// for the target to be entered, or running on after a step or continue.
+    /// Not derivable from `stop`/`terminated` — after the first stop, the
+    /// previous stop's state is still on screen while the next step is in
+    /// flight — so it is set where commands go out and cleared where events
+    /// come back.
+    busy: bool,
 }
 
 /// Which view the bottom panel shows: the returned rows, the message log, or
@@ -1354,6 +1401,9 @@ pub struct PgGuiApp {
     /// State of the browser's top-level schema-list fetch.
     db_schema_load: DbSchemaLoad,
     status: SharedString,
+    /// A repaint loop is alive, driving the status bar's clock while some tab
+    /// has work in flight. Guards against a second run stacking another loop.
+    ticking: bool,
     ai_running: bool,
     /// Next id handed to a new tab; only ever increments (see [`EditorTab::id`]).
     next_tab_id: u64,
@@ -1397,6 +1447,20 @@ pub struct PgGuiApp {
 /// line the log lines below it could not be told apart. Stops at the first
 /// file that fails to be read or that a statement fails in, and reports it
 /// named. Blocking; called on the background executor.
+/// A running clock for the status bar: `0.4s` below a minute, `1m 05s`
+/// above it. Deliberately not `Duration`'s `Debug` formatting, which the
+/// finished-run log lines use — that switches units as it goes (`843ms`,
+/// `1.2s`), which reads as jitter on a number that is ticking.
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs < 60. {
+        format!("{secs:.1}s")
+    } else {
+        let whole = elapsed.as_secs();
+        format!("{}m {:02}s", whole / 60, whole % 60)
+    }
+}
+
 fn run_files(
     session: &mut db::Session,
     files: Vec<(String, PathBuf)>,
@@ -1408,6 +1472,7 @@ fn run_files(
     let mut more = false;
     for (label, path) in files {
         let sql = std::fs::read_to_string(&path).map_err(|err| format!("{label}: {err}"))?;
+        let _ = progress.unbounded_send(db::RunEvent::File(label.clone()));
         let _ = progress.unbounded_send(db::RunEvent::Log(format!("▶ {label}")));
         let run = session
             .run(&sql, batch_size, autocommit, progress)
@@ -1545,6 +1610,7 @@ impl PgGuiApp {
             show_system_schemas: false,
             db_schema_load: DbSchemaLoad::Ready,
             status: "Ready".into(),
+            ticking: false,
             ai_running: false,
             next_tab_id,
             db_epoch: 0,
@@ -1703,6 +1769,7 @@ impl PgGuiApp {
             session: None,
             autocommit,
             running: false,
+            progress: None,
             cancel: None,
             result: TabResult::default(),
         }
@@ -1744,10 +1811,82 @@ impl PgGuiApp {
     }
 
     /// Set a tab's in-flight flag by id (no-op if the tab was closed).
+    /// Clearing it also stops that tab's clock; starting it is left to
+    /// [`Self::start_progress_by_id`], which needs to say what is running.
     fn set_tab_running(&mut self, tab_id: u64, running: bool) {
         if let Some(ix) = self.tab_index_by_id(tab_id) {
             self.tabs[ix].running = running;
+            if !running {
+                self.tabs[ix].progress = None;
+            }
         }
+    }
+
+    /// Mark a tab busy with `scope` and start its clock, so the status bar
+    /// shows a live indicator for as long as the work is in flight.
+    fn start_progress(
+        &mut self,
+        ix: usize,
+        scope: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.tabs[ix].running = true;
+        self.tabs[ix].progress = Some(RunProgress::new(scope));
+        self.start_progress_tick(cx);
+    }
+
+    /// The same by tab id, for work that starts after an `await` (the export
+    /// path, which only reaches this point once the user has picked a file).
+    fn start_progress_by_id(
+        &mut self,
+        tab_id: u64,
+        scope: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ix) = self.tab_index_by_id(tab_id) {
+            self.start_progress(ix, scope, cx);
+        }
+    }
+
+    /// Stop a tab's clock, leaving `running` to its own owner.
+    fn clear_progress(&mut self, ix: usize) {
+        self.tabs[ix].progress = None;
+    }
+
+    /// Whether any tab still has work in flight; the tick loop runs only
+    /// while this holds.
+    fn any_progress(&self) -> bool {
+        self.tabs.iter().any(|tab| tab.progress.is_some())
+    }
+
+    /// Repaint every [`PROGRESS_TICK`] while any tab has work in flight, so
+    /// the status bar's clock advances on its own. The spinner animates
+    /// itself; only the number needs this. One loop serves every tab and
+    /// exits as soon as the last run settles.
+    fn start_progress_tick(&mut self, cx: &mut Context<Self>) {
+        if self.ticking {
+            return;
+        }
+        self.ticking = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(PROGRESS_TICK).await;
+                let alive = this.update(cx, |this, cx| {
+                    if this.any_progress() {
+                        cx.notify();
+                        true
+                    } else {
+                        this.ticking = false;
+                        false
+                    }
+                });
+                // Stop on a dropped window as well as on the last run ending.
+                if !matches!(alive, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Whether the active tab has a query in flight.
@@ -3175,7 +3314,7 @@ impl PgGuiApp {
         // the first Run). A single SELECT-style statement pages through a
         // server-side cursor on that connection; scripts and DML run directly.
         let session = self.tabs[ix].session.take();
-        self.tabs[ix].running = true;
+        self.start_progress(ix, scope, cx);
         // The run streams its own result sets in; drop the previous Run's so
         // the selector only ever shows this one's.
         self.tabs[ix].result.results.clear();
@@ -3284,12 +3423,12 @@ impl PgGuiApp {
         let autocommit = self.tabs[ix].autocommit;
         let epoch = self.db_epoch;
         let session = self.tabs[ix].session.take();
-        self.tabs[ix].running = true;
         let verb = if analyze {
             "Explaining (analyze)"
         } else {
             "Explaining"
         };
+        self.start_progress(ix, format!("{verb} {scope}"), cx);
         self.set_status(format!("{verb} {scope}…"), cx);
 
         cx.spawn_in(window, async move |this, cx| {
@@ -3604,7 +3743,7 @@ impl PgGuiApp {
         let batch_size = self.config.fetch_size.max(1);
         let epoch = self.db_epoch;
         let session = self.tabs[ix].session.take();
-        self.tabs[ix].running = true;
+        self.start_progress(ix, format!("{count} script(s)"), cx);
         self.tabs[ix].result.results.clear();
         self.tabs[ix].result.selected = 0;
         self.tabs[ix].result.has_more = false;
@@ -3678,6 +3817,7 @@ impl PgGuiApp {
     fn settle_session(&mut self, tab_id: u64, epoch: u64, session: db::Session) -> Option<usize> {
         let ix = self.tab_index_by_id(tab_id)?;
         self.tabs[ix].running = false;
+        self.clear_progress(ix);
         self.tabs[ix].cancel = None;
         if epoch != self.db_epoch || session.is_closed() {
             self.tabs[ix].session = None;
@@ -3706,6 +3846,21 @@ impl PgGuiApp {
         };
         let mut rows = false;
         match event {
+            // Progress, not output: these move the status bar's indicator on
+            // and stay out of the message log.
+            db::RunEvent::Statement { n, total } => {
+                if let Some(progress) = self.tabs[ix].progress.as_mut() {
+                    progress.statement = Some((n, total));
+                }
+            }
+            db::RunEvent::File(label) => {
+                if let Some(progress) = self.tabs[ix].progress.as_mut() {
+                    progress.file = Some(SharedString::from(label));
+                    // Each file numbers its statements from 1 again; drop the
+                    // previous file's count until this one announces its first.
+                    progress.statement = None;
+                }
+            }
             db::RunEvent::Log(line) | db::RunEvent::Notice(line) => {
                 self.tabs[ix].result.log.push(SharedString::from(line));
             }
@@ -3785,6 +3940,7 @@ impl PgGuiApp {
     ) {
         if let Some(ix) = self.tab_index_by_id(tab_id) {
             self.tabs[ix].running = false;
+            self.clear_progress(ix);
             self.tabs[ix].cancel = None;
             self.tabs[ix].session = session.filter(|s| epoch == self.db_epoch && !s.is_closed());
             let result = &mut self.tabs[ix].result;
@@ -3854,7 +4010,8 @@ impl PgGuiApp {
         };
         let tab_id = tab.id;
         let epoch = self.db_epoch;
-        tab.running = true;
+        let verb = if commit { "Commit" } else { "Rollback" };
+        self.start_progress(ix, verb, cx);
         self.set_status(
             if commit {
                 "Committing…"
@@ -3960,7 +4117,7 @@ impl PgGuiApp {
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = rx.await else { return };
             this.update(cx, |this, cx| {
-                this.set_tab_running(tab_id, true);
+                this.start_progress_by_id(tab_id, format!("export of {scope}"), cx);
                 this.set_status(format!("Exporting {scope}…"), cx);
             })
             .ok();
@@ -4440,6 +4597,7 @@ impl PgGuiApp {
         for tab in &mut self.tabs {
             tab.session = None;
             tab.running = false;
+            tab.progress = None;
             tab.cancel = None;
             tab.result.has_more = false;
         }
@@ -4920,7 +5078,7 @@ impl PgGuiApp {
         let tab_id = tab.id;
         let epoch = self.db_epoch;
         let batch_size = self.config.fetch_size.max(1);
-        self.tabs[ix].running = true;
+        self.start_progress(ix, "more rows", cx);
         self.set_status("Fetching more rows…", cx);
 
         cx.spawn_in(window, async move |this, cx| {
@@ -5792,6 +5950,37 @@ impl PgGuiApp {
     /// piece; it stays plain text (not a `Button`) so the bar keeps its
     /// thin single-line typography, with the pointer cursor and a hover
     /// brightening as the affordance.
+    /// The left-hand end of the status bar: a live indicator while the active
+    /// tab has work in flight (spinner, what is running, the file and
+    /// statement it has reached, and a clock), else the last status message.
+    ///
+    /// The clock is read from the tab's start instant on every frame, so it
+    /// keeps counting across a tab switch; the repaints come from
+    /// [`Self::start_progress_tick`].
+    fn render_run_indicator(&self) -> AnyElement {
+        let Some(progress) = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.progress.as_ref())
+        else {
+            return div().child(self.status.clone()).into_any_element();
+        };
+        let mut line = format!("Running {}", progress.scope);
+        if let Some(file) = &progress.file {
+            let _ = write!(line, " · {file}");
+        }
+        // A lone statement needs no count; "1/1" is noise.
+        if let Some((n, total)) = progress.statement.filter(|(_, total)| *total > 1) {
+            let _ = write!(line, " · statement {n}/{total}");
+        }
+        let _ = write!(line, " · {}", format_elapsed(progress.started.elapsed()));
+        h_flex()
+            .gap_2()
+            .child(Spinner::new().xsmall())
+            .child(line)
+            .into_any_element()
+    }
+
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let ai_available = ai::api_key(&self.config.ai_api_key).is_some();
         let format_on_save = self.config.format_on_save;
@@ -5802,7 +5991,7 @@ impl PgGuiApp {
             .border_color(cx.theme().border)
             .text_sm()
             .text_color(cx.theme().muted_foreground)
-            .child(self.status.clone())
+            .child(self.render_run_indicator())
             .child(div().flex_1())
             .child(
                 div()
@@ -6490,8 +6679,10 @@ impl PgGuiApp {
                 this.rollback_txn(&Rollback, window, cx);
             }));
 
-        let cancel_btn = Button::new("session-cancel")
-            .danger()
+        // Filled while a query is in flight, flat when there is nothing to
+        // cancel: disabling alone only dims it, which reads the same in both
+        // states and hides the one way out of a long query.
+        let cancel_base = Button::new("session-cancel")
             .small()
             .label("⊘")
             .tooltip("Cancel running query")
@@ -6499,6 +6690,11 @@ impl PgGuiApp {
             .on_click(cx.listener(|this, _, window, cx| {
                 this.cancel_query(&CancelQuery, window, cx);
             }));
+        let cancel_btn = if running {
+            cancel_base.danger()
+        } else {
+            cancel_base.ghost()
+        };
 
         let new_tab_btn = Button::new("new-tab")
             .ghost()
@@ -6688,6 +6884,7 @@ impl PgGuiApp {
             output: None,
             status: "Starting…".to_string(),
             terminated: false,
+            busy: true,
         });
         self.set_status("Debug session started", cx);
         cx.notify();
@@ -6715,6 +6912,7 @@ impl PgGuiApp {
             debug::DebugEvent::Status(note) => dbg.status = note,
             debug::DebugEvent::Stopped(stop) => {
                 dbg.stop = Some(stop);
+                dbg.busy = false;
                 stopped = true;
             }
             debug::DebugEvent::Output(output) => dbg.output = Some(output),
@@ -6729,10 +6927,12 @@ impl PgGuiApp {
             }
             debug::DebugEvent::Error(err) => {
                 dbg.output = Some(err.clone());
+                dbg.busy = false;
                 status = Some(format!("Debug error: {err}"));
             }
             debug::DebugEvent::Terminated => {
                 dbg.terminated = true;
+                dbg.busy = false;
                 status = Some("Debug finished".to_string());
                 keep = false;
             }
@@ -6779,15 +6979,19 @@ impl PgGuiApp {
         });
     }
 
-    pub fn debug_step_over(&mut self, _: &DebugStepOver, _: &mut Window, _: &mut Context<Self>) {
-        if let Some(dbg) = self.debug.as_ref().filter(|d| !d.terminated) {
+    pub fn debug_step_over(&mut self, _: &DebugStepOver, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dbg) = self.debug.as_mut().filter(|d| !d.terminated) {
             dbg.session.step_over();
+            dbg.busy = true;
+            cx.notify();
         }
     }
 
-    pub fn debug_step_into(&mut self, _: &DebugStepInto, _: &mut Window, _: &mut Context<Self>) {
-        if let Some(dbg) = self.debug.as_ref().filter(|d| !d.terminated) {
+    pub fn debug_step_into(&mut self, _: &DebugStepInto, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dbg) = self.debug.as_mut().filter(|d| !d.terminated) {
             dbg.session.step_into();
+            dbg.busy = true;
+            cx.notify();
         }
     }
 
@@ -6798,8 +7002,12 @@ impl PgGuiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.debug.as_ref() {
-            Some(dbg) if !dbg.terminated => dbg.session.continue_(),
+        match self.debug.as_mut() {
+            Some(dbg) if !dbg.terminated => {
+                dbg.session.continue_();
+                dbg.busy = true;
+                cx.notify();
+            }
             _ => self.start_debug(&StartDebug, window, cx),
         }
     }
@@ -6902,6 +7110,10 @@ impl PgGuiApp {
                     .font_semibold()
                     .child(format!("Debug: {}", dbg.session.target)),
             )
+            // Between stops there is nothing else moving in the panel: the
+            // previous stop's variables and stack stay on screen while the
+            // step runs.
+            .when(dbg.busy, |this| this.child(Spinner::new().xsmall()))
             .child(div().flex_1())
             .child(
                 Button::new("dbg-step-over")
@@ -6987,9 +7199,15 @@ impl PgGuiApp {
             .gap_2()
             .text_color(cx.theme().muted_foreground);
         pane = pane.child(if dbg.terminated {
-            format!("Session ended before stopping. {}", dbg.status)
+            div()
+                .child(format!("Session ended before stopping. {}", dbg.status))
+                .into_any_element()
         } else {
-            format!("{}…", dbg.status.trim_end_matches('…'))
+            h_flex()
+                .gap_2()
+                .when(dbg.busy, |this| this.child(Spinner::new().xsmall()))
+                .child(format!("{}…", dbg.status.trim_end_matches('…')))
+                .into_any_element()
         });
         if let Some(output) = &dbg.output {
             pane = pane.child(div().child(format!("Target: {output}")));
@@ -7182,8 +7400,8 @@ mod tests {
 
     use super::{
         MAX_RECENT_FOLDERS, definition_content_rank, dialog_start_dir, ends_with_name_word,
-        find_sql_file, folder_menu_label, glob_match, mask_credentials, percent_decode,
-        record_recent_folder, suggested_name_from_mask, toggle_line_comments,
+        find_sql_file, folder_menu_label, format_elapsed, glob_match, mask_credentials,
+        percent_decode, record_recent_folder, suggested_name_from_mask, toggle_line_comments,
     };
     use crate::db_tree::NodeKind;
 
@@ -7769,5 +7987,20 @@ mod tests {
         // sequence is left as it stands rather than panicking on the slice.
         assert_eq!(percent_decode("%aé"), "%aé");
         assert_eq!(percent_decode("pass%é"), "pass%é");
+    }
+
+    #[test]
+    fn elapsed_reads_as_a_clock() {
+        use std::time::Duration;
+        // Sub-second: one decimal, so the number moves visibly.
+        assert_eq!(format_elapsed(Duration::from_millis(0)), "0.0s");
+        assert_eq!(format_elapsed(Duration::from_millis(432)), "0.4s");
+        // Seconds keep the same shape rather than switching unit.
+        assert_eq!(format_elapsed(Duration::from_millis(12_340)), "12.3s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59.0s");
+        // Past a minute the seconds are zero-padded so the width is stable.
+        assert_eq!(format_elapsed(Duration::from_mins(1)), "1m 00s");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(format_elapsed(Duration::from_hours(1)), "60m 00s");
     }
 }
