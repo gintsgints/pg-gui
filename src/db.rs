@@ -707,6 +707,15 @@ pub struct TriggerInfo {
     pub name: String,
 }
 
+/// A column, as shown under a table's Columns folder.
+pub struct ColumnInfo {
+    pub name: String,
+    pub data_type: String,
+    pub not_null: bool,
+    pub primary: bool,
+    pub default: Option<String>,
+}
+
 /// Quote a string as a SQL literal, doubling embedded single quotes.
 fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
@@ -883,6 +892,42 @@ pub fn list_types(conn_str: &str, schema: &str) -> Result<Vec<String>, String> {
     Ok(catalog_rows(conn_str, &sql)?
         .iter()
         .filter_map(|row| row.get(0).map(ToString::to_string))
+        .collect())
+}
+
+/// Columns of `schema.relation`, in attribute order. Dropped and system
+/// columns are excluded. `primary` marks membership of the primary key, so a
+/// composite key marks each of its columns.
+pub fn list_columns(
+    conn_str: &str,
+    schema: &str,
+    relation: &str,
+) -> Result<Vec<ColumnInfo>, String> {
+    let sql = format!(
+        "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull, \
+                EXISTS (SELECT 1 FROM pg_catalog.pg_index i \
+                        WHERE i.indrelid = c.oid AND i.indisprimary \
+                          AND a.attnum = ANY (i.indkey)), \
+                pg_catalog.pg_get_expr(d.adbin, d.adrelid) \
+         FROM pg_catalog.pg_attribute a \
+         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+         WHERE n.nspname = {schema} AND c.relname = {relation} \
+           AND a.attnum > 0 AND NOT a.attisdropped \
+         ORDER BY a.attnum",
+        schema = quote_literal(schema),
+        relation = quote_literal(relation),
+    );
+    Ok(catalog_rows(conn_str, &sql)?
+        .iter()
+        .map(|row| ColumnInfo {
+            name: row.get(0).unwrap_or_default().to_string(),
+            data_type: row.get(1).unwrap_or_default().to_string(),
+            not_null: is_true(row.get(2)),
+            primary: is_true(row.get(3)),
+            default: row.get(4).map(ToString::to_string),
+        })
         .collect())
 }
 

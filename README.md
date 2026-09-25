@@ -43,7 +43,8 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
   server does the quoting, INSERT generates a runnable SQL script. The save
   dialog suggests `<table>_<date>` from the query's `FROM` table
 - **Database object browser** (`cmd-1`): schemas with their tables (each
-  expanding to its `CREATE TABLE` DDL, indexes, constraints and triggers),
+  expanding to its `CREATE TABLE` DDL, columns with their type and PK/not
+  null/default markers, indexes, constraints and triggers),
   views, materialized views, functions, sequences and types, loaded lazily and
   filterable; the System checkbox adds the catalog schemas. Clicking an object
   opens its `.sql` file from the working folder when one matches

@@ -1,8 +1,8 @@
 //! The database object browser's tree model.
 //!
 //! The tree is schema → object-type folder (Tables, Views, …) → objects, with
-//! tables expanding one level further to their Indexes, Constraints and
-//! Triggers folders.
+//! tables expanding one level further to their Columns, Indexes, Constraints
+//! and Triggers folders.
 //! Every folder loads lazily, one catalog query per folder expansion.
 //! gpui-component's `tree` has no lazy API — a node with zero
 //! children can't be expanded, and only a full `set_items` rebuild exists — so
@@ -37,11 +37,13 @@ pub enum NodeKind {
     FunctionsFolder,
     SequencesFolder,
     TypesFolder,
-    // A table, which expands to its Definition/Indexes/Constraints entries.
+    // A table, which expands to its Definition/Columns/Indexes/Constraints
+    // entries.
     Table,
     // The table's reconstructed CREATE TABLE DDL (a leaf).
     TableDefinition,
     // Sub-folders under a table (lazy).
+    ColumnsFolder,
     IndexesFolder,
     ConstraintsFolder,
     TriggersFolder,
@@ -54,6 +56,7 @@ pub enum NodeKind {
     Index,
     Constraint,
     Trigger,
+    Column,
 }
 
 impl NodeKind {
@@ -69,6 +72,7 @@ impl NodeKind {
                 | NodeKind::FunctionsFolder
                 | NodeKind::SequencesFolder
                 | NodeKind::TypesFolder
+                | NodeKind::ColumnsFolder
                 | NodeKind::IndexesFolder
                 | NodeKind::ConstraintsFolder
                 | NodeKind::TriggersFolder
@@ -200,7 +204,7 @@ impl DbNode {
         DbNode::container(id, name, NodeKind::Schema, name, children)
     }
 
-    /// A table node, pre-populated with its (still-unloaded) Indexes,
+    /// A table node, pre-populated with its (still-unloaded) Columns, Indexes,
     /// Constraints and Triggers folders. `parent_id` is the owning Tables
     /// folder's id.
     fn table(parent_id: &str, schema: &str, name: &str) -> Self {
@@ -219,6 +223,7 @@ impl DbNode {
                 name,
                 name,
             ),
+            sub("cols", "Columns", NodeKind::ColumnsFolder),
             sub("idx", "Indexes", NodeKind::IndexesFolder),
             sub("cons", "Constraints", NodeKind::ConstraintsFolder),
             sub("trg", "Triggers", NodeKind::TriggersFolder),
@@ -280,6 +285,37 @@ pub fn load_children(
             NodeKind::Function,
         )),
         NodeKind::TypesFolder => Ok(leaves(db::list_types(conn_str, schema)?, NodeKind::Type)),
+        _ => load_table_children(conn_str, kind, parent_id, schema, relation),
+    }
+}
+
+/// The lazy folders under a table row: its columns, indexes, constraints and
+/// triggers. Split out of [`load_children`] so neither half grows unwieldy.
+fn load_table_children(
+    conn_str: &str,
+    kind: NodeKind,
+    parent_id: &str,
+    schema: &str,
+    relation: &str,
+) -> Result<Vec<DbNode>, String> {
+    // Every leaf here belongs to `schema.relation` and is named by its own
+    // catalog name; only the drawn label differs per kind.
+    let leaf = |name: &str, label: String, node_kind: NodeKind| {
+        DbNode::leaf(
+            format!("{parent_id}{SEP}{name}"),
+            label,
+            node_kind,
+            schema,
+            relation,
+            name,
+        )
+    };
+
+    match kind {
+        NodeKind::ColumnsFolder => Ok(db::list_columns(conn_str, schema, relation)?
+            .iter()
+            .map(|col| leaf(&col.name, column_label(col), NodeKind::Column))
+            .collect()),
         NodeKind::IndexesFolder => Ok(db::list_indexes(conn_str, schema, relation)?
             .iter()
             .map(|idx| {
@@ -289,14 +325,7 @@ pub fn load_children(
                 } else if idx.unique {
                     label.push_str(" · unique");
                 }
-                DbNode::leaf(
-                    format!("{parent_id}{SEP}{}", idx.name),
-                    label,
-                    NodeKind::Index,
-                    schema,
-                    relation,
-                    &idx.name,
-                )
+                leaf(&idx.name, label, NodeKind::Index)
             })
             .collect()),
         NodeKind::ConstraintsFolder => Ok(db::list_constraints(conn_str, schema, relation)?
@@ -310,31 +339,51 @@ pub fn load_children(
                     'x' => "exclude",
                     _ => "?",
                 };
-                DbNode::leaf(
-                    format!("{parent_id}{SEP}{}", con.name),
+                leaf(
+                    &con.name,
                     format!("{} ({kind_label})", con.name),
                     NodeKind::Constraint,
-                    schema,
-                    relation,
-                    &con.name,
                 )
             })
             .collect()),
         NodeKind::TriggersFolder => Ok(db::list_triggers(conn_str, schema, relation)?
             .iter()
-            .map(|trg| {
-                DbNode::leaf(
-                    format!("{parent_id}{SEP}{}", trg.name),
-                    trg.name.clone(),
-                    NodeKind::Trigger,
-                    schema,
-                    relation,
-                    &trg.name,
-                )
-            })
+            .map(|trg| leaf(&trg.name, trg.name.clone(), NodeKind::Trigger))
             .collect()),
         _ => Ok(Vec::new()),
     }
+}
+
+/// Longest default expression shown on a column row before it is elided, so
+/// one long default cannot dominate the panel's width.
+const MAX_DEFAULT_LEN: usize = 40;
+
+/// A column row's label: name, type, then the markers that matter. A primary
+/// key column is implicitly `NOT NULL`, so only the `PK` marker is drawn for
+/// it.
+fn column_label(col: &db::ColumnInfo) -> String {
+    let mut label = format!("{} {}", col.name, col.data_type);
+    if col.primary {
+        label.push_str(" · PK");
+    } else if col.not_null {
+        label.push_str(" · not null");
+    }
+    if let Some(default) = &col.default {
+        label.push_str(" · default ");
+        label.push_str(&elide(default, MAX_DEFAULT_LEN));
+    }
+    label
+}
+
+/// Truncate `text` to at most `max` characters, marking the cut with an
+/// ellipsis. Counts characters, not bytes, so a multi-byte default never
+/// splits mid-character.
+fn elide(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max).collect();
+    format!("{kept}…")
 }
 
 /// Reset every lazy-folder descendant of `node` to [`Load::Unloaded`],
@@ -477,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn table_expands_to_definition_indexes_constraints_and_triggers() {
+    fn table_expands_to_definition_columns_indexes_constraints_and_triggers() {
         let table = DbNode::table("p", "app", "users");
         assert_eq!(table.kind, NodeKind::Table);
         assert!(matches!(table.load, Load::Loaded));
@@ -486,6 +535,7 @@ mod tests {
             kinds,
             [
                 NodeKind::TableDefinition,
+                NodeKind::ColumnsFolder,
                 NodeKind::IndexesFolder,
                 NodeKind::ConstraintsFolder,
                 NodeKind::TriggersFolder,
@@ -556,5 +606,46 @@ mod tests {
             .map(|c| c.label.to_string())
             .collect();
         assert_eq!(labels, ["orders"]);
+    }
+    fn column(name: &str, data_type: &str) -> db::ColumnInfo {
+        db::ColumnInfo {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            not_null: false,
+            primary: false,
+            default: None,
+        }
+    }
+
+    #[test]
+    fn column_label_marks_primary_key_over_not_null() {
+        let mut col = column("id", "integer");
+        col.not_null = true;
+        col.primary = true;
+        assert_eq!(column_label(&col), "id integer · PK");
+    }
+
+    #[test]
+    fn column_label_marks_not_null_and_default() {
+        let mut col = column("placed_at", "timestamptz");
+        col.not_null = true;
+        col.default = Some("now()".to_string());
+        assert_eq!(
+            column_label(&col),
+            "placed_at timestamptz · not null · default now()"
+        );
+    }
+
+    #[test]
+    fn column_label_is_bare_without_markers() {
+        assert_eq!(column_label(&column("note", "text")), "note text");
+    }
+
+    #[test]
+    fn column_label_elides_a_long_default() {
+        let mut col = column("payload", "jsonb");
+        col.default = Some("x".repeat(MAX_DEFAULT_LEN + 10));
+        let label = column_label(&col);
+        assert!(label.ends_with(&format!("{}…", "x".repeat(MAX_DEFAULT_LEN))));
     }
 }
