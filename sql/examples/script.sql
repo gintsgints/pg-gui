@@ -8,3 +8,5 @@ Another way to comment
 SELECT * FROM customers;
 
 SELECT * FROM orders;
+
+SELECT pg_sleep(30);
