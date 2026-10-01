@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -1286,6 +1286,22 @@ impl TabResult {
     }
 }
 
+/// The query output parked with an inactive connection: what its tabs had
+/// last produced, put back when that connection is selected again.
+///
+/// It is deliberately runtime-only. The parked *scripts* are persisted (in
+/// `config.parked_tabs`, the only copy of an untitled tab's text), but rows,
+/// logs and plans are output, not user input, and are not worth carrying
+/// across a restart.
+#[derive(Default)]
+struct ParkedResults {
+    /// Output of the parked untitled tabs, positionally aligned with that
+    /// connection's `config::ParkedTab` list.
+    untitled: Vec<TabResult>,
+    /// Output of the tabs that stayed open across the switch, keyed by file.
+    files: HashMap<PathBuf, TabResult>,
+}
+
 /// Live state of a running debug session, shown in the debug panel that
 /// replaces the results table while active.
 struct DebugState {
@@ -1411,6 +1427,10 @@ pub struct PgGuiApp {
     /// flight against the previous server is discarded (its session not
     /// stored back) when it finally returns.
     db_epoch: u64,
+    /// Query output belonging to connections other than the active one,
+    /// keyed by connection string; the scripts of the same parked tabs live
+    /// in `config.parked_tabs`.
+    parked_results: HashMap<String, ParkedResults>,
     config: config::Config,
     /// Mtime of the config file after our last read or write; a different
     /// mtime on disk means it was edited externally and should be reloaded.
@@ -1509,6 +1529,24 @@ impl PgGuiApp {
             "",
         );
 
+        // The active connection never keeps a park — selecting it empties one
+        // — so an entry left under it was stranded by a crash or a hand edit.
+        // Fold it back in rather than leave those scripts unreachable.
+        for parked in config
+            .parked_tabs
+            .remove(&config.connection_string)
+            .unwrap_or_default()
+        {
+            let ix = parked.index.min(config.tabs.len());
+            config.tabs.insert(
+                ix,
+                config::ScriptTab {
+                    script: parked.script,
+                    file: None,
+                    disk_time: None,
+                },
+            );
+        }
         if config.tabs.is_empty() {
             config.tabs.push(config::ScriptTab::default());
         }
@@ -1614,6 +1652,7 @@ impl PgGuiApp {
             ai_running: false,
             next_tab_id,
             db_epoch: 0,
+            parked_results: HashMap::new(),
             config,
             config_disk_time: config::modified_time(),
             base_font_size: cx.theme().font_size,
@@ -1627,16 +1666,22 @@ impl PgGuiApp {
             _subscriptions: subscriptions,
             connection_dialog_subs: Vec::new(),
         };
-        this.update_window_title(window);
-        this.refresh_menus(cx);
-        this.start_lsp(cx);
-        this.load_tree(cx);
-        if this.config.db_panel_visible {
-            this.load_db_schemas(cx);
+        this.finish_setup(window, cx);
+        this
+    }
+
+    /// The startup work that needs the assembled app: title, menus, the
+    /// language server, the two trees, the file watcher and the zoom.
+    fn finish_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_window_title(window);
+        self.refresh_menus(cx);
+        self.start_lsp(cx);
+        self.load_tree(cx);
+        if self.config.db_panel_visible {
+            self.load_db_schemas(cx);
         }
         Self::watch_files(window, cx);
-        this.apply_zoom(cx);
-        this
+        self.apply_zoom(cx);
     }
 
     /// Route the window's close button through the same unsaved-edits
@@ -1745,9 +1790,10 @@ impl PgGuiApp {
         });
         let subscription = cx.subscribe_in(&editor, window, Self::on_editor_event);
         let disk_time = tab.file.as_deref().and_then(file_mtime);
-        // Only a tab backed by a file can be dirty: an untitled tab's text
-        // lives in config.json and is restored on the next launch, so there
-        // is nothing to save and nothing to warn about.
+        // Only a tab backed by a file can be dirty: an untitled tab has no
+        // file to leave stale, and its text lives in config.json, so a quit
+        // costs nothing. Closing it does drop that text, which is what
+        // [`Self::close_loses_work`] catches instead.
         let dirty = tab.file.is_some() && tab.script != saved;
         // If the file changed while the app was closed (its mtime differs
         // from the one we persisted last session) and this tab still has
@@ -1942,12 +1988,29 @@ impl PgGuiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
-        let tab_config = config::ScriptTab {
-            script,
-            file,
-            disk_time: None,
-        };
-        // A freshly added tab starts clean: its content is the baseline
+        self.insert_tab_at(
+            self.tabs.len(),
+            config::ScriptTab {
+                script,
+                file,
+                disk_time: None,
+            },
+            window,
+            cx,
+        )
+    }
+
+    /// Insert a tab (not yet selected) at `ix`, clamped to the end, keeping
+    /// the config mirror aligned with it. Returns the slot used.
+    fn insert_tab_at(
+        &mut self,
+        ix: usize,
+        tab_config: config::ScriptTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let ix = ix.min(self.tabs.len());
+        // A freshly inserted tab starts clean: its content is the baseline
         // (empty for a new script, the file's text for an opened one).
         let id = self.next_tab_id;
         self.next_tab_id += 1;
@@ -1962,9 +2025,9 @@ impl PgGuiApp {
         if let Some(client) = &self.lsp {
             Self::attach_lsp_providers(client, &tab.editor, cx);
         }
-        self.tabs.push(tab);
-        self.config.tabs.push(tab_config);
-        self.tabs.len() - 1
+        self.tabs.insert(ix, tab);
+        self.config.tabs.insert(ix, tab_config);
+        ix
     }
 
     /// Select a tab: focus its editor, retitle the window, and point the
@@ -2035,13 +2098,34 @@ impl PgGuiApp {
     }
 
     /// Continue closing a tab once any open transaction has been dealt with:
-    /// prompt for unsaved edits, otherwise close.
+    /// prompt for work the close would lose, otherwise close.
     fn after_txn_close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if ix < self.tabs.len() && self.tabs[ix].dirty {
+        if self.close_loses_work(ix) {
             self.prompt_save_before_close(ix, window, cx);
         } else {
             self.close_tab_at(ix, window, cx);
         }
+    }
+
+    /// Whether closing this tab drops work the user would want back: unsaved
+    /// edits to its file, or an untitled tab's script, which has no file to
+    /// fall back on and leaves the config the moment the tab does.
+    ///
+    /// Deliberately wider than `dirty`, which is about a file left stale on
+    /// disk. Quitting is the other way round: an untitled tab's text survives
+    /// a quit (config.json holds it, parked or not), so the quit guard stays
+    /// on `dirty` alone.
+    fn close_loses_work(&self, ix: usize) -> bool {
+        let Some(tab) = self.tabs.get(ix) else {
+            return false;
+        };
+        tab.dirty
+            || (tab.path.is_none()
+                && self
+                    .config
+                    .tabs
+                    .get(ix)
+                    .is_some_and(|cfg| !cfg.script.trim().is_empty()))
     }
 
     /// Warn before closing a tab whose session has an open transaction —
@@ -2090,12 +2174,18 @@ impl PgGuiApp {
         });
     }
 
-    /// Ask whether to save a tab's unsaved edits before closing it.
+    /// Ask whether to save a tab before closing it — its unsaved edits, or,
+    /// for an untitled tab, the script itself.
     fn prompt_save_before_close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if window.has_active_dialog(cx) {
             return;
         }
         let name = self.tab_label(ix);
+        let message = if self.tabs[ix].dirty {
+            format!("“{name}” has unsaved changes.")
+        } else {
+            format!("“{name}” was never saved to a file; closing it discards the script.")
+        };
         let app = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, _| {
             let (save, discard) = (app.clone(), app.clone());
@@ -2103,11 +2193,7 @@ impl PgGuiApp {
                 v_flex()
                     .gap_4()
                     .pb_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .child(format!("“{name}” has unsaved changes.")),
-                    )
+                    .child(div().text_sm().child(message.clone()))
                     .child(
                         h_flex()
                             .gap_2()
@@ -2858,6 +2944,10 @@ impl PgGuiApp {
         }
 
         if self.config.connection_string != old.connection_string {
+            // The tabs follow the connection here too; the config just read
+            // from disk is the base the park is applied on top of.
+            let url = self.config.connection_string.clone();
+            self.swap_connection_tabs(&old.connection_string, &url, window, cx);
             record_recent(
                 &mut self.config.recent_connections,
                 &self.config.connection_string,
@@ -4576,6 +4666,95 @@ impl PgGuiApp {
         self.apply_connection(&action.url, &action.name, window, cx);
     }
 
+    /// Move the untitled tabs and the query output from `previous` into the
+    /// park, then bring back whatever `url` last had. The tabs backed by a
+    /// file stay open throughout — only their results, log and plan are
+    /// swapped, since those describe the server that produced them.
+    fn swap_connection_tabs(
+        &mut self,
+        previous: &str,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Follow the selection by id: the index shifts as untitled tabs leave
+        // and arrive. An untitled tab that is itself parked leaves nothing to
+        // return to, so the first tab takes over.
+        let active_id = self.tabs.get(self.active_tab).map(|tab| tab.id);
+        // An empty previous connection has no park to be filed under (and
+        // could never be selected again to get them back), so its tabs simply
+        // carry over.
+        if !previous.is_empty() {
+            self.park_connection_tabs(previous);
+        }
+        self.restore_connection_tabs(url, window, cx);
+        if self.tabs.is_empty() {
+            self.add_tab(String::new(), None, window, cx);
+        }
+        let ix = active_id
+            .and_then(|id| self.tab_index_by_id(id))
+            .unwrap_or(0);
+        self.activate_tab(ix, window, cx);
+    }
+
+    /// Take the untitled tabs out of the tab bar and every tab's output off
+    /// the tabs, filing both under `url`.
+    fn park_connection_tabs(&mut self, url: &str) {
+        let mut parked = Vec::new();
+        let mut results = ParkedResults::default();
+        // Walking from the back keeps a removal from shifting the tabs still
+        // to be visited, so the recorded slot is the tab's original one —
+        // which is what re-inserting them in ascending order needs.
+        for ix in (0..self.tabs.len()).rev() {
+            if let Some(path) = self.tabs[ix].path.clone() {
+                results
+                    .files
+                    .insert(path, std::mem::take(&mut self.tabs[ix].result));
+            } else {
+                let tab = self.tabs.remove(ix);
+                let script = self.config.tabs.remove(ix).script;
+                parked.push(config::ParkedTab { script, index: ix });
+                results.untitled.push(tab.result);
+            }
+        }
+        parked.reverse();
+        results.untitled.reverse();
+        self.config.parked_tabs.insert(url.to_string(), parked);
+        self.parked_results.insert(url.to_string(), results);
+    }
+
+    /// Put `url`'s parked untitled tabs back where they were and hand every
+    /// tab the output it last had on that connection.
+    fn restore_connection_tabs(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let parked = self.config.parked_tabs.remove(url).unwrap_or_default();
+        let mut results = self.parked_results.remove(url).unwrap_or_default();
+        // The two lists only line up when they were parked together; an
+        // externally edited config can leave the scripts without their output.
+        let aligned = results.untitled.len() == parked.len();
+        for (n, tab) in parked.into_iter().enumerate() {
+            let ix = self.insert_tab_at(
+                tab.index,
+                config::ScriptTab {
+                    script: tab.script,
+                    file: None,
+                    disk_time: None,
+                },
+                window,
+                cx,
+            );
+            if aligned {
+                self.tabs[ix].result = std::mem::take(&mut results.untitled[n]);
+            }
+        }
+        for tab in &mut self.tabs {
+            if let Some(path) = &tab.path
+                && let Some(result) = results.files.remove(path)
+            {
+                tab.result = result;
+            }
+        }
+    }
+
     /// Switch to `url` (saved under `name`, which may be empty): remember
     /// it, persist, and restart the language server so completions follow
     /// the new database's schema.
@@ -4601,7 +4780,13 @@ impl PgGuiApp {
             tab.cancel = None;
             tab.result.has_more = false;
         }
-        self.config.connection_string = url.to_string();
+        let previous = std::mem::replace(&mut self.config.connection_string, url.to_string());
+        // Untitled tabs and query output belong to the connection they were
+        // opened and run against, so they travel with it rather than with the
+        // window.
+        if previous != url {
+            self.swap_connection_tabs(&previous, url, window, cx);
+        }
         record_recent(&mut self.config.recent_connections, url, name);
         self.save_config();
         self.refresh_menus(cx);

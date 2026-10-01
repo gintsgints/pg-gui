@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -27,6 +28,19 @@ impl PartialEq for ScriptTab {
 }
 
 impl Eq for ScriptTab {}
+
+/// An untitled tab parked while the connection it was opened under is not
+/// the active one. Only untitled tabs are parked: a tab backed by a file
+/// belongs to the window, not to the database it was last run against.
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParkedTab {
+    #[serde(default)]
+    pub script: String,
+    /// The tab-bar slot it was taken from, so selecting that connection
+    /// again puts it back where it was rather than at the end.
+    #[serde(default)]
+    pub index: usize,
+}
 
 /// A remembered connection: an optional user-given name and the connection
 /// string it maps to. Shown in the Connection ▸ Recent menu by name, or by
@@ -96,6 +110,12 @@ pub struct Config {
     /// Index of the selected tab.
     #[serde(default)]
     pub active_tab: usize,
+    /// Untitled tabs belonging to connections other than the active one,
+    /// keyed by connection string. The active connection's untitled tabs sit
+    /// in `tabs` with everything else; they move here when the connection
+    /// changes and come back when it is selected again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parked_tabs: BTreeMap<String, Vec<ParkedTab>>,
     /// Height of the SQL editor panel in pixels; `None` until the divider
     /// is first dragged (both panels then split the window evenly).
     #[serde(default)]
@@ -229,6 +249,7 @@ impl Default for Config {
             script_file: None,
             tabs: Vec::new(),
             active_tab: 0,
+            parked_tabs: BTreeMap::new(),
             editor_height: None,
             page_size: default_page_size(),
             fetch_size: default_fetch_size(),
@@ -366,6 +387,33 @@ mod tests {
         // An explicit value is respected.
         let off: Config = serde_json::from_str(r#"{"format_on_save": false}"#).unwrap();
         assert!(!off.format_on_save);
+    }
+
+    #[test]
+    fn parked_tabs_round_trip_and_default_empty() {
+        // A config written before the field existed loads with no parks.
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.parked_tabs.is_empty());
+        // An empty map is left out of the file entirely.
+        assert!(
+            !serde_json::to_string(&config)
+                .unwrap()
+                .contains("parked_tabs")
+        );
+
+        let mut config = Config::default();
+        config.parked_tabs.insert(
+            "postgres://a@localhost/db".to_string(),
+            vec![ParkedTab {
+                script: "select 1;".to_string(),
+                index: 2,
+            }],
+        );
+        let back: Config = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        let parked = &back.parked_tabs["postgres://a@localhost/db"];
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].script, "select 1;");
+        assert_eq!(parked[0].index, 2);
     }
 
     #[test]
