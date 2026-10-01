@@ -10,6 +10,12 @@ gpui-component itself is a git dependency on the fork <https://github.com/gintsg
 
 Code editing is its own state type: the SQL tabs are `EditorState`/`Editor` (`.language("sql")`, `line_number`, `line_number_offset`, `breakpoints_enabled`, `tab_size`), and the LSP providers are installed through its `lsp_mut()` accessor. Filters and dialog fields stay plain `InputState`/`Input`. Provider traits take `&mut App`, not a `Context` of the editor state.
 
+## Related crates are out of scope — hand them to a separate session
+
+pg-gui depends on forks and sibling crates that live in their own checkouts: the gpui-kit fork (`my_fixes3`), the postgres-language-server fork (`bump_treesitter`), and the local `pgdap` path checkout. Changing any of them is a separate task in a separate Claude session, run from that crate's own directory with its own CLAUDE.md and its own build.
+
+So within a pg-gui session: never edit, branch, commit or build a related crate, and never point `Cargo.toml` at an uncommitted local copy of one. If a task needs a fix on the other side — a missing fork patch, a `[lib]` target, an API change — do everything that can be done inside pg-gui, then stop and tell the user exactly what the other crate needs (crate, branch, the change) so they can open a session there. Resume once the dependency is published or pushed and the pin updated.
+
 ## Formatting and linting — required after every change
 
 After ANY change to Rust code or `Cargo.toml`, run both of these and fix every finding before considering the change done:
