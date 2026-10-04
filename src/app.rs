@@ -159,23 +159,38 @@ const PROGRESS_TICK: Duration = Duration::from_millis(200);
 /// Number of connections kept in the Recent menu.
 const MAX_RECENT_CONNECTIONS: usize = 10;
 
-/// Move the connection at `url` to the front of the recent list (dedup by
-/// url, capped), ignoring an empty url. A non-empty `name` labels the
-/// entry; an empty one keeps whatever name the url was already recorded
-/// under, so simply reconnecting doesn't erase a saved name.
-fn record_recent(recents: &mut Vec<config::RecentConnection>, url: &str, name: &str) {
+/// Move the connection to the front of the recent list (capped), ignoring an
+/// empty url. Entries are deduped by [`config::connection_key`], not by url,
+/// so pointing a saved connection at another server updates its entry in
+/// place instead of adding a second one next to it. `replacing` is the key
+/// the edit started from, dropped as well so a rename leaves no entry behind
+/// under the old name. A non-empty `name` labels the entry; an empty one
+/// keeps whatever name the url was already recorded under, so simply
+/// reconnecting doesn't erase a saved name. Returns the key the connection is
+/// now filed under (empty for an empty url).
+fn record_recent(
+    recents: &mut Vec<config::RecentConnection>,
+    url: &str,
+    name: &str,
+    replacing: Option<&str>,
+) -> String {
     if url.is_empty() {
-        return;
+        return String::new();
     }
     let name = if name.is_empty() {
-        recents
-            .iter()
-            .find(|c| c.url == url)
+        replacing
+            .and_then(|key| recents.iter().find(|c| c.key() == key))
+            .or_else(|| recents.iter().find(|c| c.url == url))
             .map_or(String::new(), |c| c.name.clone())
     } else {
         name.to_string()
     };
-    recents.retain(|c| c.url != url);
+    let key = config::connection_key(&name, url).to_string();
+    // An unnamed entry says nothing the url doesn't, so a named connection
+    // taking that url over absorbs it rather than sitting beside it.
+    recents.retain(|c| {
+        c.key() != key && replacing != Some(c.key()) && !(c.name.is_empty() && c.url == url)
+    });
     recents.insert(
         0,
         config::RecentConnection {
@@ -184,6 +199,7 @@ fn record_recent(recents: &mut Vec<config::RecentConnection>, url: &str, name: &
         },
     );
     recents.truncate(MAX_RECENT_CONNECTIONS);
+    key
 }
 
 /// Number of folders kept in the File ▸ Open Recent Folder menu.
@@ -208,10 +224,11 @@ fn folder_menu_label(path: &Path) -> String {
 
 /// One entry of the title-bar connection combobox: a recent connection,
 /// shown by its saved name (or masked url when unnamed) and identified by
-/// its unmasked url.
+/// its [`config::connection_key`], so two entries pointing at the same
+/// server stay distinguishable.
 #[derive(Clone)]
 struct ConnectionItem {
-    url: SharedString,
+    key: SharedString,
     label: SharedString,
 }
 
@@ -223,7 +240,7 @@ impl SearchableListItem for ConnectionItem {
     }
 
     fn value(&self) -> &SharedString {
-        &self.url
+        &self.key
     }
 }
 
@@ -234,7 +251,7 @@ fn connection_items(recents: &[config::RecentConnection]) -> SearchableVec<Conne
         recents
             .iter()
             .map(|c| ConnectionItem {
-                url: c.url.clone().into(),
+                key: c.key().to_string().into(),
                 label: if c.name.is_empty() {
                     mask_credentials(&c.url).into()
                 } else {
@@ -984,6 +1001,19 @@ struct ConnectionFields {
     password: Entity<InputState>,
 }
 
+/// Everything the New / Edit Connection dialog is built over: the name box,
+/// the five connection fields, the editable connection-string preview, the
+/// Test Connection result, and the key of the recent entry being edited
+/// (`None` for a new connection).
+#[derive(Clone)]
+struct ConnectionForm {
+    name: Entity<InputState>,
+    fields: ConnectionFields,
+    preview: Entity<InputState>,
+    test_status: Entity<ConnectionTest>,
+    replacing: Option<String>,
+}
+
 impl ConnectionFields {
     fn as_array(&self) -> [Entity<InputState>; 5] {
         [
@@ -1428,8 +1458,8 @@ pub struct PgGuiApp {
     /// stored back) when it finally returns.
     db_epoch: u64,
     /// Query output belonging to connections other than the active one,
-    /// keyed by connection string; the scripts of the same parked tabs live
-    /// in `config.parked_tabs`.
+    /// keyed by [`config::connection_key`] like `config.parked_tabs`, where
+    /// the scripts of the same parked tabs live.
     parked_results: HashMap<String, ParkedResults>,
     config: config::Config,
     /// Mtime of the config file after our last read or write; a different
@@ -1523,20 +1553,33 @@ impl PgGuiApp {
         }
         // Keep the active connection at the head of the recent list so
         // Connection ▸ Recent always offers to reconnect to it.
-        record_recent(
+        let active = record_recent(
             &mut config.recent_connections,
             &config.connection_string,
             "",
+            None,
         );
+
+        // Parks were once keyed by connection string; move a legacy entry
+        // onto its connection's name, which is the key now, so an edit to the
+        // url can no longer strand it.
+        for conn in &config.recent_connections {
+            if conn.name.is_empty() {
+                continue;
+            }
+            if let Some(parked) = config.parked_tabs.remove(&conn.url) {
+                config
+                    .parked_tabs
+                    .entry(conn.name.clone())
+                    .or_default()
+                    .extend(parked);
+            }
+        }
 
         // The active connection never keeps a park — selecting it empties one
         // — so an entry left under it was stranded by a crash or a hand edit.
         // Fold it back in rather than leave those scripts unreachable.
-        for parked in config
-            .parked_tabs
-            .remove(&config.connection_string)
-            .unwrap_or_default()
-        {
+        for parked in config.parked_tabs.remove(&active).unwrap_or_default() {
             let ix = parked.index.min(config.tabs.len());
             config.tabs.insert(
                 ix,
@@ -2946,13 +2989,15 @@ impl PgGuiApp {
         if self.config.connection_string != old.connection_string {
             // The tabs follow the connection here too; the config just read
             // from disk is the base the park is applied on top of.
+            let previous = Self::active_key(&old);
             let url = self.config.connection_string.clone();
-            self.swap_connection_tabs(&old.connection_string, &url, window, cx);
-            record_recent(
-                &mut self.config.recent_connections,
-                &self.config.connection_string,
-                "",
-            );
+            let key = record_recent(&mut self.config.recent_connections, &url, "", None);
+            // An edited url that still belongs to the same saved connection
+            // keeps that connection's tabs — only a different connection
+            // swaps them.
+            if key != previous {
+                self.swap_connection_tabs(&previous, &key, window, cx);
+            }
             self.refresh_menus(cx);
             if self.config.db_panel_visible {
                 self.load_db_schemas(cx);
@@ -3716,6 +3761,19 @@ impl PgGuiApp {
             )
     }
 
+    /// The [`config::connection_key`] the active connection is filed under:
+    /// the name of its recent entry, or the connection string when it has no
+    /// entry (or an unnamed one). The head of the list wins, which is the
+    /// entry last connected to, so two connections sharing a url resolve to
+    /// the one the user actually picked.
+    fn active_key(config: &config::Config) -> String {
+        config
+            .recent_connections
+            .iter()
+            .find(|c| c.url == config.connection_string)
+            .map_or_else(|| config.connection_string.clone(), |c| c.key().to_string())
+    }
+
     /// Confirm a batch before it runs. A batch is the one action here that
     /// executes files the user is not looking at — several of them, against
     /// whatever connection the window happens to be on — so it names the
@@ -4318,15 +4376,15 @@ impl PgGuiApp {
             window,
             |this, _, event: &ComboboxEvent<SearchableVec<ConnectionItem>>, window, cx| {
                 if let ComboboxEvent::Confirm(values) = event
-                    && let Some(url) = values.first()
-                {
-                    let name = this
+                    && let Some(key) = values.first()
+                    && let Some((url, name)) = this
                         .config
                         .recent_connections
                         .iter()
-                        .find(|c| c.url == url.as_ref())
-                        .map_or(String::new(), |c| c.name.clone());
-                    this.apply_connection(&url.clone(), &name, window, cx);
+                        .find(|c| c.key() == key.as_ref())
+                        .map(|c| (c.url.clone(), c.name.clone()))
+                {
+                    this.apply_connection(&url, &name, None, window, cx);
                 }
             },
         );
@@ -4337,11 +4395,12 @@ impl PgGuiApp {
     /// mark the active connection selected.
     fn sync_connection_combo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let items = connection_items(&self.config.recent_connections);
+        let active = Self::active_key(&self.config);
         let selected = self
             .config
             .recent_connections
             .iter()
-            .position(|c| c.url == self.config.connection_string)
+            .position(|c| c.key() == active)
             .map(|row| IndexPath::default().row(row));
         self.connections.update(cx, |state, cx| {
             state.set_items(items, window, cx);
@@ -4357,7 +4416,7 @@ impl PgGuiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_connection_form("New connection", &default_conn(), "", window, cx);
+        self.open_connection_form("New connection", &default_conn(), "", None, window, cx);
     }
 
     /// Connection ▸ Edit Connection…: open the connection form seeded with
@@ -4370,24 +4429,28 @@ impl PgGuiApp {
     ) {
         let url = self.config.connection_string.clone();
         // Seed the name from the matching recent entry, so an already-named
-        // connection shows its name.
+        // connection shows its name. Its key goes along as the entry being
+        // edited, so a new name replaces that entry rather than adding one.
+        let key = Self::active_key(&self.config);
         let name = self
             .config
             .recent_connections
             .iter()
-            .find(|c| c.url == url)
+            .find(|c| c.key() == key)
             .map_or(String::new(), |c| c.name.clone());
-        self.open_connection_form("Edit connection", &url, &name, window, cx);
+        self.open_connection_form("Edit connection", &url, &name, Some(key), window, cx);
     }
 
     /// Build the field inputs seeded from `seed_url`/`seed_name`, wire up the
     /// live connection-string preview, and show the connection dialog titled
-    /// `title`. Shared by New Connection and Edit Connection.
+    /// `title`. Shared by New Connection and Edit Connection; `replacing` is
+    /// the key of the entry being edited, `None` for a new connection.
     fn open_connection_form(
         &mut self,
         title: &'static str,
         seed_url: &str,
         seed_name: &str,
+        replacing: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -4421,7 +4484,18 @@ impl PgGuiApp {
         self.connection_dialog_subs =
             Self::wire_connection_sync(&fields, &preview, &test_status, window, cx);
 
-        Self::open_connection_dialog(title, name, fields, preview, test_status, window, cx);
+        Self::open_connection_dialog(
+            title,
+            ConnectionForm {
+                name,
+                fields,
+                preview,
+                test_status,
+                replacing,
+            },
+            window,
+            cx,
+        );
     }
 
     /// Wire the two-way sync between the individual fields and the editable
@@ -4521,26 +4595,23 @@ impl PgGuiApp {
         subs
     }
 
-    /// Build and show the connection dialog for the given title, name and
-    /// field inputs, live connection-string preview, and Test Connection
-    /// result.
+    /// Build and show the connection dialog for the given title over the
+    /// state in `form`.
     fn open_connection_dialog(
         title: &'static str,
-        name: Entity<InputState>,
-        fields: ConnectionFields,
-        preview: Entity<InputState>,
-        test_status: Entity<ConnectionTest>,
+        form: ConnectionForm,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let app = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, cx| {
-            let (name, fields, preview, test_status) = (
-                name.clone(),
-                fields.clone(),
-                preview.clone(),
-                test_status.clone(),
-            );
+            let ConnectionForm {
+                name,
+                fields,
+                preview,
+                test_status,
+                replacing,
+            } = form.clone();
             let connect = {
                 let (app, name, fields) = (app.clone(), name.clone(), fields.clone());
                 move |window: &mut Window, cx: &mut App| {
@@ -4548,7 +4619,7 @@ impl PgGuiApp {
                     let name = name.read(cx).value().trim().to_string();
                     window.close_dialog(cx);
                     app.update(cx, |this, cx| {
-                        this.apply_connection(&url, &name, window, cx);
+                        this.apply_connection(&url, &name, replacing.as_deref(), window, cx);
                     })
                     .ok();
                 }
@@ -4663,17 +4734,18 @@ impl PgGuiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_connection(&action.url, &action.name, window, cx);
+        self.apply_connection(&action.url, &action.name, None, window, cx);
     }
 
     /// Move the untitled tabs and the query output from `previous` into the
-    /// park, then bring back whatever `url` last had. The tabs backed by a
-    /// file stay open throughout — only their results, log and plan are
-    /// swapped, since those describe the server that produced them.
+    /// park, then bring back whatever `key` last had. Both are
+    /// [`config::connection_key`]s, not urls. The tabs backed by a file stay
+    /// open throughout — only their results, log and plan are swapped, since
+    /// those describe the server that produced them.
     fn swap_connection_tabs(
         &mut self,
         previous: &str,
-        url: &str,
+        key: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -4687,7 +4759,7 @@ impl PgGuiApp {
         if !previous.is_empty() {
             self.park_connection_tabs(previous);
         }
-        self.restore_connection_tabs(url, window, cx);
+        self.restore_connection_tabs(key, window, cx);
         if self.tabs.is_empty() {
             self.add_tab(String::new(), None, window, cx);
         }
@@ -4698,8 +4770,8 @@ impl PgGuiApp {
     }
 
     /// Take the untitled tabs out of the tab bar and every tab's output off
-    /// the tabs, filing both under `url`.
-    fn park_connection_tabs(&mut self, url: &str) {
+    /// the tabs, filing both under the connection key `key`.
+    fn park_connection_tabs(&mut self, key: &str) {
         let mut parked = Vec::new();
         let mut results = ParkedResults::default();
         // Walking from the back keeps a removal from shifting the tabs still
@@ -4719,15 +4791,15 @@ impl PgGuiApp {
         }
         parked.reverse();
         results.untitled.reverse();
-        self.config.parked_tabs.insert(url.to_string(), parked);
-        self.parked_results.insert(url.to_string(), results);
+        self.config.parked_tabs.insert(key.to_string(), parked);
+        self.parked_results.insert(key.to_string(), results);
     }
 
-    /// Put `url`'s parked untitled tabs back where they were and hand every
-    /// tab the output it last had on that connection.
-    fn restore_connection_tabs(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let parked = self.config.parked_tabs.remove(url).unwrap_or_default();
-        let mut results = self.parked_results.remove(url).unwrap_or_default();
+    /// Put the untitled tabs parked under `key` back where they were and hand
+    /// every tab the output it last had on that connection.
+    fn restore_connection_tabs(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let parked = self.config.parked_tabs.remove(key).unwrap_or_default();
+        let mut results = self.parked_results.remove(key).unwrap_or_default();
         // The two lists only line up when they were parked together; an
         // externally edited config can leave the scripts without their output.
         let aligned = results.untitled.len() == parked.len();
@@ -4755,13 +4827,49 @@ impl PgGuiApp {
         }
     }
 
+    /// Bring the scripts parked under `key` into the tab bar without touching
+    /// the tabs already there. Renaming the connection we are on onto a name
+    /// some other entry held takes that name's park over, and the active
+    /// connection never holds one — so those scripts have to come home or
+    /// they become unreachable. Only the scripts do: the rows and logs in
+    /// that park were produced on a different connection.
+    fn adopt_parked_scripts(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.parked_results.remove(key);
+        let parked = self.config.parked_tabs.remove(key).unwrap_or_default();
+        if parked.is_empty() {
+            return;
+        }
+        // Inserting ahead of the selected tab shifts its index, so the
+        // selection is followed by id, as in `swap_connection_tabs`.
+        let active_id = self.tabs.get(self.active_tab).map(|tab| tab.id);
+        for tab in parked {
+            self.insert_tab_at(
+                tab.index,
+                config::ScriptTab {
+                    script: tab.script,
+                    file: None,
+                    disk_time: None,
+                },
+                window,
+                cx,
+            );
+        }
+        let ix = active_id
+            .and_then(|id| self.tab_index_by_id(id))
+            .unwrap_or(0);
+        self.activate_tab(ix, window, cx);
+    }
+
     /// Switch to `url` (saved under `name`, which may be empty): remember
     /// it, persist, and restart the language server so completions follow
-    /// the new database's schema.
+    /// the new database's schema. `replacing` is the recent entry this is an
+    /// edit of, if any — editing the connection we are on is not a switch,
+    /// so its tabs and output stay put however the url or name changes.
     fn apply_connection(
         &mut self,
         url: &str,
         name: &str,
+        replacing: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -4780,14 +4888,18 @@ impl PgGuiApp {
             tab.cancel = None;
             tab.result.has_more = false;
         }
-        let previous = std::mem::replace(&mut self.config.connection_string, url.to_string());
+        let previous = Self::active_key(&self.config);
+        self.config.connection_string = url.to_string();
+        let key = record_recent(&mut self.config.recent_connections, url, name, replacing);
         // Untitled tabs and query output belong to the connection they were
         // opened and run against, so they travel with it rather than with the
-        // window.
-        if previous != url {
-            self.swap_connection_tabs(&previous, url, window, cx);
+        // window. The connection is identified by its key: re-pointing or
+        // renaming the one we are on leaves the tabs alone.
+        if key != previous && replacing != Some(previous.as_str()) {
+            self.swap_connection_tabs(&previous, &key, window, cx);
+        } else if key != previous {
+            self.adopt_parked_scripts(&key, window, cx);
         }
-        record_recent(&mut self.config.recent_connections, url, name);
         self.save_config();
         self.refresh_menus(cx);
         self.sync_connection_combo(window, cx);
@@ -7584,9 +7696,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        MAX_RECENT_FOLDERS, definition_content_rank, dialog_start_dir, ends_with_name_word,
-        find_sql_file, folder_menu_label, format_elapsed, glob_match, mask_credentials,
-        percent_decode, record_recent_folder, suggested_name_from_mask, toggle_line_comments,
+        MAX_RECENT_CONNECTIONS, MAX_RECENT_FOLDERS, definition_content_rank, dialog_start_dir,
+        ends_with_name_word, find_sql_file, folder_menu_label, format_elapsed, glob_match,
+        mask_credentials, percent_decode, record_recent, record_recent_folder,
+        suggested_name_from_mask, toggle_line_comments,
     };
     use crate::db_tree::NodeKind;
 
@@ -8052,6 +8165,64 @@ mod tests {
             recents.iter().filter(|d| *d == Path::new("/dir5")).count(),
             1
         );
+    }
+
+    /// Re-pointing a saved connection at another server updates its entry
+    /// rather than leaving the old url behind as a second one, and a rename
+    /// replaces the entry it started from.
+    #[test]
+    fn recent_connections_are_keyed_by_name() {
+        let mut recents = Vec::new();
+        record_recent(&mut recents, "postgres://a/db", "Prod", None);
+        assert_eq!(recents.len(), 1);
+
+        // Edit: same name, new url.
+        let key = record_recent(&mut recents, "postgres://b/db", "Prod", Some("Prod"));
+        assert_eq!(key, "Prod");
+        assert_eq!(recents.len(), 1);
+        assert_eq!(recents[0].url, "postgres://b/db");
+
+        // Rename: the entry it started from goes with it.
+        let key = record_recent(&mut recents, "postgres://b/db", "Staging", Some("Prod"));
+        assert_eq!(key, "Staging");
+        assert_eq!(recents.len(), 1);
+        assert_eq!(recents[0].name, "Staging");
+    }
+
+    /// An unnamed connection is keyed by its url, and naming that url folds
+    /// the unnamed entry into the named one instead of listing both.
+    #[test]
+    fn unnamed_connections_are_keyed_by_url() {
+        let mut recents = Vec::new();
+        let key = record_recent(&mut recents, "postgres://a/db", "", None);
+        assert_eq!(key, "postgres://a/db");
+
+        record_recent(&mut recents, "postgres://c/db", "", None);
+        assert_eq!(recents.len(), 2);
+
+        let key = record_recent(&mut recents, "postgres://a/db", "Prod", None);
+        assert_eq!(key, "Prod");
+        assert_eq!(recents.len(), 2);
+        assert_eq!(recents[0].name, "Prod");
+        assert_eq!(recents[1].url, "postgres://c/db");
+
+        // Reconnecting without a name keeps the one it was saved under.
+        let key = record_recent(&mut recents, "postgres://a/db", "", None);
+        assert_eq!(key, "Prod");
+        assert_eq!(recents.len(), 2);
+        assert_eq!(recents[0].name, "Prod");
+    }
+
+    #[test]
+    fn recent_connections_are_capped() {
+        let mut recents = Vec::new();
+        for i in 0..MAX_RECENT_CONNECTIONS + 2 {
+            record_recent(&mut recents, &format!("postgres://host{i}/db"), "", None);
+        }
+        assert_eq!(recents.len(), MAX_RECENT_CONNECTIONS);
+        // An empty url is not a connection.
+        record_recent(&mut recents, "", "Nothing", None);
+        assert_eq!(recents.len(), MAX_RECENT_CONNECTIONS);
     }
 
     #[test]

@@ -51,6 +51,23 @@ pub struct RecentConnection {
     pub url: String,
 }
 
+impl RecentConnection {
+    /// What identifies this connection: see [`connection_key`].
+    pub fn key(&self) -> &str {
+        connection_key(&self.name, &self.url)
+    }
+}
+
+/// What identifies a connection: its user-given name, or its connection
+/// string when it has none. The url cannot be the identity — editing a saved
+/// connection is how its url changes, and the entry (plus the untitled tabs
+/// parked under it) has to survive that — so the name is the key wherever one
+/// exists. Free-standing so a name/url pair that is not in the recent list
+/// yet is keyed the same way.
+pub fn connection_key<'a>(name: &'a str, url: &'a str) -> &'a str {
+    if name.is_empty() { url } else { name }
+}
+
 impl<'de> Deserialize<'de> for RecentConnection {
     /// Accept both the current object form (`{ "name": …, "url": … }`) and
     /// the legacy bare-string form — older configs stored
@@ -111,9 +128,11 @@ pub struct Config {
     #[serde(default)]
     pub active_tab: usize,
     /// Untitled tabs belonging to connections other than the active one,
-    /// keyed by connection string. The active connection's untitled tabs sit
-    /// in `tabs` with everything else; they move here when the connection
-    /// changes and come back when it is selected again.
+    /// keyed by [`connection_key`] — the connection's name, or its url when
+    /// unnamed — so re-pointing or renaming a saved connection doesn't
+    /// strand them. The active connection's untitled tabs sit in `tabs` with
+    /// everything else; they move here when the connection changes and come
+    /// back when it is selected again.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub parked_tabs: BTreeMap<String, Vec<ParkedTab>>,
     /// Height of the SQL editor panel in pixels; `None` until the divider
@@ -403,17 +422,31 @@ mod tests {
 
         let mut config = Config::default();
         config.parked_tabs.insert(
-            "postgres://a@localhost/db".to_string(),
+            "Prod".to_string(),
             vec![ParkedTab {
                 script: "select 1;".to_string(),
                 index: 2,
             }],
         );
         let back: Config = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
-        let parked = &back.parked_tabs["postgres://a@localhost/db"];
+        let parked = &back.parked_tabs["Prod"];
         assert_eq!(parked.len(), 1);
         assert_eq!(parked[0].script, "select 1;");
         assert_eq!(parked[0].index, 2);
+    }
+
+    #[test]
+    fn connection_key_is_the_name_when_there_is_one() {
+        let named = RecentConnection {
+            name: "Prod".to_string(),
+            url: "postgres://a@localhost/db".to_string(),
+        };
+        assert_eq!(named.key(), "Prod");
+        let unnamed = RecentConnection {
+            name: String::new(),
+            url: "postgres://a@localhost/db".to_string(),
+        };
+        assert_eq!(unnamed.key(), "postgres://a@localhost/db");
     }
 
     #[test]
