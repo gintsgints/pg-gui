@@ -120,24 +120,6 @@ fn load_catppuccin(cx: &mut App) {
 }
 
 fn main() {
-    // The profiler writes dhat-heap.json when it is dropped, and nothing on
-    // the way out of `main` drops it: gpui's macOS `quit()` ends in
-    // `[NSApp terminate:]`, which exits the process without unwinding. So it
-    // is kept in a cell and dropped from the `on_app_quit` handler below,
-    // which gpui does run (via the app delegate's `willTerminate`).
-    //
-    // dhat's default backtrace depth of 10 truncates most stacks here (gpui's
-    // render/dispatch chains are deep), which both hides the real allocation
-    // site and makes distinct backtraces write out as identical program
-    // points — dh_view.html rejects that file with "data file contains a
-    // repeated location". See `tools/dhat-merge-dups.py` for repairing a file
-    // already recorded.
-    //
-    // 100 frames, because the interesting stacks are the deepest ones: a
-    // layout allocation inside taffy sits under gpui's whole element
-    // request_layout/measure recursion, so 40 frames never reached pg-gui's
-    // own render functions and the layout churn could not be attributed to a
-    // panel. Override with DHAT_TRIM to trade file size for depth.
     #[cfg(feature = "dhat-heap")]
     let profiler = std::cell::RefCell::new(Some(
         dhat::Profiler::builder()
