@@ -1272,6 +1272,10 @@ struct RunProgress {
     /// moment it is announced. `None` until the first announcement, and for
     /// work that does not run statements (fetch, export).
     statement: Option<(usize, usize)>,
+    /// Whether this run has already pulled the bottom panel over to the log.
+    /// It does that once, on its first log line, so a user who switches back
+    /// to the table mid-run is not dragged away again by the next statement.
+    log_shown: bool,
 }
 
 impl RunProgress {
@@ -1282,6 +1286,7 @@ impl RunProgress {
             started: std::time::Instant::now(),
             file: None,
             statement: None,
+            log_shown: false,
         }
     }
 }
@@ -4008,6 +4013,7 @@ impl PgGuiApp {
             return;
         };
         let mut rows = false;
+        let mut logged = false;
         match event {
             // Progress, not output: these move the status bar's indicator on
             // and stay out of the message log.
@@ -4026,6 +4032,7 @@ impl PgGuiApp {
             }
             db::RunEvent::Log(line) | db::RunEvent::Notice(line) => {
                 self.tabs[ix].result.log.push(SharedString::from(line));
+                logged = true;
             }
             db::RunEvent::Result(set) => {
                 rows = !set.rows.is_empty();
@@ -4041,13 +4048,39 @@ impl PgGuiApp {
         // the output isn't silently hidden, and switch the panel back to the
         // table in case the log was left showing from an earlier run.
         if rows {
-            self.bottom_view = BottomView::Data;
-            if !self.config.results_panel_visible {
-                self.config.results_panel_visible = true;
-                self.schedule_save(cx);
-            }
+            self.reveal_bottom_view(BottomView::Data, cx);
+        } else if logged && ix == self.active_tab && self.show_log_for_run(ix) {
+            // Nothing to put on the table: a script of DDL and DML returns no
+            // result set at all, so the run's only output is the log. Show it,
+            // or the whole run plays out behind an empty table.
+            self.reveal_bottom_view(BottomView::Log, cx);
         }
         cx.notify();
+    }
+
+    /// Whether this log line should pull the bottom panel over to the log:
+    /// the run has produced no result set, so the table has nothing to show,
+    /// and it has not already done so once (see [`RunProgress::log_shown`]).
+    fn show_log_for_run(&mut self, ix: usize) -> bool {
+        if !self.tabs[ix].result.results.is_empty() {
+            return false;
+        }
+        match self.tabs[ix].progress.as_mut() {
+            // No progress entry: the line comes from outside a run, which has
+            // its own idea of which view to show.
+            None => false,
+            Some(progress) => !std::mem::replace(&mut progress.log_shown, true),
+        }
+    }
+
+    /// Switch the bottom panel to `view` and open the panel (cmd-3) if it is
+    /// closed, so a run's output is never produced into a hidden panel.
+    fn reveal_bottom_view(&mut self, view: BottomView, cx: &mut Context<Self>) {
+        self.bottom_view = view;
+        if !self.config.results_panel_visible {
+            self.config.results_panel_visible = true;
+            self.schedule_save(cx);
+        }
     }
 
     /// Settle a finished run: put its session back on the tab and report what
@@ -4114,7 +4147,7 @@ impl PgGuiApp {
             if ix == self.active_tab {
                 // Switch to the log so the error line the run just appended is
                 // visible instead of hiding behind the table.
-                self.bottom_view = BottomView::Log;
+                self.reveal_bottom_view(BottomView::Log, cx);
                 self.show_tab_result(ix, cx);
             }
         }
