@@ -140,7 +140,7 @@ fn push_trimmed(text: &str, range: Range<usize>, out: &mut Vec<Range<usize>>) {
 }
 
 /// Skip a `'…'` or `"…"` region (the quote is doubled to escape it).
-fn skip_quoted(bytes: &[u8], start: usize, quote: u8) -> usize {
+pub(crate) fn skip_quoted(bytes: &[u8], start: usize, quote: u8) -> usize {
     let mut i = start + 1;
     while i < bytes.len() {
         if bytes[i] == quote {
@@ -156,7 +156,7 @@ fn skip_quoted(bytes: &[u8], start: usize, quote: u8) -> usize {
     bytes.len()
 }
 
-fn skip_line_comment(bytes: &[u8], start: usize) -> usize {
+pub(crate) fn skip_line_comment(bytes: &[u8], start: usize) -> usize {
     let mut i = start + 2;
     while i < bytes.len() && bytes[i] != b'\n' {
         i += 1;
@@ -165,7 +165,7 @@ fn skip_line_comment(bytes: &[u8], start: usize) -> usize {
 }
 
 /// Skip a `/* … */` comment; Postgres allows them to nest.
-fn skip_block_comment(bytes: &[u8], start: usize) -> usize {
+pub(crate) fn skip_block_comment(bytes: &[u8], start: usize) -> usize {
     let mut depth = 1_usize;
     let mut i = start + 2;
     while i < bytes.len() {
@@ -200,7 +200,7 @@ fn skip_dollar_quoted(text: &str, start: usize) -> usize {
 
 /// The `$tag$` delimiter opening at `start`, or `None` when the `$` there does
 /// not open a dollar-quoted region (a `$1` placeholder, a bare `$`).
-fn dollar_quote_tag(text: &str, start: usize) -> Option<&str> {
+pub(crate) fn dollar_quote_tag(text: &str, start: usize) -> Option<&str> {
     let bytes = text.as_bytes();
     let mut tag_end = start + 1;
     while tag_end < bytes.len()

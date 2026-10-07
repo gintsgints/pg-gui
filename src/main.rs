@@ -10,6 +10,7 @@ mod debug;
 mod definitions;
 mod export;
 mod file_tree;
+mod highlight;
 mod instance;
 mod lsp;
 mod plan;

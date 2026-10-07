@@ -49,8 +49,8 @@ use crate::{
     OpenGitHub, OpenRecentFolder, OpenSnippets, PrevTab, Quit, RefreshDbTree, Rollback, RunQuery,
     RunScripts, SaveFile, SetTheme, ShowHelp, StartDebug, ToggleAutocommit, ToggleComment,
     ToggleDbPanel, ToggleFilesPanel, ToggleFormatOnSave, ToggleResultsPanel, ZoomIn, ZoomOut,
-    ZoomReset, ai, config, db, db_tree, debug, definitions, export, file_tree, lsp, plan, snippets,
-    statement,
+    ZoomReset, ai, config, db, db_tree, debug, definitions, export, file_tree, highlight, lsp,
+    plan, snippets, statement,
 };
 
 /// The project's GitHub page, opened from the About application menu.
@@ -1832,6 +1832,9 @@ impl PgGuiApp {
         let weak = cx.weak_entity();
         editor.update(cx, |state, _| {
             state.lsp_mut().completion_provider = Some(Rc::new(lsp::SnippetCompletions));
+            // The PL/pgSQL keywords the SQL grammar has no token for, painted
+            // over the tree-sitter result.
+            state.lsp_mut().semantic_tokens_provider = Some(Rc::new(highlight::Keywords));
             state.lsp_mut().definition_provider =
                 Some(Rc::new(definitions::Provider::new(weak.clone())));
             state.lsp_mut().show_document = Some(Rc::new(move |params, window, cx| {
