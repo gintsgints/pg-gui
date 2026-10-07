@@ -10,8 +10,9 @@ use gpui::Subscription;
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity,
     EntityInputHandler as _, Focusable as _, Hsla, InteractiveElement as _, IntoElement, Menu,
-    MenuItem, MouseButton, NoAction, ParentElement as _, Pixels, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    MenuItem, MouseButton, NoAction, ParentElement as _, Pixels, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, IndexPath, Sizable as _, StyledExt as _, Theme, ThemeMode,
@@ -1392,6 +1393,9 @@ pub struct PgGuiApp {
     /// Per-statement messages from the last executed query/script, shown in
     /// the Log view.
     log: Vec<SharedString>,
+    /// Scroll state of the Log view, so a running script's new lines can
+    /// follow the bottom (see [`PgGuiApp::log_at_bottom`]).
+    log_scroll: ScrollHandle,
     /// Split state of the editor/results panels; the editor height is
     /// persisted to the config whenever the divider is dragged.
     resizable_state: Entity<ResizableState>,
@@ -1670,6 +1674,7 @@ impl PgGuiApp {
             results,
             bottom_view: BottomView::Data,
             log: Vec::new(),
+            log_scroll: ScrollHandle::new(),
             resizable_state,
             sidebar_state,
             tree_state,
@@ -2016,7 +2021,17 @@ impl PgGuiApp {
             || (Vec::new(), db::Rows::new()),
             |set| (set.columns.clone(), set.rows.clone()),
         );
+        // A run appends to the log a line at a time; the scroll offset stays
+        // where it was, so without this the new lines pile up below the
+        // viewport and a long script's log stops being live. Follow the
+        // bottom only when the view is already there, so a user who scrolled
+        // up to read an earlier statement is not yanked back down by the
+        // next one.
+        let follow = tab.result.log.len() != self.log.len() && self.log_at_bottom();
         self.log = tab.result.log.clone();
+        if follow {
+            self.log_scroll.scroll_to_bottom();
+        }
         self.results.update(cx, |table, cx| {
             table.delegate_mut().set_data(columns, rows, cx);
             table.refresh(cx);
@@ -5099,6 +5114,17 @@ impl PgGuiApp {
             )
     }
 
+    /// Whether the Log view is scrolled to its last line — which it also is
+    /// when the log is short enough not to scroll at all, and before the
+    /// view has ever been laid out.
+    ///
+    /// The offset runs negative downwards and `max_offset` is the positive
+    /// distance the content can travel, so the two cancel out at the bottom;
+    /// the tolerance covers the sub-pixel drift between the two measurements.
+    fn log_at_bottom(&self) -> bool {
+        self.log_scroll.max_offset().y + self.log_scroll.offset().y <= px(2.)
+    }
+
     /// The message log (one line per statement from the last query/script)
     /// over a Data switch button at the bottom.
     fn render_log(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -5124,6 +5150,7 @@ impl PgGuiApp {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
+                    .track_scroll(&self.log_scroll)
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(cx.theme().mono_font_size)
                     .child(body),
