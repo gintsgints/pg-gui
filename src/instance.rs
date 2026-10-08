@@ -37,7 +37,7 @@ pub fn acquire() -> Option<InstanceSocket> {
 
     let unguarded = |err: Option<std::io::Error>| {
         if let Some(err) = err {
-            eprintln!("pg-gui: single-instance socket unavailable: {err}");
+            tracing::warn!("single-instance socket unavailable: {err}");
         }
         Some(InstanceSocket { listener: None })
     };

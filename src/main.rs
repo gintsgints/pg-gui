@@ -12,6 +12,7 @@ mod export;
 mod file_tree;
 mod highlight;
 mod instance;
+mod logging;
 mod lsp;
 mod plan;
 mod results;
@@ -105,7 +106,7 @@ fn load_catppuccin(cx: &mut App) {
     if let Err(err) = ThemeRegistry::global_mut(cx)
         .load_themes_from_str(include_str!("../themes/catppuccin.json"))
     {
-        eprintln!("pg-gui: failed to load Catppuccin themes: {err}");
+        tracing::warn!("failed to load Catppuccin themes: {err}");
         return;
     }
     let registry = ThemeRegistry::global(cx);
@@ -121,6 +122,19 @@ fn load_catppuccin(cx: &mut App) {
 }
 
 fn main() {
+    // First thing, so the instance check and everything after it can report.
+    let log = logging::init();
+    // Naming the file is the point of the line: a windowed launch has no
+    // stderr to read, so this is what says where its diagnostics went.
+    let destination = log.as_ref().map_or_else(
+        || "stderr only".to_string(),
+        |path| path.display().to_string(),
+    );
+    tracing::info!(
+        "pg-gui {} starting, logging to {destination}",
+        env!("CARGO_PKG_VERSION")
+    );
+
     #[cfg(feature = "dhat-heap")]
     let profiler = std::cell::RefCell::new(Some(
         dhat::Profiler::builder()

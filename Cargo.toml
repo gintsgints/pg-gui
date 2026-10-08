@@ -76,6 +76,13 @@ postgres = "0.19"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Diagnostics. gpui-component and gpui-base report through `tracing`, gpui
+# itself and the postgres driver through `log`; `tracing-subscriber`'s
+# `tracing-log` feature (on by default) installs the bridge that turns the
+# latter into tracing events, so one subscriber catches both. See
+# `src/logging.rs`.
+tracing = "0.1"
+tracing-subscriber = "0.3"
 # Only the AI completion call uses this: HTTPS + JSON and nothing else. The
 # default features add gzip (responses are a few hundred bytes) and ureq 3's
 # other extras, so they are off.

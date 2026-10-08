@@ -137,6 +137,27 @@ string for that launch; with neither present the field defaults to
 Only one instance runs at a time (two would race for `config.json`): launching
 the app while it's already open just raises the running window.
 
+## Logging
+
+The app writes a diagnostics log next to `config.json` —
+`~/Library/Application Support/pg-gui/pg-gui.log` on macOS, `~/.config/pg-gui/pg-gui.log`
+on Linux — and the same lines to stderr, so a `cargo run` shows them in the terminal
+and a launch from Finder still leaves a file to read.
+
+By default it records the app's own events from `info` up and everything else only
+at `warn` and `error`.
+
+`PG_GUI_LOG` widens or narrows that, in the usual `target=level` syntax —
+a bare level sets the default, `target=level` overrides one module tree, and the
+levels are `error`, `warn`, `info`, `debug` and `trace`:
+
+```sh
+PG_GUI_LOG=debug cargo run                      # everything from debug up
+PG_GUI_LOG=warn,pg_gui=trace cargo run          # all of pg-gui, warnings elsewhere
+PG_GUI_LOG=pgls_workspace=debug cargo run       # just the language server
+PG_GUI_LOG=off cargo run                        # nothing at all
+```
+
 ## Test database
 
 A disposable Postgres with sample data (customers/orders) is included. It is a

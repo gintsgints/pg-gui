@@ -370,7 +370,7 @@ pub fn save(config: &Config) {
         })
         .and_then(|()| std::fs::rename(&tmp, &path));
     if let Err(err) = result {
-        eprintln!("pg-gui: failed to save config to {}: {err}", path.display());
+        tracing::error!("failed to save config to {}: {err}", path.display());
     }
 }
 
