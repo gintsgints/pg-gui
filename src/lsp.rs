@@ -7,6 +7,11 @@
 //! the `gpui-component` editor through its provider traits. The database
 //! credentials come from the workspace settings we push at startup, which is
 //! what makes completions schema-aware.
+//!
+//! Being a library, there is no wire traffic to trace, so the boundary logs
+//! itself: the configuration derived from the connection string, each
+//! document sync, and every answer the workspace gives, with completions
+//! tallied by item kind. See the `PG_GUI_LOG` recipe in `CLAUDE.md`.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver as StdReceiver, RecvTimeoutError};
@@ -39,12 +44,16 @@ use pgls_workspace::workspace::{
     RegisterProjectFolderParams, UpdateSettingsParams,
 };
 use pgls_workspace::{Workspace, WorkspaceError};
+use tracing::{debug, info, trace, warn};
 
 use crate::config::CaseStyle;
 
 /// How long a burst of edits is allowed to settle before we re-run the
 /// (potentially database-touching) diagnostics analysis.
 const DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// How much of the text before the cursor the completion/hover trace shows.
+const CONTEXT_CHARS: usize = 40;
 
 /// Stack for the document worker. Every language feature parses the statement
 /// under the cursor, and `pgls_query` parses by decoding `libpg_query`'s protobuf
@@ -68,6 +77,9 @@ fn contain_panic<T>(f: impl FnOnce() -> T) -> Result<T> {
             .map(|s| (*s).to_string())
             .or_else(|| payload.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "unknown panic".to_string());
+        // Most callers drop the error (a language feature must not fail the
+        // edit), so this is the only place the panic is ever recorded.
+        warn!("language server panicked: {message}");
         anyhow!("language server panicked: {message}")
     })
 }
@@ -188,9 +200,12 @@ impl Client {
             })
             .map_err(|err| anyhow!("failed to register language server project: {err}"))?;
 
+        let configuration = build_configuration(connection_string, keyword_case, constant_case);
+        log_configuration(&configuration, &dir);
+
         workspace
             .update_settings(UpdateSettingsParams {
-                configuration: build_configuration(connection_string, keyword_case, constant_case),
+                configuration,
                 vcs_base_path: None,
                 gitignore_matches: Vec::new(),
                 workspace_directory: Some(dir),
@@ -216,6 +231,10 @@ impl Client {
             .spawn(move || {
                 document_worker(&worker_workspace, &worker_path, &doc_rx, &diagnostics_tx);
             })?;
+        info!(
+            bytes = text.len(),
+            "language server workspace started, document opened"
+        );
         // Publish an initial diagnostics set for the freshly opened document.
         doc_tx.send(DocEvent::Changed(text.to_string())).ok();
 
@@ -328,6 +347,11 @@ fn document_worker(
                 position,
                 reply,
             }) => {
+                trace!(
+                    position = u32::from(position),
+                    before = %cursor_context(&text, position),
+                    "completion request"
+                );
                 version += 1;
                 apply_change(workspace, path, version, text);
                 reply
@@ -341,6 +365,11 @@ fn document_worker(
                 position,
                 reply,
             }) => {
+                trace!(
+                    position = u32::from(position),
+                    before = %cursor_context(&text, position),
+                    "hover request"
+                );
                 version += 1;
                 apply_change(workspace, path, version, text);
                 reply.send(worker_hover(workspace, path, position)).ok();
@@ -371,13 +400,16 @@ fn document_worker(
 /// Apply a full-text change to the workspace document, containing any panic.
 fn apply_change(workspace: &Arc<dyn Workspace>, path: &PgLSPath, version: i32, content: String) {
     contain_panic(|| {
-        workspace
-            .change_file(ChangeFileParams {
-                path: path.clone(),
-                version,
-                content,
-            })
-            .ok();
+        trace!(version, bytes = content.len(), "syncing document");
+        if let Err(err) = workspace.change_file(ChangeFileParams {
+            path: path.clone(),
+            version,
+            content,
+        }) {
+            // A rejected change leaves the workspace document behind the
+            // buffer, which is itself a reason completions go stale.
+            warn!("document sync failed: {err}");
+        }
     })
     .ok();
 }
@@ -394,11 +426,76 @@ fn worker_completions(
             position,
         })
     }) {
-        Ok(Ok(result)) => CompletionOutcome::Items(result.into_iter().collect()),
-        Ok(Err(WorkspaceError::DatabaseConnectionError(_))) => CompletionOutcome::DatabaseOffline,
-        Ok(Err(err)) => CompletionOutcome::Failed(err.to_string()),
+        Ok(Ok(result)) => {
+            let items: Vec<_> = result.into_iter().collect();
+            log_completion_items(&items);
+            CompletionOutcome::Items(items)
+        }
+        Ok(Err(err @ WorkspaceError::DatabaseConnectionError(_))) => {
+            // The single most common reason schema items are missing, and
+            // invisible otherwise: the provider silently falls back to
+            // snippets, and the server only warns on the first failure of a
+            // backoff window.
+            debug!("completions have no database connection: {err}");
+            CompletionOutcome::DatabaseOffline
+        }
+        Ok(Err(err)) => {
+            warn!("completions failed: {err}");
+            CompletionOutcome::Failed(err.to_string())
+        }
+        // `contain_panic` has already logged the panic.
         Err(err) => CompletionOutcome::Failed(err.to_string()),
     }
+}
+
+/// Summarise what the server answered a completion request with. A list that
+/// holds keywords but no `Table`/`Column` items is the signature of a schema
+/// cache that never loaded — the usual reason table names do not complete —
+/// so the tally is logged even when the list is not empty.
+fn log_completion_items(items: &[pgls_completions::CompletionItem]) {
+    let mut tables = 0usize;
+    let mut columns = 0usize;
+    let mut schemas = 0usize;
+    let mut functions = 0usize;
+    let mut keywords = 0usize;
+    let mut other = 0usize;
+    for item in items {
+        match &item.kind {
+            PgCompletionItemKind::Table => tables += 1,
+            PgCompletionItemKind::Column => columns += 1,
+            PgCompletionItemKind::Schema => schemas += 1,
+            PgCompletionItemKind::Function => functions += 1,
+            PgCompletionItemKind::Keyword => keywords += 1,
+            PgCompletionItemKind::Policy | PgCompletionItemKind::Role => other += 1,
+        }
+    }
+    debug!(
+        total = items.len(),
+        tables, columns, schemas, functions, keywords, other, "server completions"
+    );
+    if !items.is_empty() {
+        trace!(
+            labels = ?items.iter().map(|item| item.label.as_str()).collect::<Vec<_>>(),
+            "server completion labels"
+        );
+    }
+}
+
+/// The characters just before `position`, for the completion/hover trace.
+/// What the server took to be the statement under the cursor is the first
+/// thing to check when nothing schema-aware comes back.
+fn cursor_context(text: &str, position: TextSize) -> String {
+    let mut end = usize::from(position).min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let start = text[..end]
+        .char_indices()
+        .rev()
+        .take(CONTEXT_CHARS)
+        .last()
+        .map_or(end, |(offset, _)| offset);
+    text[start..end].replace('\n', "\\n")
 }
 
 /// Compute hover at `position` on the (already synced) document.
@@ -413,17 +510,30 @@ fn worker_hover(
             position,
         })
     }) {
-        Ok(Ok(result)) => HoverOutcome::Content(result.into_iter().collect()),
-        Ok(Err(WorkspaceError::DatabaseConnectionError(_))) => HoverOutcome::DatabaseOffline,
-        Ok(Err(err)) => HoverOutcome::Failed(err.to_string()),
+        Ok(Ok(result)) => {
+            let blocks: Vec<_> = result.into_iter().collect();
+            debug!(blocks = blocks.len(), "server hover");
+            HoverOutcome::Content(blocks)
+        }
+        Ok(Err(err @ WorkspaceError::DatabaseConnectionError(_))) => {
+            debug!("hover has no database connection: {err}");
+            HoverOutcome::DatabaseOffline
+        }
+        Ok(Err(err)) => {
+            warn!("hover failed: {err}");
+            HoverOutcome::Failed(err.to_string())
+        }
         Err(err) => HoverOutcome::Failed(err.to_string()),
     }
 }
 
 fn pull_diagnostics(workspace: &Arc<dyn Workspace>, path: &PgLSPath) -> Vec<lsp_types::Diagnostic> {
-    let Ok(content) = workspace.get_file_content(GetFileContentParams { path: path.clone() })
-    else {
-        return Vec::new();
+    let content = match workspace.get_file_content(GetFileContentParams { path: path.clone() }) {
+        Ok(content) => content,
+        Err(err) => {
+            warn!("diagnostics could not read the workspace document: {err}");
+            return Vec::new();
+        }
     };
     let rope = Rope::from(content.as_str());
     let result = workspace.pull_file_diagnostics(PullFileDiagnosticsParams {
@@ -433,14 +543,28 @@ fn pull_diagnostics(workspace: &Arc<dyn Workspace>, path: &PgLSPath) -> Vec<lsp_
         only: Vec::new(),
         skip: Vec::new(),
     });
-    let Ok(result) = result else {
-        return Vec::new();
+    let result = match result {
+        Ok(result) => result,
+        Err(err @ WorkspaceError::DatabaseConnectionError(_)) => {
+            debug!("diagnostics have no database connection: {err}");
+            return Vec::new();
+        }
+        Err(err) => {
+            warn!("diagnostics failed: {err}");
+            return Vec::new();
+        }
     };
-    result
+    let diagnostics: Vec<_> = result
         .diagnostics
         .iter()
         .filter_map(|diagnostic| diagnostic_to_lsp(diagnostic, &rope))
-        .collect()
+        .collect();
+    debug!(
+        count = diagnostics.len(),
+        reported = result.diagnostics.len(),
+        "server diagnostics"
+    );
+    diagnostics
 }
 
 fn diagnostic_to_lsp(
@@ -521,6 +645,7 @@ impl CompletionProvider for Provider {
         let content = text.to_string();
         let rope = text.clone();
         let snippets = snippet_items(text, offset);
+        let snippet_count = snippets.len();
         cx.background_spawn(async move {
             // Route through the document worker so the query runs *after* the
             // buffer change it was triggered by; the workspace document is
@@ -554,6 +679,12 @@ impl CompletionProvider for Provider {
                     .map(|item| completion_to_lsp(item, &rope)),
             );
             clamp_filter_text(&mut items, &query);
+            debug!(
+                total = items.len(),
+                snippets = snippet_count,
+                query = query.as_str(),
+                "completion menu"
+            );
             Ok(CompletionResponse::Array(items))
         })
     }
@@ -824,6 +955,28 @@ fn build_configuration(
     config
 }
 
+/// Record the settings the workspace is configured with. These decide
+/// whether completions are schema-aware at all, and they are derived from the
+/// connection string rather than given, so the derivation is worth seeing.
+/// The password is the one field that never goes in the log.
+fn log_configuration(config: &PartialConfiguration, dir: &std::path::Path) {
+    let db = config.db.as_ref();
+    let search_path = config
+        .typecheck
+        .as_ref()
+        .and_then(|typecheck| typecheck.search_path.as_ref());
+    debug!(
+        workspace = %dir.display(),
+        host = db.and_then(|db| db.host.as_deref()).unwrap_or_default(),
+        port = db.and_then(|db| db.port).unwrap_or_default(),
+        user = db.and_then(|db| db.username.as_deref()).unwrap_or_default(),
+        database = db.and_then(|db| db.database.as_deref()).unwrap_or_default(),
+        connection_disabled = db.and_then(|db| db.disable_connection).unwrap_or(false),
+        search_path = ?search_path,
+        "language server configuration"
+    );
+}
+
 fn to_keyword_case(case: CaseStyle) -> KeywordCase {
     match case {
         CaseStyle::Lower => KeywordCase::Lower,
@@ -837,13 +990,41 @@ fn default_user() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr as _;
     use std::time::Duration;
 
     use lsp_types::CompletionItem;
 
-    use super::{CaseStyle, Client, WORKER_STACK, clamp_filter_text, contain_panic, to_text_size};
+    use super::{
+        CaseStyle, Client, CompletionOutcome, DocEvent, WORKER_STACK, clamp_filter_text,
+        contain_panic, cursor_context, to_text_size,
+    };
     use pgls_workspace::features::completions::GetCompletionsParams;
     use pgls_workspace::features::on_hover::OnHoverParams;
+
+    /// Install a stderr subscriber for the `#[ignore]`d probes, so a run with
+    /// `PG_GUI_LOG` set shows the same boundary trace the app logs — which is
+    /// how the language server is debugged without a window. Stderr only: the
+    /// app's log file is not this binary's to rotate. A second call is a
+    /// no-op, as is a call in a binary that already has a subscriber.
+    fn trace_to_stderr() {
+        use tracing_subscriber::filter::Targets;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+        use tracing_subscriber::{Layer as _, fmt};
+
+        let directives = std::env::var("PG_GUI_LOG").unwrap_or_else(|_| "pg_gui=trace".to_string());
+        let filter = Targets::from_str(&directives)
+            .unwrap_or_else(|_| Targets::new().with_default(tracing::Level::TRACE));
+        tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_filter(filter),
+            )
+            .try_init()
+            .ok();
+    }
 
     /// Run a workspace probe with the stack the document worker gets. These
     /// tests call the workspace directly instead of going through the worker,
@@ -864,6 +1045,19 @@ mod tests {
             filter_text: filter_text.map(ToString::to_string),
             ..CompletionItem::default()
         }
+    }
+
+    #[test]
+    fn cursor_context_shows_the_text_before_the_cursor() {
+        let text = "select * from ord";
+        assert_eq!(
+            cursor_context(text, to_text_size(text.len())),
+            "select * from ord"
+        );
+        // Newlines would break the one-event-per-line log.
+        assert_eq!(cursor_context("a\nb", to_text_size(3)), "a\\nb");
+        // A position inside a multi-byte character must not panic the trace.
+        assert_eq!(cursor_context("é", to_text_size(1)), "");
     }
 
     #[test]
@@ -952,6 +1146,8 @@ mod tests {
     fn embedded_server_resolves_search_path_schemas() {
         const CONN: &str = "postgres://pgui:pgui@localhost:5433/pgui_test";
 
+        trace_to_stderr();
+
         let (client, mut diagnostics) = Client::start(
             CONN,
             "SELECT * FROM feature_flags;\nSELECT * FROM no_such_table_xyz;\n",
@@ -993,10 +1189,52 @@ mod tests {
     /// Docker Postgres (`docker compose up -d`). Ignored by default because it
     /// needs the database; run with:
     /// `cargo test --  --ignored embedded_server`.
+    /// The completion path the editor actually drives: through the document
+    /// worker, which syncs the buffer first. The direct-workspace probe below
+    /// bypasses it, so it cannot catch an ordering or sync fault — and it is
+    /// the worker that logs the per-kind tally a missing-tables report needs.
+    #[test]
+    #[ignore = "requires the docker Postgres on localhost:5433"]
+    fn embedded_server_completions_through_the_worker() {
+        const CONN: &str = "postgres://pgui:pgui@localhost:5433/pgui_test";
+
+        trace_to_stderr();
+
+        let text = "SELECT * FROM o";
+        let (client, _diagnostics) =
+            Client::start(CONN, text, CaseStyle::Lower, CaseStyle::Lower).expect("client starts");
+
+        let (reply, reply_rx) = futures::channel::oneshot::channel();
+        client
+            .inner
+            .doc_tx
+            .send(DocEvent::Completions {
+                text: text.to_string(),
+                position: to_text_size(text.len()),
+                reply,
+            })
+            .expect("the worker takes the request");
+        let labels: Vec<String> = match futures::executor::block_on(reply_rx)
+            .expect("the worker replies")
+        {
+            CompletionOutcome::Items(items) => items.into_iter().map(|item| item.label).collect(),
+            CompletionOutcome::DatabaseOffline => panic!("the workspace reported no database"),
+            CompletionOutcome::Failed(err) => panic!("completions failed: {err}"),
+        };
+        assert!(
+            labels.iter().any(|label| label == "orders"),
+            "expected `orders` in completions, got {labels:?}"
+        );
+
+        client.shutdown();
+    }
+
     #[test]
     #[ignore = "requires the docker Postgres on localhost:5433"]
     fn embedded_server_completions_diagnostics_and_formatting() {
         const CONN: &str = "postgres://pgui:pgui@localhost:5433/pgui_test";
+
+        trace_to_stderr();
 
         let (client, mut diagnostics) =
             Client::start(CONN, "SELECT * FROM o", CaseStyle::Upper, CaseStyle::Upper)
