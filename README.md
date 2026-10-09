@@ -144,8 +144,7 @@ The app writes a diagnostics log next to `config.json` —
 on Linux — and the same lines to stderr, so a `cargo run` shows them in the terminal
 and a launch from Finder still leaves a file to read.
 
-By default it records the app's own events from `info` up and everything else only
-at `warn` and `error`.
+By default it records errors only, from the app and its libraries alike.
 
 `PG_GUI_LOG` widens or narrows that, in the usual `target=level` syntax —
 a bare level sets the default, `target=level` overrides one module tree, and the

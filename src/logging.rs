@@ -28,10 +28,10 @@ use tracing_subscriber::{Layer as _, fmt};
 /// The environment variable holding the filter directives.
 const FILTER_VAR: &str = "PG_GUI_LOG";
 
-/// What is logged when `PG_GUI_LOG` is unset: the app's own events from
-/// `info` up, everything else only when it is a `warn` or an `error`. The
-/// libraries are chatty at `debug`, and gpui logs a line per frame drop.
-const DEFAULT_FILTER: &str = "warn,pg_gui=info";
+/// What is logged when `PG_GUI_LOG` is unset: errors only, from the app and
+/// the libraries alike. Anything more is opt-in — the libraries are chatty
+/// at `debug`, and gpui logs a line per frame drop.
+const DEFAULT_FILTER: &str = "error";
 
 /// The log file's name in the config directory, beside `config.json`.
 const FILE_NAME: &str = "pg-gui.log";
@@ -50,7 +50,7 @@ pub fn init() -> Option<PathBuf> {
         // default, and say so once the subscriber is up.
         Targets::from_str(directives)
             .or_else(|_| Targets::from_str(DEFAULT_FILTER))
-            .unwrap_or_else(|_| Targets::new().with_default(tracing::Level::WARN))
+            .unwrap_or_else(|_| Targets::new().with_default(tracing::Level::ERROR))
     };
 
     let path = path();
@@ -83,7 +83,11 @@ pub fn init() -> Option<PathBuf> {
     if let Ok(directives) = std::env::var(FILTER_VAR)
         && Targets::from_str(&directives).is_err()
     {
-        tracing::warn!("{FILTER_VAR}={directives:?} is not a valid filter, using {DEFAULT_FILTER}");
+        // `error!`, not `warn!`: the fallback filter drops warnings, and
+        // this is the one line that explains why the log went quiet.
+        tracing::error!(
+            "{FILTER_VAR}={directives:?} is not a valid filter, using {DEFAULT_FILTER}"
+        );
     }
     path
 }
