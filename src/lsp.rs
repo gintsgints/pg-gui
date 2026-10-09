@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver as StdReceiver, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use futures::channel::{mpsc, oneshot};
@@ -55,6 +55,16 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 /// How much of the text before the cursor the completion/hover trace shows.
 const CONTEXT_CHARS: usize = 40;
 
+/// How long to wait before asking again whether the schema cache has loaded,
+/// while it has not. The server backs a failed connection off for up to a
+/// minute, so a tighter poll would only add log lines.
+const SCHEMA_PROBE_INTERVAL: Duration = Duration::from_secs(20);
+
+/// The statement the schema probe completes. A `FROM` with nothing after it is
+/// the one position where the server can only answer out of the schema cache,
+/// so a reply holding relations proves the cache loaded.
+const PROBE_TEXT: &str = "select * from ";
+
 /// Stack for the document worker. Every language feature parses the statement
 /// under the cursor, and `pgls_query` parses by decoding `libpg_query`'s protobuf
 /// AST with `prost`: the generated decoder for the `Node` message — a `oneof`
@@ -86,6 +96,43 @@ fn contain_panic<T>(f: impl FnOnce() -> T) -> Result<T> {
 
 /// Diagnostics computed for the editor document.
 pub type DiagnosticsReceiver = mpsc::UnboundedReceiver<Vec<lsp_types::Diagnostic>>;
+
+/// Schema-cache state, as the status bar reports it.
+///
+/// The workspace loads its schema cache lazily, on the first feature that
+/// needs a database, and every such feature degrades silently when the load
+/// fails — completions come back as keywords alone, hover empty. Nothing in
+/// the [`Workspace`] trait reports on the cache (it can only invalidate it),
+/// so this is derived from a probe the document worker runs: see
+/// [`probe_schema`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaStatus {
+    /// No answer yet — the first probe is still out.
+    Loading,
+    /// The workspace answered out of a loaded schema cache.
+    Loaded,
+    /// The database is unreachable, so there is no schema to complete from.
+    Offline,
+    /// The workspace was configured without a database (the connection string
+    /// did not parse), so no schema can ever load.
+    Disabled,
+}
+
+impl SchemaStatus {
+    /// How the status bar words it.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Loading => "SQL LSP: schema loading",
+            Self::Loaded => "SQL LSP: schema loaded",
+            Self::Offline => "SQL LSP: no schema — database unreachable",
+            Self::Disabled => "SQL LSP: no schema — no database",
+        }
+    }
+}
+
+/// Schema-cache state pushed by the document worker as it changes.
+pub type SchemaStatusReceiver = mpsc::UnboundedReceiver<SchemaStatus>;
 
 /// A handle to an embedded language-server workspace. Cloning is cheap; the
 /// workspace and its background document worker are torn down once the last
@@ -169,6 +216,10 @@ impl Client {
     /// document. Loading the schema cache happens lazily on the first
     /// completion/diagnostic, so call this from a background thread.
     ///
+    /// Besides the diagnostics stream, the worker reports what the schema
+    /// cache is doing ([`SchemaStatus`]) so the status bar can say whether
+    /// completions are schema-aware yet.
+    ///
     /// # Errors
     ///
     /// Fails when the workspace directory cannot be prepared or the workspace
@@ -178,7 +229,7 @@ impl Client {
         text: &str,
         keyword_case: CaseStyle,
         constant_case: CaseStyle,
-    ) -> Result<(Self, DiagnosticsReceiver)> {
+    ) -> Result<(Self, DiagnosticsReceiver, SchemaStatusReceiver)> {
         contain_panic(|| Self::start_inner(connection_string, text, keyword_case, constant_case))?
     }
 
@@ -187,11 +238,14 @@ impl Client {
         text: &str,
         keyword_case: CaseStyle,
         constant_case: CaseStyle,
-    ) -> Result<(Self, DiagnosticsReceiver)> {
+    ) -> Result<(Self, DiagnosticsReceiver, SchemaStatusReceiver)> {
         let workspace = pgls_workspace::workspace::server_sync();
         let dir = workspace_dir()?;
         std::fs::create_dir_all(&dir).ok();
         let path = PgLSPath::new(dir.join("scratch.sql"));
+        // The probe completes its own scratch document, so it never disturbs
+        // (or is disturbed by) the editor buffer opened below.
+        let probe_path = PgLSPath::new(dir.join("schema-probe.sql"));
 
         workspace
             .register_project_folder(RegisterProjectFolderParams {
@@ -202,6 +256,14 @@ impl Client {
 
         let configuration = build_configuration(connection_string, keyword_case, constant_case);
         log_configuration(&configuration, &dir);
+        // Settled here rather than re-parsed: `build_configuration` is what
+        // decides a connection string the driver rejects runs without a
+        // database, and a disabled connection can never load a schema.
+        let connection_disabled = configuration
+            .db
+            .as_ref()
+            .and_then(|db| db.disable_connection)
+            .unwrap_or(false);
 
         workspace
             .update_settings(UpdateSettingsParams {
@@ -221,15 +283,22 @@ impl Client {
             .map_err(|err| anyhow!("failed to open document: {err}"))?;
 
         let (diagnostics_tx, diagnostics_rx) = mpsc::unbounded();
+        let (schema_tx, schema_rx) = mpsc::unbounded();
         let (doc_tx, doc_rx) = std::sync::mpsc::channel();
 
-        let worker_workspace = workspace.clone();
-        let worker_path = path.clone();
+        let worker = Worker {
+            workspace: workspace.clone(),
+            path: path.clone(),
+            probe_path,
+            diagnostics: diagnostics_tx,
+            schema: schema_tx,
+            connection_disabled,
+        };
         std::thread::Builder::new()
             .name("pg-lsp-document".into())
             .stack_size(WORKER_STACK)
             .spawn(move || {
-                document_worker(&worker_workspace, &worker_path, &doc_rx, &diagnostics_tx);
+                document_worker(&worker, &doc_rx);
             })?;
         info!(
             bytes = text.len(),
@@ -246,7 +315,7 @@ impl Client {
             constant_case,
             doc_tx,
         });
-        Ok((Self { inner }, diagnostics_rx))
+        Ok((Self { inner }, diagnostics_rx, schema_rx))
     }
 
     /// The connection string the workspace was configured with at startup.
@@ -301,43 +370,71 @@ impl Client {
     }
 }
 
+/// What the document worker owns: the workspace, the two documents it writes,
+/// and the channels it answers on.
+struct Worker {
+    workspace: Arc<dyn Workspace>,
+    /// The editor buffer, mirrored into the workspace.
+    path: PgLSPath,
+    /// The scratch document [`probe_schema`] completes.
+    probe_path: PgLSPath,
+    diagnostics: mpsc::UnboundedSender<Vec<lsp_types::Diagnostic>>,
+    schema: mpsc::UnboundedSender<SchemaStatus>,
+    /// The workspace was configured without a database, so no schema can ever
+    /// load and probing for one is pointless.
+    connection_disabled: bool,
+}
+
 /// Owns every write to the workspace document. Applies buffer changes as they
-/// arrive, answers format requests in order, and republishes diagnostics once
-/// a burst of edits settles ([`DEBOUNCE`]). Workspace calls can block for
-/// seconds while the database is unreachable (diagnostics hold the document
-/// lock across connection attempts), which is why all of this runs on its own
-/// thread. Returns — closing the workspace document on the way out — when a
-/// [`DocEvent::Close`] arrives or the channel is dropped (i.e. the last
-/// [`Client`] is gone).
-fn document_worker(
-    workspace: &Arc<dyn Workspace>,
-    path: &PgLSPath,
-    events: &StdReceiver<DocEvent>,
-    diagnostics_tx: &mpsc::UnboundedSender<Vec<lsp_types::Diagnostic>>,
-) {
+/// arrive, answers format/completion/hover requests in order, republishes
+/// diagnostics once a burst of edits settles ([`DEBOUNCE`]), and polls the
+/// schema cache until it has loaded ([`SCHEMA_PROBE_INTERVAL`]). Workspace
+/// calls can block for seconds while the database is unreachable (diagnostics
+/// hold the document lock across connection attempts), which is why all of
+/// this runs on its own thread. Returns — closing the workspace document on
+/// the way out — when a [`DocEvent::Close`] arrives or the channel is dropped
+/// (i.e. the last [`Client`] is gone).
+fn document_worker(worker: &Worker, events: &StdReceiver<DocEvent>) {
+    let workspace = &worker.workspace;
+    let path = &worker.path;
     let mut version = 0;
-    // Set after a change; cleared once its diagnostics run has published.
-    let mut dirty = false;
+    // When the diagnostics of the last change are due; cleared once published.
+    let mut settle_at: Option<Instant> = None;
+    let mut status = if worker.connection_disabled {
+        SchemaStatus::Disabled
+    } else {
+        SchemaStatus::Loading
+    };
+    worker.schema.unbounded_send(status).ok();
+    // When to probe the schema cache next; `None` once it has loaded (or can
+    // never load). The first probe waits out the opening diagnostics run,
+    // which loads the cache itself and so usually makes the probe a cache hit.
+    let mut probe_at = (!worker.connection_disabled).then(|| Instant::now() + DEBOUNCE);
     loop {
-        // While a diagnostics run is pending, wait only DEBOUNCE for the
-        // next event, so a burst of edits coalesces into one analysis run.
-        let event = if dirty {
-            match events.recv_timeout(DEBOUNCE) {
+        // Wait only until the nearest of the two deadlines, so a burst of
+        // edits still coalesces into one analysis run.
+        let now = Instant::now();
+        let deadline = [settle_at, probe_at]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(|at| at.saturating_duration_since(now));
+        let event = match deadline {
+            Some(timeout) => match events.recv_timeout(timeout) {
                 Ok(event) => Some(event),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => break,
-            }
-        } else {
-            match events.recv() {
+            },
+            None => match events.recv() {
                 Ok(event) => Some(event),
                 Err(_) => break,
-            }
+            },
         };
         match event {
             Some(DocEvent::Changed(content)) => {
                 version += 1;
                 apply_change(workspace, path, version, content);
-                dirty = true;
+                settle_at = Some(Instant::now() + DEBOUNCE);
             }
             Some(DocEvent::Format { text, reply }) => {
                 reply.send(format_document(workspace, path, &text)).ok();
@@ -358,7 +455,7 @@ fn document_worker(
                     .send(worker_completions(workspace, path, position))
                     .ok();
                 // The document moved, so diagnostics need a fresh run.
-                dirty = true;
+                settle_at = Some(Instant::now() + DEBOUNCE);
             }
             Some(DocEvent::Hover {
                 text,
@@ -374,18 +471,27 @@ fn document_worker(
                 apply_change(workspace, path, version, text);
                 reply.send(worker_hover(workspace, path, position)).ok();
                 // The document moved, so diagnostics need a fresh run.
-                dirty = true;
+                settle_at = Some(Instant::now() + DEBOUNCE);
             }
             Some(DocEvent::Close) => break,
+            // A deadline passed rather than an event arriving; both may be due.
             None => {
-                // The burst settled. A contained panic publishes nothing and
-                // keeps the worker alive for the next edit.
-                let diagnostics =
-                    contain_panic(|| pull_diagnostics(workspace, path)).unwrap_or_default();
-                if diagnostics_tx.unbounded_send(diagnostics).is_err() {
-                    break;
+                if settle_at.is_some_and(|at| at <= Instant::now()) {
+                    settle_at = None;
+                    if !publish_diagnostics(worker) {
+                        break;
+                    }
                 }
-                dirty = false;
+                if probe_at.is_some_and(|at| at <= Instant::now()) {
+                    let Some(probed) = report_schema_status(worker, status) else {
+                        break;
+                    };
+                    status = probed;
+                    // Once loaded it stays loaded: the workspace caches the
+                    // schema per connection for the life of the process.
+                    probe_at = (status != SchemaStatus::Loaded)
+                        .then(|| Instant::now() + SCHEMA_PROBE_INTERVAL);
+                }
             }
         }
     }
@@ -395,6 +501,79 @@ fn document_worker(
             .ok();
     })
     .ok();
+}
+
+/// Run the settled diagnostics analysis and publish it. `false` once the
+/// receiver is gone, i.e. the worker has nobody left to report to.
+fn publish_diagnostics(worker: &Worker) -> bool {
+    // A contained panic publishes nothing and keeps the worker alive for the
+    // next edit.
+    let diagnostics =
+        contain_panic(|| pull_diagnostics(&worker.workspace, &worker.path)).unwrap_or_default();
+    worker.diagnostics.unbounded_send(diagnostics).is_ok()
+}
+
+/// Re-probe the schema cache and push the result when it differs from `status`.
+/// The new status, or `None` once the receiver is gone.
+fn report_schema_status(worker: &Worker, status: SchemaStatus) -> Option<SchemaStatus> {
+    let probed = probe_schema(&worker.workspace, &worker.probe_path);
+    if probed == status {
+        return Some(status);
+    }
+    info!(status = ?probed, "schema cache status");
+    worker.schema.unbounded_send(probed).ok()?;
+    Some(probed)
+}
+
+/// Ask the workspace to complete a bare `FROM` on a scratch document, to find
+/// out whether its schema cache has loaded. There is no direct way to ask: the
+/// [`Workspace`] trait can invalidate the cache but not report on it, and the
+/// features that read it fail soft, so the answer has to be inferred from one.
+/// Relations in the reply mean the cache loaded; a `DatabaseConnectionError`
+/// means it did not. An answer with no relations at all (the server skips
+/// completions entirely when it has no pool, e.g. during its connection
+/// backoff) is reported as offline too — the user has no schema either way.
+fn probe_schema(workspace: &Arc<dyn Workspace>, path: &PgLSPath) -> SchemaStatus {
+    contain_panic(|| {
+        if let Err(err) = workspace.open_file(OpenFileParams {
+            path: path.clone(),
+            content: PROBE_TEXT.to_string(),
+            version: 0,
+        }) {
+            debug!("schema probe could not open its document: {err}");
+            return SchemaStatus::Offline;
+        }
+        let result = workspace.get_completions(GetCompletionsParams {
+            path: path.clone(),
+            position: to_text_size(PROBE_TEXT.len()),
+        });
+        workspace
+            .close_file(CloseFileParams { path: path.clone() })
+            .ok();
+        match result {
+            Ok(items) => {
+                let relations = items
+                    .into_iter()
+                    .filter(|item| !matches!(item.kind, PgCompletionItemKind::Keyword))
+                    .count();
+                debug!(relations, "schema probe");
+                if relations > 0 {
+                    SchemaStatus::Loaded
+                } else {
+                    SchemaStatus::Offline
+                }
+            }
+            Err(err @ WorkspaceError::DatabaseConnectionError(_)) => {
+                debug!("schema probe has no database connection: {err}");
+                SchemaStatus::Offline
+            }
+            Err(err) => {
+                warn!("schema probe failed: {err}");
+                SchemaStatus::Offline
+            }
+        }
+    })
+    .unwrap_or(SchemaStatus::Offline)
 }
 
 /// Apply a full-text change to the workspace document, containing any panic.
@@ -996,8 +1175,8 @@ mod tests {
     use lsp_types::CompletionItem;
 
     use super::{
-        CaseStyle, Client, CompletionOutcome, DocEvent, WORKER_STACK, clamp_filter_text,
-        contain_panic, cursor_context, to_text_size,
+        CaseStyle, Client, CompletionOutcome, DocEvent, SchemaStatus, SchemaStatusReceiver,
+        WORKER_STACK, clamp_filter_text, contain_panic, cursor_context, to_text_size,
     };
     use pgls_workspace::features::completions::GetCompletionsParams;
     use pgls_workspace::features::on_hover::OnHoverParams;
@@ -1080,6 +1259,64 @@ mod tests {
         assert_eq!(items[1].filter_text.as_deref(), Some("ab"));
     }
 
+    /// Wait for a schema status matching `wanted`, up to `attempts` × 100ms.
+    fn wait_for_status(
+        schema: &mut SchemaStatusReceiver,
+        wanted: impl Fn(SchemaStatus) -> bool,
+        attempts: usize,
+    ) -> Option<SchemaStatus> {
+        for _ in 0..attempts {
+            match schema.try_recv() {
+                Ok(status) if wanted(status) => return Some(status),
+                Ok(_) => continue,
+                Err(err) if err.is_closed() => return None,
+                Err(_) => {}
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        None
+    }
+
+    /// A connection string the driver cannot parse leaves the workspace
+    /// without a database, so the status bar must say so rather than wait for
+    /// a schema that can never load. No database needed.
+    #[test]
+    fn schema_status_is_disabled_without_a_database() {
+        let (client, _diagnostics, mut schema) = Client::start(
+            "not a connection string",
+            "select 1;\n",
+            CaseStyle::Lower,
+            CaseStyle::Lower,
+        )
+        .expect("client starts");
+        assert_eq!(
+            wait_for_status(&mut schema, |status| status == SchemaStatus::Disabled, 20),
+            Some(SchemaStatus::Disabled)
+        );
+        client.shutdown();
+    }
+
+    /// The probe is the only thing that can tell the status bar completions
+    /// are schema-aware; with the docker database up it has to reach `Loaded`.
+    #[test]
+    #[ignore = "requires the docker Postgres on localhost:5433"]
+    fn embedded_server_reports_a_loaded_schema() {
+        trace_to_stderr();
+
+        let (client, _diagnostics, mut schema) = Client::start(
+            "postgres://pgui:pgui@localhost:5433/pgui_test",
+            "select 1;\n",
+            CaseStyle::Lower,
+            CaseStyle::Lower,
+        )
+        .expect("client starts");
+        assert_eq!(
+            wait_for_status(&mut schema, |status| status == SchemaStatus::Loaded, 300),
+            Some(SchemaStatus::Loaded)
+        );
+        client.shutdown();
+    }
+
     /// Hover at every byte offset of `text`. Contained panics come back as
     /// errors; only an uncontained panic (or an abort) fails the test.
     fn hover_every_position(client: &Client, text: &str) {
@@ -1106,7 +1343,7 @@ mod tests {
     #[test]
     fn hover_survives_snippet_tab_stop_markers() {
         let text = "CREATE SEQUENCE ${1:sequence_name}\n    START WITH ${2:1}\n    INCREMENT BY ${3:1};invoice_seqCREATE SEQUENCE 100\n    START WITH 1\n    INCREMENT BY ${3:1};invoice_seqcreate table\n";
-        let (client, _diagnostics) = Client::start(
+        let (client, _diagnostics, _schema) = Client::start(
             "postgres://nobody:nope@127.0.0.1:1/none",
             text,
             CaseStyle::Lower,
@@ -1125,7 +1362,7 @@ mod tests {
     #[ignore = "requires the docker Postgres on localhost:5433"]
     fn embedded_server_hover_survives_snippet_markers() {
         let text = "CREATE SEQUENCE ${1:sequence_name}\n    START WITH ${2:1}\n    INCREMENT BY ${3:1};invoice_seqCREATE SEQUENCE 100\n    START WITH 1\n    INCREMENT BY ${3:1};invoice_seqcreate table\n";
-        let (client, _diagnostics) = Client::start(
+        let (client, _diagnostics, _schema) = Client::start(
             "postgres://pgui:pgui@localhost:5433/pgui_test",
             text,
             CaseStyle::Lower,
@@ -1148,7 +1385,7 @@ mod tests {
 
         trace_to_stderr();
 
-        let (client, mut diagnostics) = Client::start(
+        let (client, mut diagnostics, _schema) = Client::start(
             CONN,
             "SELECT * FROM feature_flags;\nSELECT * FROM no_such_table_xyz;\n",
             CaseStyle::Lower,
@@ -1201,7 +1438,7 @@ mod tests {
         trace_to_stderr();
 
         let text = "SELECT * FROM o";
-        let (client, _diagnostics) =
+        let (client, _diagnostics, _schema) =
             Client::start(CONN, text, CaseStyle::Lower, CaseStyle::Lower).expect("client starts");
 
         let (reply, reply_rx) = futures::channel::oneshot::channel();
@@ -1236,7 +1473,7 @@ mod tests {
 
         trace_to_stderr();
 
-        let (client, mut diagnostics) =
+        let (client, mut diagnostics, _schema) =
             Client::start(CONN, "SELECT * FROM o", CaseStyle::Upper, CaseStyle::Upper)
                 .expect("client starts");
 

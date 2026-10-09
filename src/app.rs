@@ -1480,6 +1480,10 @@ pub struct PgGuiApp {
     base_mono_font_size: Pixels,
     save_generation: usize,
     lsp: Option<lsp::Client>,
+    /// What the language server's schema cache is doing, as the worker last
+    /// reported it. Only meaningful while `lsp` is set, and reset with every
+    /// (re)start, since each client loads its own.
+    lsp_schema: lsp::SchemaStatus,
     /// Symbols already resolved for Go to Definition. Lives here, not in the
     /// per-editor provider, so every tab shares one cache and a reconnect or
     /// a browser refresh can drop it in one place.
@@ -1712,6 +1716,7 @@ impl PgGuiApp {
             base_mono_font_size: cx.theme().mono_font_size,
             save_generation: 0,
             lsp: None,
+            lsp_schema: lsp::SchemaStatus::Loading,
             definition_cache: definitions::Cache::default(),
             connections,
             #[cfg(not(target_os = "macos"))]
@@ -3122,7 +3127,9 @@ impl PgGuiApp {
                 })
                 .await;
             this.update(cx, |this, cx| match result {
-                Ok((client, diagnostics)) => this.attach_lsp(client, diagnostics, cx),
+                Ok((client, diagnostics, schema)) => {
+                    this.attach_lsp(client, diagnostics, schema, cx);
+                }
                 Err(err) => this.set_status(format!("SQL language server unavailable: {err}"), cx),
             })
             .ok();
@@ -3134,6 +3141,7 @@ impl PgGuiApp {
         &mut self,
         client: lsp::Client,
         mut diagnostics: lsp::DiagnosticsReceiver,
+        mut schema: lsp::SchemaStatusReceiver,
         cx: &mut Context<Self>,
     ) {
         // The settings the server reads at startup changed while it was
@@ -3152,7 +3160,27 @@ impl PgGuiApp {
         // Resync whatever was typed while the server was starting.
         client.document_changed(self.editor().read(cx).value().to_string());
         self.lsp = Some(client);
+        self.lsp_schema = lsp::SchemaStatus::Loading;
         self.set_status("SQL language server connected", cx);
+
+        // Whether completions are schema-aware is the difference between a
+        // working editor and one offering keywords only, and the server says
+        // nothing about it; the status bar reports what the probe finds.
+        cx.spawn(async move |this, cx| {
+            while let Some(status) = schema.next().await {
+                let updated = this.update(cx, |this, cx| {
+                    this.lsp_schema = status;
+                    if status == lsp::SchemaStatus::Loaded {
+                        this.set_status("SQL language server schema loaded", cx);
+                    }
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
 
         cx.spawn(async move |this, cx| {
             while let Some(diagnostics) = diagnostics.next().await {
@@ -6383,7 +6411,7 @@ impl PgGuiApp {
                     "AI off — set ai_api_key or ANTHROPIC_API_KEY"
                 },
                 if self.lsp.is_some() {
-                    "SQL LSP connected"
+                    self.lsp_schema.label()
                 } else {
                     "SQL LSP offline"
                 },
