@@ -28,7 +28,7 @@ futures = "0.3.34"
 # workspace uses (it asks for 0.3.1, we set the floor at the 0.3.4 both land
 # on) so a single gpui resolves for the whole graph;
 # tree-sitter still lands on 0.26, in lockstep with the pgls fork's
-# `bump_treesitter` branch.
+# `pg_gui_2` branch.
 gpui = { package = "gpui-pre", version = "0.3.5" }
 # gpui split the platform out into its own crate; `gpui_platform::application()`
 # replaces the old `Application::new()`. Features match gpui-kit's own.
@@ -58,13 +58,13 @@ lsp-types = "0.97"
 # The Postgres Language Server, embedded as a library (was: spawned
 # `postgrestools lsp-proxy` binary). Points at a fork so a modified server can
 # be used. `pgls_workspace` enables its `db` feature by default.
-pgls_analyse = { git = "https://github.com/gintsgints/postgres-language-server", branch = "bump_treesitter" }
-pgls_completions = { git = "https://github.com/gintsgints/postgres-language-server", branch = "bump_treesitter" }
-pgls_configuration = { git = "https://github.com/gintsgints/postgres-language-server", branch = "bump_treesitter" }
-pgls_diagnostics = { git = "https://github.com/gintsgints/postgres-language-server", branch = "bump_treesitter" }
-pgls_fs = { git = "https://github.com/gintsgints/postgres-language-server", branch = "bump_treesitter" }
-pgls_text_size = { git = "https://github.com/gintsgints/postgres-language-server", branch = "bump_treesitter" }
-pgls_workspace = { git = "https://github.com/gintsgints/postgres-language-server", branch = "bump_treesitter" }
+pgls_analyse = { git = "https://github.com/gintsgints/postgres-language-server", branch = "pg_gui_2" }
+pgls_completions = { git = "https://github.com/gintsgints/postgres-language-server", branch = "pg_gui_2" }
+pgls_configuration = { git = "https://github.com/gintsgints/postgres-language-server", branch = "pg_gui_2" }
+pgls_diagnostics = { git = "https://github.com/gintsgints/postgres-language-server", branch = "pg_gui_2" }
+pgls_fs = { git = "https://github.com/gintsgints/postgres-language-server", branch = "pg_gui_2" }
+pgls_text_size = { git = "https://github.com/gintsgints/postgres-language-server", branch = "pg_gui_2" }
+pgls_workspace = { git = "https://github.com/gintsgints/postgres-language-server", branch = "pg_gui_2" }
 # PL/pgSQL step debugger over EnterpriseDB's pldebugger (`pldbg_*` proxy API),
 # embedded as a library (its `debugger::DebugSession`) rather than spawned as a
 # DAP server binary — same "library not binary" approach as the pgls fork above.
