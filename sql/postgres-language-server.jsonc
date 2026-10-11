@@ -1,5 +1,5 @@
 {
-  "$schema": "https://pgtools.dev/latest/schema.json",
+  "$schema": "https://pg-language-server.com/latest/schema.json",
   "db": {
     "host": "127.0.0.1",
     "port": 5433,
@@ -7,7 +7,13 @@
     "password": "pgui",
     "database": "pgui_test",
     "connTimeoutSecs": 10,
-    "allowStatementExecutionsAgainst": ["127.0.0.1/*", "localhost/*"],
+    "allowStatementExecutionsAgainst": ["127.0.0.1/*", "localhost/*"]
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true
+    }
   },
   "format": {
     "enabled": true,
@@ -16,6 +22,6 @@
     "indentStyle": "spaces",
     "keywordCase": "upper",
     "constantCase": "upper",
-    "typeCase": "upper",
-  },
+    "typeCase": "upper"
+  }
 }

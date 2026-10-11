@@ -11,3 +11,5 @@ SELECT * FROM customers;
 SELECT * FROM orders;
 
 SELECT pg_sleep(30);
+
+select * from orders;
