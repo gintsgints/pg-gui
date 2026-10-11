@@ -27,6 +27,7 @@ use gpui_component::{
         RopeExt as _, TabSize,
     },
     list::{List, ListEvent, ListItem, ListState},
+    menu::{PopupMenu, PopupMenuItem},
     resizable::{ResizableState, h_resizable, resizable_panel, v_resizable},
     searchable_list::{SearchableListItem, SearchableVec},
     spinner::Spinner,
@@ -55,6 +56,10 @@ use crate::{
 
 /// The project's GitHub page, opened from the About application menu.
 const REPO_URL: &str = "https://github.com/gintsgints/pg-gui";
+
+/// A dialog's confirm action, shared by its primary button and the dialog's
+/// own Enter binding; returns whether the dialog may close.
+type DialogConfirm = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
 
 const ZOOM_STEP: f32 = 0.1;
 const ZOOM_MIN: f32 = 0.5;
@@ -3741,18 +3746,26 @@ impl PgGuiApp {
     /// the path relative to the working folder — what the panel shows —
     /// since the absolute path is mostly noise in a log line.
     fn selected_script_batch(&self) -> Vec<(String, PathBuf)> {
-        let root = self.config.working_dir.as_ref();
         self.selected_script_paths()
             .into_iter()
             .map(|path| {
-                let label = root
-                    .and_then(|root| path.strip_prefix(root).ok())
-                    .unwrap_or(path.as_path())
-                    .display()
-                    .to_string();
+                let label = self.script_label(&path);
                 (label, path)
             })
             .collect()
+    }
+
+    /// How a script is named in a log line and in the run confirmation: its
+    /// path relative to the working folder — what the panel shows — since
+    /// the absolute path is mostly noise.
+    fn script_label(&self, path: &Path) -> String {
+        self.config
+            .working_dir
+            .as_deref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path)
+            .display()
+            .to_string()
     }
 
     /// A batch reads its scripts from disk, so a tab still holding unsaved
@@ -3797,6 +3810,21 @@ impl PgGuiApp {
             return;
         }
         self.prompt_run_scripts(files, window, cx);
+    }
+
+    /// Run one script picked from the files panel's context menu. Goes
+    /// through the same confirmation as a batch: it is still a file the user
+    /// is not necessarily looking at, run against whatever connection the
+    /// window happens to be on.
+    fn run_one_script(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        if tab.running {
+            return;
+        }
+        let label = self.script_label(&path);
+        self.prompt_run_scripts(vec![(label, path)], window, cx);
     }
 
     /// The name the current connection goes by in the UI — its saved name,
@@ -5713,6 +5741,233 @@ impl PgGuiApp {
         .detach();
     }
 
+    /// Rename the file or folder the files panel's context menu was opened
+    /// on. Asked with an in-app dialog rather than the platform's save
+    /// panel: a rename is a new *name* in the same folder, which that panel
+    /// cannot express (it offers a location too).
+    fn prompt_rename_path(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let Some(current) = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+        else {
+            return;
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
+        // Deferred, so it lands after `open_dialog` below: opening a dialog
+        // focuses the dialog's own handle, which would take the focus
+        // straight back off the input. The name starts selected, so typing
+        // replaces it.
+        cx.defer_in(window, {
+            let input = input.clone();
+            move |_, window, cx| {
+                input.update(cx, |state, cx| {
+                    state.focus(window, cx);
+                    state.select_all(window, cx);
+                });
+            }
+        });
+        let app = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let input = input.clone();
+            // Shared by the Rename button and the dialog's own Enter
+            // binding; reports whether the dialog may close.
+            let confirm: DialogConfirm = {
+                let (app, input, path) = (app.clone(), input.clone(), path.clone());
+                Rc::new(move |window: &mut Window, cx: &mut App| {
+                    let name = input.read(cx).value().trim().to_string();
+                    if name.is_empty() {
+                        return false;
+                    }
+                    let path = path.clone();
+                    app.update(cx, |this, cx| this.rename_path(&path, &name, window, cx))
+                        .ok();
+                    true
+                })
+            };
+            let ok = confirm.clone();
+            dialog
+                .title("Rename")
+                .w(px(420.))
+                .on_ok(move |_, window, cx| ok(window, cx))
+                .child(
+                    v_flex().gap_4().pb_2().child(Input::new(&input)).child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(Button::new("cancel").label("Cancel").on_click(
+                                |_, window, cx| {
+                                    window.close_dialog(cx);
+                                },
+                            ))
+                            .child(Button::new("rename").primary().label("Rename").on_click(
+                                move |_, window, cx| {
+                                    if confirm(window, cx) {
+                                        window.close_dialog(cx);
+                                    }
+                                },
+                            )),
+                    ),
+                )
+        });
+    }
+
+    /// Apply a confirmed rename. The name is taken as a plain file name in
+    /// the same folder — a path would move the entry, which the dialog does
+    /// not offer — and a file is forced to `.sql`, like
+    /// [`Self::new_script_in`], since those are the only ones the panel
+    /// opens and runs. An existing entry is never clobbered.
+    fn rename_path(
+        &mut self,
+        from: &Path,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = Path::new(name);
+        let mut parts = name.components();
+        if !matches!(parts.next(), Some(std::path::Component::Normal(_))) || parts.next().is_some()
+        {
+            self.set_status("Enter a name, not a path", cx);
+            return;
+        }
+        let Some(parent) = from.parent() else {
+            return;
+        };
+        let mut to = parent.join(name);
+        if from.is_file() && !file_tree::is_sql(&to) {
+            to.set_extension("sql");
+        }
+        if to == from {
+            return;
+        }
+        if to.exists() {
+            self.set_status(format!("{} already exists", to.display()), cx);
+            return;
+        }
+        if let Err(err) = std::fs::rename(from, &to) {
+            self.set_status(format!("Rename failed: {err}"), cx);
+            return;
+        }
+        // Tabs on the renamed file — or on anything under a renamed folder —
+        // follow it, so saving still writes the file the panel now shows.
+        for ix in 0..self.tabs.len() {
+            let Some(open) = self.tabs[ix].path.clone() else {
+                continue;
+            };
+            if let Ok(rest) = open.strip_prefix(from) {
+                self.set_tab_path(ix, to.join(rest), window);
+            }
+        }
+        // The panel re-scans on a timer; show the new name now.
+        self.tree_signature = 0;
+        self.load_tree(cx);
+        self.save_config();
+        self.set_status(format!("Renamed to {}", to.display()), cx);
+    }
+
+    /// Confirm before deleting: there is no undo and nothing goes to a
+    /// trash can, so the dialog names what goes.
+    fn prompt_delete_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let what = if path.is_dir() { "folder" } else { "file" };
+        let label = self.script_label(&path);
+        let app = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (app, path) = (app.clone(), path.clone());
+            let delete: DialogConfirm = {
+                let (app, path) = (app.clone(), path.clone());
+                Rc::new(move |window: &mut Window, cx: &mut App| {
+                    let path = path.clone();
+                    app.update(cx, |this, cx| this.delete_path(&path, window, cx))
+                        .ok();
+                    true
+                })
+            };
+            let ok = delete.clone();
+            dialog
+                .title(format!("Delete {what}"))
+                .w(px(420.))
+                // Enter deletes, Escape cancels (the dialog's own binding).
+                .on_ok(move |_, window, cx| ok(window, cx))
+                .child(
+                    v_flex()
+                        .gap_4()
+                        .pb_2()
+                        .child(div().text_sm().child(format!(
+                            "Delete {what} \u{201c}{label}\u{201d} permanently?"
+                        )))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(Button::new("cancel").label("Cancel").on_click(
+                                    |_, window, cx| {
+                                        window.close_dialog(cx);
+                                    },
+                                ))
+                                .child(Button::new("delete").danger().label("Delete").on_click(
+                                    move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        delete(window, cx);
+                                    },
+                                )),
+                        ),
+                )
+        });
+    }
+
+    /// Delete a confirmed file, or an *empty* folder — a recursive delete
+    /// from a one-click menu would take a whole tree with no undo, so a
+    /// folder with anything in it is refused rather than emptied.
+    fn delete_path(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let is_dir = path.is_dir();
+        if is_dir
+            && std::fs::read_dir(path)
+                .ok()
+                .and_then(|mut dir| dir.next())
+                .is_some()
+        {
+            self.set_status(format!("{} is not empty", path.display()), cx);
+            return;
+        }
+        let removed = if is_dir {
+            std::fs::remove_dir(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        if let Err(err) = removed {
+            self.set_status(format!("Delete failed: {err}"), cx);
+            return;
+        }
+        // A tab on a deleted file keeps its text but loses its file: saving
+        // it again would silently re-create what was just deleted, so it
+        // goes back to being untitled. Nothing is lost — an untitled
+        // buffer is persisted in config.json.
+        for ix in 0..self.tabs.len() {
+            let Some(open) = self.tabs[ix].path.clone() else {
+                continue;
+            };
+            if open.strip_prefix(path).is_err() {
+                continue;
+            }
+            self.config.tabs[ix].file = None;
+            self.tabs[ix].path = None;
+            self.tabs[ix].disk_time = None;
+            self.tabs[ix].diverged = false;
+            self.refresh_dirty(ix, cx);
+        }
+        self.update_window_title(window);
+        self.tree_signature = 0;
+        self.load_tree(cx);
+        self.save_config();
+        self.set_status(format!("Deleted {}", path.display()), cx);
+    }
+
     /// Pick the working directory shown in the files side panel.
     pub fn open_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
         let dialog = rfd::AsyncFileDialog::new()
@@ -6821,6 +7076,77 @@ impl PgGuiApp {
         )
     }
 
+    /// The files panel's right-click menu, built per row. `batch` is set
+    /// when the row is part of a multi-row selection, in which case Run
+    /// takes the whole selection rather than just this file — right-clicking
+    /// inside a selection to run one of its files would be a surprise.
+    ///
+    /// The tree builds this with a [`Context<TreeState>`], so the app is
+    /// reached through its own entity rather than through `cx`.
+    fn file_row_menu(
+        view: &Entity<Self>,
+        id: &SharedString,
+        is_dir: bool,
+        batch: Option<usize>,
+        menu: PopupMenu,
+    ) -> PopupMenu {
+        let path = PathBuf::from(id.to_string());
+        // "New Script" lands inside a folder row, and beside a file row.
+        let dir = if is_dir {
+            path.clone()
+        } else {
+            path.parent()
+                .map_or_else(|| path.clone(), Path::to_path_buf)
+        };
+        let menu = if is_dir {
+            menu
+        } else {
+            let (open, run) = (view.clone(), view.clone());
+            let (open_path, run_path) = (path.clone(), path.clone());
+            let run_label = match batch {
+                Some(count) => format!("Run {count} Selected Scripts"),
+                None => "Run Script".to_string(),
+            };
+            menu.item(PopupMenuItem::new("Open").on_click(move |_, window, cx| {
+                let path = open_path.clone();
+                open.update(cx, |this, cx| this.open_path(&path, window, cx));
+            }))
+            .item(
+                PopupMenuItem::new(run_label).on_click(move |_, window, cx| {
+                    let path = run_path.clone();
+                    run.update(cx, |this, cx| {
+                        if batch.is_some() {
+                            this.run_scripts(&RunScripts, window, cx);
+                        } else {
+                            this.run_one_script(path, window, cx);
+                        }
+                    });
+                }),
+            )
+            .separator()
+        };
+        let (new, rename, delete) = (view.clone(), view.clone(), view.clone());
+        let (rename_path, delete_path) = (path.clone(), path);
+        menu.item(
+            PopupMenuItem::new("New Script\u{2026}").on_click(move |_, window, cx| {
+                let dir = dir.clone();
+                new.update(cx, |_, cx| Self::new_script_in(&dir, window, cx));
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Rename\u{2026}").on_click(move |_, window, cx| {
+                let path = rename_path.clone();
+                rename.update(cx, |_, cx| Self::prompt_rename_path(path, window, cx));
+            }),
+        )
+        .item(
+            PopupMenuItem::new("Delete\u{2026}").on_click(move |_, window, cx| {
+                let path = delete_path.clone();
+                delete.update(cx, |this, cx| this.prompt_delete_path(path, window, cx));
+            }),
+        )
+    }
+
     /// The files panel's title row: the working folder's name, and the "+"
     /// that creates a script directly inside it — the root has no row of
     /// its own in the tree, where every other folder carries its own.
@@ -6892,10 +7218,8 @@ impl PgGuiApp {
             || root.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
-        let dirs = self.tree_dirs.clone();
-        let selected: Rc<HashSet<SharedString>> = Rc::new(self.selected_scripts.clone());
-        let picked = selected.len();
-        let view = cx.entity();
+        let picked = self.selected_scripts.len();
+        let files_tree = self.render_files_tree(cx);
         v_flex()
             .size_full()
             .child(Self::render_files_header(root, folder_name, cx))
@@ -6911,77 +7235,95 @@ impl PgGuiApp {
             .when(picked > 1, |this| {
                 this.child(Self::render_script_run_bar(picked, cx))
             })
-            .child(div().flex_1().min_h(px(0.)).px_1().child(tree(
-                &self.tree_state,
-                move |ix, entry, _selected, _window, cx| {
-                    view.update(cx, |_, cx| {
-                        let item = entry.item();
-                        // The tree's own `is_folder()` is children-based
-                        // and misses empty directories.
-                        let is_dir = entry.is_folder() || dirs.contains(&item.id);
-                        // A text glyph, like the object browser's rows.
-                        let glyph = if !is_dir {
-                            ""
-                        } else if entry.is_expanded() {
-                            "▾"
-                        } else {
-                            "▸"
-                        };
-                        // The tree owns its own single selection (and
-                        // overwrites `ListItem::selected` after this
-                        // closure returns), so a picked script is marked
-                        // with its own background instead.
-                        let is_picked = selected.contains(&item.id);
-                        let label_row = h_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .w_4()
-                                    .flex_none()
-                                    .text_center()
-                                    // See the database tree: muted is too dim
-                                    // for a single arrow glyph on dark.
-                                    .text_color(cx.theme().sidebar_foreground)
-                                    .child(glyph),
-                            )
-                            .child(item.label.clone());
-                        let list_item = ListItem::new(ix)
-                            .w_full()
-                            .h(Self::tree_row_height(cx))
-                            .rounded(cx.theme().radius)
-                            .px_2()
-                            .pl(px(14.) * entry.depth() + px(8.))
-                            .when(is_picked, |this| this.bg(cx.theme().accent));
-                        if is_dir {
-                            Self::render_folder_row(list_item, label_row, &item.id, cx)
-                        } else {
-                            // Plain click opens the script and re-anchors;
-                            // shift-click takes the range from the anchor,
-                            // cmd/ctrl-click toggles the one row. Only a
-                            // plain click opens a tab — extending a
-                            // selection shouldn't fill the tab bar.
-                            let id = item.id.clone();
-                            let path = PathBuf::from(item.id.to_string());
-                            list_item
-                                .child(Self::clip_label(label_row.w_full()))
-                                .on_click(cx.listener(
-                                    move |this, event: &ClickEvent, window, cx| {
-                                        let modifiers = event.modifiers();
-                                        if modifiers.shift {
-                                            this.extend_script_selection(&id);
-                                        } else if modifiers.secondary() {
-                                            this.toggle_script(&id);
-                                        } else {
-                                            this.select_script(&id);
-                                            this.open_path(&path, window, cx);
-                                        }
-                                        cx.notify();
-                                    },
-                                ))
-                        }
-                    })
-                },
-            )))
+            .child(div().flex_1().min_h(px(0.)).px_1().child(files_tree))
+    }
+
+    /// The files panel's tree widget: the row renderer plus the per-row
+    /// right-click menu. Split out of [`Self::render_files_panel`] because
+    /// both closures capture, and both are long.
+    fn render_files_tree(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let dirs = self.tree_dirs.clone();
+        let selected: Rc<HashSet<SharedString>> = Rc::new(self.selected_scripts.clone());
+        let view = cx.entity();
+        let (menu_dirs, menu_selected, menu_view) = (dirs.clone(), selected.clone(), view.clone());
+        tree(
+            &self.tree_state,
+            move |ix, entry, _selected, _window, cx| {
+                view.update(cx, |_, cx| {
+                    let item = entry.item();
+                    // The tree's own `is_folder()` is children-based
+                    // and misses empty directories.
+                    let is_dir = entry.is_folder() || dirs.contains(&item.id);
+                    // A text glyph, like the object browser's rows.
+                    let glyph = if !is_dir {
+                        ""
+                    } else if entry.is_expanded() {
+                        "▾"
+                    } else {
+                        "▸"
+                    };
+                    // The tree owns its own single selection (and
+                    // overwrites `ListItem::selected` after this
+                    // closure returns), so a picked script is marked
+                    // with its own background instead.
+                    let is_picked = selected.contains(&item.id);
+                    let label_row = h_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .w_4()
+                                .flex_none()
+                                .text_center()
+                                // See the database tree: muted is too dim
+                                // for a single arrow glyph on dark.
+                                .text_color(cx.theme().sidebar_foreground)
+                                .child(glyph),
+                        )
+                        .child(item.label.clone());
+                    let list_item = ListItem::new(ix)
+                        .w_full()
+                        .h(Self::tree_row_height(cx))
+                        .rounded(cx.theme().radius)
+                        .px_2()
+                        .pl(px(14.) * entry.depth() + px(8.))
+                        .when(is_picked, |this| this.bg(cx.theme().accent));
+                    if is_dir {
+                        Self::render_folder_row(list_item, label_row, &item.id, cx)
+                    } else {
+                        // Plain click opens the script and re-anchors;
+                        // shift-click takes the range from the anchor,
+                        // cmd/ctrl-click toggles the one row. Only a
+                        // plain click opens a tab — extending a
+                        // selection shouldn't fill the tab bar.
+                        let id = item.id.clone();
+                        let path = PathBuf::from(item.id.to_string());
+                        list_item
+                            .child(Self::clip_label(label_row.w_full()))
+                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                let modifiers = event.modifiers();
+                                if modifiers.shift {
+                                    this.extend_script_selection(&id);
+                                } else if modifiers.secondary() {
+                                    this.toggle_script(&id);
+                                } else {
+                                    this.select_script(&id);
+                                    this.open_path(&path, window, cx);
+                                }
+                                cx.notify();
+                            }))
+                    }
+                })
+            },
+        )
+        .context_menu(move |_, entry, menu, _window, _cx| {
+            let id = entry.item().id.clone();
+            // The tree's own `is_folder()` is children-based and misses
+            // empty directories, as in the row renderer above.
+            let is_dir = entry.is_folder() || menu_dirs.contains(&id);
+            let batch = (menu_selected.len() > 1 && menu_selected.contains(&id))
+                .then(|| menu_selected.len());
+            Self::file_row_menu(&menu_view, &id, is_dir, batch, menu)
+        })
     }
 
     /// One tab per open script, with a "×" close button each and a
@@ -7132,7 +7474,15 @@ impl PgGuiApp {
                 .default_value(signature)
         });
         let args = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. 1, 99.50"));
-        sig.update(cx, |state, cx| state.focus(window, cx));
+        // Deferred for the same reason as the rename dialog: `open_dialog`
+        // focuses the dialog itself, so focusing an input before it opens is
+        // immediately undone.
+        cx.defer_in(window, {
+            let sig = sig.clone();
+            move |_, window, cx| {
+                sig.update(cx, |state, cx| state.focus(window, cx));
+            }
+        });
         let stop_on_entry = cx.new(|_| true);
         let app = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, cx| {

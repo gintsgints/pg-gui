@@ -32,6 +32,13 @@ re-scan no longer finds drops out of it.
   [autocommit setting](transactions.md) and any transaction it is holding
   open.
 
+## One script
+
+**Run Script** in a file row's
+[right-click menu](files.md#right-click-menu) runs that one file the same way,
+confirmation included. Inside a multi-row selection the item runs the whole
+selection instead.
+
 ## The confirmation
 
 A batch is the only action that executes files you are not looking at, several

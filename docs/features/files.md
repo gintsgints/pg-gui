@@ -29,5 +29,29 @@ up on their own.
 From there you can also [create scripts in place](new-scripts.md) and
 [run a selection of scripts](run-scripts.md) as a batch.
 
+### Right-click menu
+
+Right-clicking a row opens a context menu:
+
+| Row | Items |
+| --- | --- |
+| A `.sql` file | **Open**, **Run Script**, **New Script…**, **Rename…**, **Delete…** |
+| A folder | **New Script…**, **Rename…**, **Delete…** |
+
+- **Run Script** runs just that file, through the same
+  [confirmation](run-scripts.md#the-confirmation) a batch gets. Right-clicking
+  inside a multi-row selection says **Run N Selected Scripts** instead and
+  runs the whole selection.
+- **New Script…** lands inside a folder row, and beside a file row.
+- **Rename…** asks for a new name in the same folder (not a new location),
+  forces `.sql` on a file, and never overwrites an existing entry. Tabs on the
+  renamed file — or on anything under a renamed folder — follow it.
+- **Delete…** confirms first, and is permanent: nothing goes to a trash can.
+  A folder is deleted only when it is empty. A tab on a deleted file keeps its
+  text but becomes untitled, so saving it again cannot silently re-create the
+  file.
+
+Files that are not `.sql` are greyed out in the panel and have no menu.
+
 Saving may reformat the script first — see
 [format-on-save](language-server.md#formatting), which is on by default.
