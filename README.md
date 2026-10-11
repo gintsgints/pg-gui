@@ -115,28 +115,6 @@ cargo run
 The first build is slow: the embedded language server compiles `libpg_query`
 from source, which needs a working C toolchain and libclang.
 
-The connection and the open editor tabs are remembered between launches:
-both are saved to `~/Library/Application Support/pg-gui/config.json` (the platform
-config directory) as you type — the scripts with a short debounce — and restored on
-the next start, unsaved edits included. Each tab's `.sql` file path is remembered
-too, so `cmd-s` keeps writing to the same file after a restart. The config also
-holds the recent-connections list, the theme, the zoom level, and a few
-options: `format_on_save` (on by default; toggled from the `fmt:` switch in the
-status bar or Edit ▸ Format on Save), `keyword_case` / `constant_case`
-(`"lower"`/`"upper"`, used by the formatter), `autocommit` (the mode new tabs
-start in), `page_size` / `fetch_size` (rows per results page and per server
-fetch), `definition_file_mask` (the `.sql` name pattern a clicked database
-object is opened from, default `*_{object}.sql`), and the AI settings
-(`ai_api_key`, `ai_model`, `ai_prompt`).
-`cmd-,` (Preferences…) opens the file in the system editor.
-A `DATABASE_URL` environment variable, if set, overrides the saved connection
-string for that launch; with neither present the field defaults to
-`postgres://$USER@localhost:5432/postgres`. TLS connections are not supported yet
-(the client connects with `NoTls`).
-
-Only one instance runs at a time (two would race for `config.json`): launching
-the app while it's already open just raises the running window.
-
 ## Logging
 
 The app writes a diagnostics log next to `config.json` —
@@ -237,22 +215,3 @@ or `F1` (Linux) in the app to see this list in a dialog. On Linux, `cmd` is
 | `cmd-0` | Reset zoom |
 | `cmd-h` / `F1` | Show the command help dialog |
 | `cmd-q` | Quit |
-
-## Code layout
-
-- `src/main.rs` — app entry, actions, keybindings, and theme loading
-- `src/app.rs` — main window: menu bar, editor, results table, status bar, dialogs
-- `src/config.rs` — `config.json` load/save (connections, tabs, options)
-- `src/db.rs` — Postgres execution (blocking `postgres` client on a background thread)
-- `src/db_tree.rs` — database object browser model (lazy catalog loading)
-- `src/definitions.rs` — catalog lookup behind Go to Definition
-- `src/debug.rs` — PL/pgSQL debug session driving pldebugger through `pgdap`
-- `src/file_tree.rs` — files panel scanning, filtering and run ordering
-- `src/lsp.rs` — embedded Postgres Language Server (completions, hover, diagnostics, formatting)
-- `src/export.rs` — rendering results for export (CSV via `COPY`, INSERT scripts)
-- `src/plan.rs` — `EXPLAIN (FORMAT JSON)` parsed into the flame graph's frames
-- `src/results.rs` — table delegate rendering the result set
-- `src/statement.rs` — locating the SQL statement under the cursor
-- `src/snippets.rs` — built-in and user snippet library
-- `src/instance.rs` — single-instance lock that raises the running window
-- `src/ai.rs` — Claude Messages API client for completions
