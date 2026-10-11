@@ -921,6 +921,9 @@ fn snippet_items(rope: &Rope, offset: usize) -> Vec<lsp_types::CompletionItem> {
         .map(|suggestion| lsp_types::CompletionItem {
             label: suggestion.name.to_string(),
             kind: Some(lsp_types::CompletionItemKind::SNIPPET),
+            // The menu draws `detail`, not `label_details` (see
+            // [`completion_detail`]); keep both so the kind is visible.
+            detail: Some("Snippet".into()),
             label_details: Some(CompletionItemLabelDetails {
                 description: Some("snippet".into()),
                 detail: None,
@@ -991,9 +994,7 @@ fn completion_to_lsp(
     rope: &Rope,
 ) -> lsp_types::CompletionItem {
     let is_snippet = item.completion_text.as_ref().is_some_and(|c| c.is_snippet);
-    let detail = item
-        .detail
-        .map_or_else(|| format!(" {}", item.kind), |detail| format!(" {detail}"));
+    let detail = completion_detail(&item.kind, item.detail.as_deref(), &item.description);
     let text_edit = item.completion_text.map(|completion| {
         CompletionTextEdit::Edit(TextEdit {
             new_text: completion.text,
@@ -1003,9 +1004,10 @@ fn completion_to_lsp(
     lsp_types::CompletionItem {
         kind: Some(completion_kind(&item.kind)),
         label: item.label,
+        detail: Some(detail.clone()),
         label_details: Some(CompletionItemLabelDetails {
             description: Some(item.description),
-            detail: Some(detail),
+            detail: Some(format!(" {detail}")),
         }),
         preselect: Some(item.preselected),
         sort_text: Some(item.sort_text),
@@ -1016,6 +1018,59 @@ fn completion_to_lsp(
         }),
         text_edit,
         ..lsp_types::CompletionItem::default()
+    }
+}
+
+/// The text the completion menu draws beside the label: what the item *is*
+/// ("Table", "Column", "View", ...) and where it lives. gpui-component's menu
+/// renders only the item's top-level `detail` field and ignores
+/// `label_details`, so the kind has to be in this one string to show up at
+/// all.
+///
+/// The server's own `detail` means different things per kind: on a table it is
+/// the relkind (`View`/`MView`, absent for an ordinary table), which *replaces*
+/// the kind; everywhere else it is extra information (a column's type) that
+/// follows it. `description` — the owning schema, or `schema.table` for a
+/// column — comes last, dropped when it only repeats what is already there
+/// (a schema item describes itself as "Schema").
+fn completion_detail(
+    kind: &PgCompletionItemKind,
+    detail: Option<&str>,
+    description: &str,
+) -> String {
+    let detail = detail.map(str::trim).filter(|text| !text.is_empty());
+    let kind_is_table = matches!(kind, PgCompletionItemKind::Table);
+    let mut parts: Vec<&str> = Vec::with_capacity(3);
+    match detail {
+        Some(detail) if kind_is_table => parts.push(detail),
+        Some(detail) => {
+            parts.push(kind_label(kind));
+            parts.push(detail);
+        }
+        None => parts.push(kind_label(kind)),
+    }
+    let description = description.trim();
+    if !description.is_empty()
+        && !parts
+            .iter()
+            .any(|part| part.eq_ignore_ascii_case(description))
+    {
+        parts.push(description);
+    }
+    parts.join(" \u{b7} ")
+}
+
+/// The server's own name for the kind (its `Display`), as a `&'static str` so
+/// [`completion_detail`] can hold it beside the borrowed server strings.
+fn kind_label(kind: &PgCompletionItemKind) -> &'static str {
+    match kind {
+        PgCompletionItemKind::Table => "Table",
+        PgCompletionItemKind::Function => "Function",
+        PgCompletionItemKind::Column => "Column",
+        PgCompletionItemKind::Schema => "Schema",
+        PgCompletionItemKind::Policy => "Policy",
+        PgCompletionItemKind::Role => "Role",
+        PgCompletionItemKind::Keyword => "Keyword",
     }
 }
 
@@ -1175,8 +1230,9 @@ mod tests {
     use lsp_types::CompletionItem;
 
     use super::{
-        CaseStyle, Client, CompletionOutcome, DocEvent, SchemaStatus, SchemaStatusReceiver,
-        WORKER_STACK, clamp_filter_text, contain_panic, cursor_context, to_text_size,
+        CaseStyle, Client, CompletionOutcome, DocEvent, PgCompletionItemKind, SchemaStatus,
+        SchemaStatusReceiver, WORKER_STACK, clamp_filter_text, completion_detail, contain_panic,
+        cursor_context, to_text_size,
     };
     use pgls_workspace::features::completions::GetCompletionsParams;
     use pgls_workspace::features::on_hover::OnHoverParams;
@@ -1224,6 +1280,35 @@ mod tests {
             filter_text: filter_text.map(ToString::to_string),
             ..CompletionItem::default()
         }
+    }
+
+    #[test]
+    fn completion_detail_names_the_kind_and_where_the_object_lives() {
+        // A plain table: kind, then the schema it is in.
+        assert_eq!(
+            completion_detail(&PgCompletionItemKind::Table, None, "public"),
+            "Table \u{b7} public"
+        );
+        // A view: the server's detail is the relkind and replaces the kind.
+        assert_eq!(
+            completion_detail(&PgCompletionItemKind::Table, Some("View"), "public"),
+            "View \u{b7} public"
+        );
+        // A column: the detail is its type and follows the kind.
+        assert_eq!(
+            completion_detail(&PgCompletionItemKind::Column, Some("text"), "public.orders"),
+            "Column \u{b7} text \u{b7} public.orders"
+        );
+        // A schema describes itself as "Schema": not said twice.
+        assert_eq!(
+            completion_detail(&PgCompletionItemKind::Schema, None, "Schema"),
+            "Schema"
+        );
+        // A keyword has neither detail nor description.
+        assert_eq!(
+            completion_detail(&PgCompletionItemKind::Keyword, None, ""),
+            "Keyword"
+        );
     }
 
     #[test]
