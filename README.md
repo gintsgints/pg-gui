@@ -8,103 +8,42 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
 
 ## Features
 
-- **SQL editor** with tree-sitter syntax highlighting, line numbers, and a monospace theme
-- **Language support** from the embedded
-  [Postgres Language Server](https://github.com/supabase-community/postgres-language-server):
-  schema-aware completions, hover documentation, diagnostics, and script
-  formatting (`cmd-shift-f`), all driven in-process — no external binary
-- **Execute scripts** against any PostgreSQL server (`cmd-enter` or
-  Connection ▸ Run Query); if text is selected in the editor, only the
-  selection runs, otherwise the statement under the cursor (which gets
-  selected so you can see what ran). Multi-statement selections are supported
-  via the simple query protocol, and the last result set is shown in a
-  virtualized table (handles large result sets). A single SELECT runs
-  through a server-side cursor: only the first batch of rows is
-  transferred (`fetch_size` in config.json, default 500) and a Fetch more
-  button under the table pulls the next batch on demand. Columns are sized to
-  their content — the header and the first rows of each — and a result of
-  four columns or fewer stretches to fill the pane instead of leaving an
-  empty strip beside it
-- **Copy from the results grid** (`cmd-c`): click a cell to copy its value, a
-  row header to copy the row (cells joined by tabs), a column header to copy
-  the column (one value per line, the current page only). A SQL NULL copies as
-  the empty string
-- **Message log** (`cmd-3`, the Log switch under the results): one line per
-  statement with its timing, plus the server's own `RAISE NOTICE` /
-  `WARNING` output, which Postgres sends out of band and result sets never
-  carry
-- **Transactions** (Session menu): autocommit is per tab — with it off, Run
-  opens a transaction that Commit or Rollback ends; the current mode seeds new
-  tabs and survives restart. A long-running statement can be stopped with
-  Cancel Query
-- **Export results** to a file (Connection ▸ Export as CSV… / Export as
-  INSERT…): re-runs the selection or the statement at the cursor and writes
-  every row — CSV is produced server-side via `COPY (…) TO STDOUT` so the
-  server does the quoting, INSERT generates a runnable SQL script. The save
-  dialog suggests `<table>_<date>` from the query's `FROM` table
-- **Database object browser** (`cmd-1`): schemas with their tables (each
-  expanding to its `CREATE TABLE` DDL, columns with their type and PK/not
-  null/default markers, indexes, constraints and triggers),
-  views, materialized views, functions, sequences and types, loaded lazily and
-  filterable; the System checkbox adds the catalog schemas. Clicking an object
-  opens its `.sql` file from the working folder when one matches
-  (`definition_file_mask` in config.json) and its definition fetched from the
-  catalog otherwise
-- **Go to Definition**: cmd-click a routine, table or view name in the editor
-  (or right-click ▸ Go to Definition) to open its source the same way the
-  browser does. The lookup is pg-gui's own catalog query, so it works even
-  while the language server is down, and resolves unqualified names the way
-  `search_path` would
-- **Query plan flame graph** (`cmd-e`, or `cmd-shift-e` to run the statement
-  under `EXPLAIN (ANALYZE, BUFFERS)`): the plan is drawn under the editor as a
-  flame graph, each node as wide as its estimated cost — or, with ANALYZE, the
-  time it actually spent across every loop it ran. Hover a frame for its
-  measure and share of the plan, click one to zoom into it, click an ancestor
-  row (or Reset zoom) to come back out. The explain runs on the tab's own
-  session, so with autocommit off an `EXPLAIN (ANALYZE)` of a DML statement is
-  still Rollback's to undo
-- **PL/pgSQL step debugging** (`cmd-shift-d`) through the server's
-  [pldebugger](https://github.com/EnterpriseDB/pldebugger) extension: the launch
-  dialog takes the routine (pre-filled from the statement at the cursor), its
-  arguments and a stop-on-entry toggle. Click the editor's gutter to set
-  breakpoints, then step over / into (`F10` / `F11`),
-  continue (`F5`) or stop (`shift-F5`) while the panel under the editor shows
-  the variables (click one to change its value) and the call stack (click a
-  frame to inspect it); each stop selects the executing line in the editor.
-  Needs `pldbgapi` installed in the database and `plugin_debugger` in the
-  server's `shared_preload_libraries`
-- **Connection manager**: create and edit connections in a per-field dialog
-  with an inline Test Connection check, give them names, and switch between
-  them from the combobox in the title bar or the Connection ▸ Recent menu
-- **Open / save** `.sql` files with native file dialogs (`cmd-o` / `cmd-s`)
-  that start in the last used directory,
-  each open script in its own editor tab; a tab with unsaved edits is marked
-  with a `•` and prompts to save before it's closed (and before quitting),
-  and an open script that changes on disk offers to reload
-- **Snippets** (`cmd-p`): a searchable picker of built-in queries — including
-  `New:` templates for tables, views, triggers, sequences and more — extendable
-  with your own `.sql` files in the config directory's `snippets/` folder.
-  Snippets can carry numbered tab stops (`$1`, `${2:placeholder}`); after
-  inserting, `tab` visits each stop in order with its placeholder selected.
-  Snippets also appear in the editor's completion menu: type words of the
-  name or the SQL's leading words ("create seq…") and accept the suggestion
-- **New scripts in place**: the "+" on the files panel's title row creates a
-  script in the working folder, and the one that appears on a folder row when
-  you hover it creates one inside that folder; the file opens in a tab as soon
-  as it is made
-- **Run scripts from the files panel** (`cmd-shift-enter` or Connection ▸ Run
-  Selected Scripts): click a `.sql` file, shift-click another to take the
-  range, cmd-click to add or drop one, then run them all against the current
-  connection. They run in the order the tree lists them (which for
-  timestamp-named migration files is the order they were written), each file
-  headed by its own line in the message log, and the batch stops at the first
-  file that fails — the same rule as `psql -v ON_ERROR_STOP=1`. The run uses
-  the active tab's session, so it sees that tab's autocommit setting and any
-  transaction it is holding open
-- **Themes**: Catppuccin Mocha (dark) and Latte (light), switchable from
-  View ▸ Theme (light / dark / follow the system)
-- **AI completion** (optional): completes the SQL at the cursor using the Claude API
-  (`cmd-i` or `ctrl-space`)
+- **[SQL editor](docs/features/sql-editor.md)** — tree-sitter highlighting,
+  line numbers, find and replace
+- **[Language support](docs/features/language-server.md)** — completions,
+  hover, diagnostics and formatting from the embedded Postgres Language Server
+- **[Executing scripts](docs/features/running-queries.md)** — `cmd-enter` runs
+  the selection or the statement at the cursor into a virtualized result table
+- **[Copying from the results grid](docs/features/results-copy.md)** — `cmd-c`
+  on a cell, row or column
+- **[Message log](docs/features/message-log.md)** — per-statement timings and
+  the server's own `RAISE NOTICE` output
+- **[Transactions](docs/features/transactions.md)** — per-tab autocommit,
+  Commit / Rollback, Cancel Query
+- **[Exporting results](docs/features/export.md)** — every row as CSV or as a
+  runnable `INSERT` script
+- **[Database object browser](docs/features/object-browser.md)** — `cmd-1` for
+  schemas, tables, views, routines, sequences and types
+- **[Go to Definition](docs/features/go-to-definition.md)** — cmd-click a name
+  in the editor to open its source
+- **[Query plan flame graph](docs/features/query-plan.md)** — `cmd-e`, or
+  `cmd-shift-e` with `EXPLAIN (ANALYZE, BUFFERS)`
+- **[PL/pgSQL step debugging](docs/features/debugging.md)** — `cmd-shift-d`,
+  breakpoints, variables and call stack via pldebugger
+- **[Connection manager](docs/features/connections.md)** — named connections,
+  inline Test Connection, tabs and output parked per connection
+- **[Opening and saving scripts](docs/features/files.md)** — native dialogs,
+  one tab per file, dirty and changed-on-disk prompts
+- **[Snippets](docs/features/snippets.md)** — `cmd-p` picker with tab stops,
+  extendable with your own `.sql` files
+- **[Creating scripts in place](docs/features/new-scripts.md)** — the "+" on
+  the files panel's title row or on a folder
+- **[Running scripts from the files panel](docs/features/run-scripts.md)** —
+  `cmd-shift-enter` for a batch that stops at the first failure
+- **[Themes](docs/features/themes.md)** — Catppuccin Mocha and Latte, or
+  follow the system
+- **[AI completion](docs/features/ai-completion.md)** (optional) — complete
+  the SQL at the cursor with the Claude API
 
 ## Running
 
@@ -171,15 +110,8 @@ export ANTHROPIC_API_KEY=sk-ant-...
 cargo run
 ```
 
-Place the cursor where you want a completion and press `cmd-i`. The model receives the
-text before and after the cursor and inserts the completion at the cursor.
-
-- Default model: `claude-opus-4-8` — override with `ai_model` in `config.json`
-  or the `PG_GUI_AI_MODEL` environment variable (the config wins;
-  e.g. `claude-haiku-4-5` for lower latency).
-- `ai_prompt` in `config.json`, when set, is appended to the system prompt —
-  useful for schema hints or style preferences
-  (e.g. `"Prefer explicit JOINs and snake_case aliases."`).
+Place the cursor where you want a completion and press `cmd-i`. Model and
+prompt settings are in [docs/features/ai-completion.md](docs/features/ai-completion.md).
 
 ## Keybindings
 
