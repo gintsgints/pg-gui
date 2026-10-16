@@ -1860,9 +1860,9 @@ impl PgGuiApp {
         let weak = cx.weak_entity();
         editor.update(cx, |state, _| {
             state.lsp_mut().completion_provider = Some(Rc::new(lsp::SnippetCompletions));
-            // The PL/pgSQL keywords the SQL grammar has no token for, painted
-            // over the tree-sitter result.
-            state.lsp_mut().semantic_tokens_provider = Some(Rc::new(highlight::Keywords));
+            // The PL/pgSQL keywords and `$n` parameters the SQL grammar leaves
+            // uncoloured, painted over the tree-sitter result.
+            state.lsp_mut().semantic_tokens_provider = Some(Rc::new(highlight::Tokens));
             state.lsp_mut().definition_provider =
                 Some(Rc::new(definitions::Provider::new(weak.clone())));
             state.lsp_mut().show_document = Some(Rc::new(move |params, window, cx| {
