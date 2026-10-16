@@ -5670,6 +5670,7 @@ dependencies = [
  "dhat",
  "dirs 7.0.0",
  "futures",
+ "gpui-base",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",

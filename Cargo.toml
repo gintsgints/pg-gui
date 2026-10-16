@@ -52,6 +52,11 @@ gpui-component = { git = "https://github.com/gintsgints/gpui-kit", branch = "my_
 # `IconName::ChevronRight`/`ChevronDown` button in `set_editor_style` and which
 # an app cannot re-style from outside.
 gpui-kit-assets = { git = "https://github.com/gintsgints/gpui-kit", branch = "my_fixes3" }
+# The editing/text engine gpui-component is built on, from the same workspace
+# and revision. Needed directly for `SelectableText` (plain text that joins the
+# window-level drag-select/copy the `Root` layer drives), which gpui-component
+# does not re-export; the Log view renders with it.
+gpui-base = { git = "https://github.com/gintsgints/gpui-kit", branch = "my_fixes3" }
 # Must stay in lockstep with the lsp-types version gpui-component uses,
 # so our provider impls and its editor traits share the same types.
 lsp-types = "0.97"
