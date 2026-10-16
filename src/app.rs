@@ -14,7 +14,7 @@ use gpui::{
     ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
     prelude::FluentBuilder as _, px,
 };
-use gpui_base::{SelectableText, TextSelectionHandle};
+use gpui_base::{SelectableText, TextSelectionHandle, input::DiagnosticSeverity};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, IndexPath, Sizable as _, StyledExt as _, Theme, ThemeMode,
     TitleBar, WindowExt as _,
@@ -47,12 +47,13 @@ use crate::results::ResultsDelegate;
 use crate::{
     AiComplete, CancelQuery, ClearRowSelection, CloseTab, Commit, Connect, CopyCell, DebugContinue,
     DebugStepInto, DebugStepOver, DebugStop, EditConnection, ExplainAnalyze, ExplainPlan,
-    ExportCsv, ExportInserts, FormatScript, NewConnection, NewFile, NextTab, OpenConfig, OpenFile,
-    OpenFolder, OpenGitHub, OpenRecentFolder, OpenSnippets, PrevTab, Quit, RefreshDbTree, Rollback,
-    RunQuery, RunScripts, SaveFile, SelectAllRows, SetTheme, ShowHelp, StartDebug,
-    ToggleAutocommit, ToggleComment, ToggleDbPanel, ToggleFilesPanel, ToggleFormatOnSave,
-    ToggleResultsPanel, ZoomIn, ZoomOut, ZoomReset, ai, config, db, db_tree, debug, definitions,
-    export, file_tree, highlight, lsp, plan, snippets, statement,
+    ExportCsv, ExportInserts, FormatScript, NewConnection, NewFile, NextDiagnostic, NextTab,
+    OpenConfig, OpenFile, OpenFolder, OpenGitHub, OpenRecentFolder, OpenSnippets, PrevDiagnostic,
+    PrevTab, Quit, RefreshDbTree, Rollback, RunQuery, RunScripts, SaveFile, SelectAllRows,
+    SetTheme, ShowHelp, StartDebug, ToggleAutocommit, ToggleComment, ToggleDbPanel,
+    ToggleFilesPanel, ToggleFormatOnSave, ToggleResultsPanel, ZoomIn, ZoomOut, ZoomReset, ai,
+    config, db, db_tree, debug, definitions, export, file_tree, highlight, lsp, plan, snippets,
+    statement,
 };
 
 /// The project's GitHub page, opened from the About application menu.
@@ -93,6 +94,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cmd-i / ctrl-space", "AI-complete SQL at the cursor"),
     ("cmd-shift-f", "Format the script"),
     ("cmd-/", "Comment or uncomment the line / selection"),
+    (
+        "cmd-j / cmd-k",
+        "Next / previous problem (errors first, then warnings)",
+    ),
     ("cmd-f", "Find in the script"),
     ("cmd-r", "Find and replace in the script"),
     ("cmd-p", "Insert a snippet"),
@@ -139,6 +144,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("ctrl-i / ctrl-space", "AI-complete SQL at the cursor"),
     ("ctrl-shift-f", "Format the script"),
     ("ctrl-/", "Comment or uncomment the line / selection"),
+    (
+        "ctrl-j / ctrl-k",
+        "Next / previous problem (errors first, then warnings)",
+    ),
     ("ctrl-f", "Find in the script"),
     ("ctrl-r", "Find and replace in the script"),
     ("ctrl-p", "Insert a snippet"),
@@ -423,6 +432,9 @@ fn build_menus(
                 MenuItem::action("AI Complete", AiComplete),
                 MenuItem::separator(),
                 MenuItem::action("Toggle Comment", ToggleComment),
+                MenuItem::separator(),
+                MenuItem::action("Next Problem", NextDiagnostic),
+                MenuItem::action("Previous Problem", PrevDiagnostic),
             ],
         },
         Menu {
@@ -1181,6 +1193,43 @@ impl ConnectionParts {
         url.push_str(&percent_encode(&self.database));
         url
     }
+}
+
+/// Which diagnostic cmd-j / cmd-k lands on, given each entry's start
+/// offset and whether it is an error, sorted by start the way
+/// `DiagnosticSet` keeps them. Errors come first — while there is any, the
+/// warnings and hints between them are skipped — and the walk wraps around
+/// at either end. The cursor is left on a diagnostic's start, so "after"
+/// and "before" are strict: the next press moves on rather than landing on
+/// the same one again.
+///
+/// Returns the index into `entries`, its 1-based place among the entries
+/// being walked, and how many of those there are.
+fn diagnostic_target(
+    entries: &[(usize, bool)],
+    cursor: usize,
+    forward: bool,
+) -> Option<(usize, usize, usize)> {
+    let errors_only = entries.iter().any(|&(_, is_error)| is_error);
+    let candidates: Vec<(usize, usize)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, is_error))| *is_error || !errors_only)
+        .map(|(ix, (start, _))| (ix, *start))
+        .collect();
+    let place = if forward {
+        candidates
+            .iter()
+            .position(|&(_, start)| start > cursor)
+            .unwrap_or(0)
+    } else {
+        candidates
+            .iter()
+            .rposition(|&(_, start)| start < cursor)
+            .or(candidates.len().checked_sub(1))?
+    };
+    let &(ix, _) = candidates.get(place)?;
+    Some((ix, place + 1, candidates.len()))
 }
 
 /// Toggle `--` line comments on a block of full lines: when every
@@ -6393,6 +6442,61 @@ impl PgGuiApp {
         });
     }
 
+    /// Move the cursor to the next language-server problem (cmd-j).
+    pub fn next_diagnostic(
+        &mut self,
+        _: &NextDiagnostic,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.jump_to_diagnostic(true, window, cx);
+    }
+
+    /// Move the cursor to the previous language-server problem (cmd-k).
+    pub fn prev_diagnostic(
+        &mut self,
+        _: &PrevDiagnostic,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.jump_to_diagnostic(false, window, cx);
+    }
+
+    /// Put the cursor on the start of the problem `diagnostic_target`
+    /// picks and open its popover there. The popover only follows the
+    /// mouse otherwise, and the next mouse move closes it, so the message
+    /// is echoed in the status bar as well.
+    fn jump_to_diagnostic(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let found = self.editor().update(cx, |state, cx| {
+            let entries: Vec<_> = state.diagnostics()?.iter().cloned().collect();
+            let keys: Vec<_> = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.range.start,
+                        entry.severity == DiagnosticSeverity::Error,
+                    )
+                })
+                .collect();
+            let (ix, rank, total) = diagnostic_target(&keys, state.cursor(), forward)?;
+            let is_error = keys[ix].1;
+            let entry = entries[ix].clone();
+            let position = state.text().offset_to_position(entry.range.start);
+            state.set_cursor_position(position, window, cx);
+            let message = entry.message.lines().next().unwrap_or_default().to_string();
+            state.present_diagnostic(entry, cx);
+            Some((is_error, rank, total, message))
+        });
+        let status = match found {
+            Some((is_error, rank, total, message)) => {
+                let kind = if is_error { "Error" } else { "Problem" };
+                format!("{kind} {rank}/{total}: {message}")
+            }
+            None => "No problems in this script".to_string(),
+        };
+        self.set_status(status, cx);
+    }
+
     pub fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
         self.save_active(false, window, cx);
     }
@@ -8209,6 +8313,8 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::format_script))
             .on_action(cx.listener(Self::toggle_format_on_save))
             .on_action(cx.listener(Self::toggle_comment))
+            .on_action(cx.listener(Self::next_diagnostic))
+            .on_action(cx.listener(Self::prev_diagnostic))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::zoom_reset))
@@ -8241,9 +8347,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        MAX_RECENT_CONNECTIONS, MAX_RECENT_FOLDERS, definition_content_rank, dialog_start_dir,
-        ends_with_name_word, find_sql_file, folder_menu_label, format_elapsed, glob_match,
-        mask_credentials, percent_decode, record_recent, record_recent_folder,
+        MAX_RECENT_CONNECTIONS, MAX_RECENT_FOLDERS, definition_content_rank, diagnostic_target,
+        dialog_start_dir, ends_with_name_word, find_sql_file, folder_menu_label, format_elapsed,
+        glob_match, mask_credentials, percent_decode, record_recent, record_recent_folder,
         suggested_name_from_mask, toggle_line_comments,
     };
     use crate::db_tree::NodeKind;
@@ -8903,5 +9009,28 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_mins(1)), "1m 00s");
         assert_eq!(format_elapsed(Duration::from_secs(65)), "1m 05s");
         assert_eq!(format_elapsed(Duration::from_hours(1)), "60m 00s");
+    }
+
+    #[test]
+    fn diagnostic_target_walks_errors_first_and_wraps() {
+        // A warning at 5, errors at 10 and 30, a hint at 20.
+        let entries = [(5, false), (10, true), (20, false), (30, true)];
+        assert_eq!(diagnostic_target(&entries, 0, true), Some((1, 1, 2)));
+        // Strictly after: sitting on an error's start moves on.
+        assert_eq!(diagnostic_target(&entries, 10, true), Some((3, 2, 2)));
+        assert_eq!(diagnostic_target(&entries, 30, true), Some((1, 1, 2)));
+        assert_eq!(diagnostic_target(&entries, 30, false), Some((1, 1, 2)));
+        assert_eq!(diagnostic_target(&entries, 10, false), Some((3, 2, 2)));
+        assert_eq!(diagnostic_target(&entries, 0, false), Some((3, 2, 2)));
+    }
+
+    #[test]
+    fn diagnostic_target_falls_back_to_other_severities() {
+        let entries = [(5, false), (20, false)];
+        assert_eq!(diagnostic_target(&entries, 5, true), Some((1, 2, 2)));
+        assert_eq!(diagnostic_target(&entries, 25, true), Some((0, 1, 2)));
+        assert_eq!(diagnostic_target(&entries, 5, false), Some((1, 2, 2)));
+        assert_eq!(diagnostic_target(&[], 0, true), None);
+        assert_eq!(diagnostic_target(&[], 0, false), None);
     }
 }
