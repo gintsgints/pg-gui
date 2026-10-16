@@ -522,7 +522,7 @@ const BUILTINS: &[(&str, &str)] = &[
     ),
     (
         "Activity: long-running queries",
-        "SELECT pid, usename, state, now() - query_start AS runtime,\n       left(query, 200) AS query\nFROM pg_stat_activity\nWHERE state = 'active'\n  AND now() - query_start > interval '1 minute'\n  AND pid <> pg_backend_pid()\nORDER BY runtime DESC;",
+        "SELECT pid, now() - query_start AS runtime, state, wait_event_type, wait_event,\n       usename, application_name, query\nFROM pg_stat_activity\nWHERE state <> 'idle'\n  AND now() - query_start > interval '5 seconds'\n  AND pid <> pg_backend_pid()\nORDER BY runtime DESC;",
     ),
     (
         "Activity: connections by state",
