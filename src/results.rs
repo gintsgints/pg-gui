@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use gpui::{
-    App, Context, FontId, IntoElement, ParentElement as _, Pixels, Styled as _, Window, div, font,
-    px,
+    App, Context, Div, FontId, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
+    MouseDownEvent, ParentElement as _, Pixels, Stateful, Styled as _, Window, div, font,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _,
@@ -105,6 +106,14 @@ pub struct ResultsDelegate {
     rows: Vec<Vec<Option<String>>>,
     page: usize,
     page_size: usize,
+    /// Rows picked with shift/cmd-click or select-all, as indices into the
+    /// whole result set rather than the page, so a selection can span
+    /// pages. The table itself selects one row or cell at a time; this
+    /// set lives beside that selection and is painted by `render_tr`.
+    selected_rows: BTreeSet<usize>,
+    /// Where a shift-click range starts: the row last clicked without
+    /// shift, as a result-set index.
+    anchor: Option<usize>,
 }
 
 impl ResultsDelegate {
@@ -118,6 +127,8 @@ impl ResultsDelegate {
             rows: Vec::new(),
             page: 0,
             page_size: page_size.max(1),
+            selected_rows: BTreeSet::new(),
+            anchor: None,
         }
     }
 
@@ -136,6 +147,8 @@ impl ResultsDelegate {
             .collect();
         self.rows = rows;
         self.page = 0;
+        self.selected_rows.clear();
+        self.anchor = None;
         self.measure_columns(false, cx);
     }
 
@@ -256,6 +269,75 @@ impl ResultsDelegate {
         self.page * self.page_size
     }
 
+    /// Update the row selection for a left mouse-down on row `row_ix` of
+    /// the current page: shift takes the range from the anchor, cmd/ctrl
+    /// toggles the row, and a plain click drops the selection back to the
+    /// table's own single row/cell and re-anchors.
+    fn click_row(&mut self, row_ix: usize, modifiers: Modifiers) {
+        let row = self.page_start() + row_ix;
+        if row >= self.rows.len() {
+            return;
+        }
+        if modifiers.shift {
+            let anchor = self.anchor.unwrap_or(row);
+            self.selected_rows = (anchor.min(row)..=anchor.max(row)).collect();
+            self.anchor = Some(anchor);
+        } else if modifiers.secondary() {
+            // The plainly clicked row the toggle starts from counts as
+            // picked, as it does in a file list.
+            if self.selected_rows.is_empty()
+                && let Some(anchor) = self.anchor
+            {
+                self.selected_rows.insert(anchor);
+            }
+            if !self.selected_rows.remove(&row) {
+                self.selected_rows.insert(row);
+            }
+            self.anchor = Some(row);
+        } else {
+            self.selected_rows.clear();
+            self.anchor = Some(row);
+        }
+    }
+
+    /// Select every row of the result set, across all pages.
+    pub fn select_all_rows(&mut self) {
+        self.selected_rows = (0..self.rows.len()).collect();
+    }
+
+    /// Drop the multi-row selection. Returns whether there was one.
+    pub fn clear_row_selection(&mut self) -> bool {
+        let had = !self.selected_rows.is_empty();
+        self.selected_rows.clear();
+        had
+    }
+
+    pub fn selected_row_count(&self) -> usize {
+        self.selected_rows.len()
+    }
+
+    /// The selected rows as copy text, in result-set order: one line per
+    /// row, cells joined by tabs (NULL as the empty string, as
+    /// `cell_text` has it). `None` when no rows are selected.
+    pub fn selected_rows_text(&self) -> Option<String> {
+        if self.selected_rows.is_empty() {
+            return None;
+        }
+        Some(
+            self.selected_rows
+                .iter()
+                .filter_map(|&row| self.rows.get(row))
+                .map(|row| {
+                    row.iter()
+                        .map(|value| value.as_deref().unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join("\t")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
     /// The value of a cell on the current page, `None` for a SQL NULL (or a
     /// row/column outside the result set).
     fn cell_value(&self, row_ix: usize, col_ix: usize) -> Option<String> {
@@ -283,6 +365,49 @@ impl TableDelegate for ResultsDelegate {
         self.columns[col_ix].clone()
     }
 
+    /// A click on the header's top-left corner — the row-header column's
+    /// head, left of the columns' viewport — selects every row, as in a
+    /// spreadsheet. The table draws that corner without a click handler of
+    /// its own, so it is found by position on the header row instead.
+    fn render_header(
+        &mut self,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> Stateful<Div> {
+        div().id("header").on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|table, event: &MouseDownEvent, _, cx| {
+                let columns_left = table.horizontal_scroll_handle.bounds().origin.x;
+                if event.position.x < columns_left {
+                    table.delegate_mut().select_all_rows();
+                    cx.notify();
+                }
+            }),
+        )
+    }
+
+    /// Paints rows of the multi-row selection and feeds left mouse-downs
+    /// (which bubble up from the cells and the row header alike) to
+    /// `click_row`, since the table's own click handling ignores modifiers.
+    fn render_tr(
+        &mut self,
+        row_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> Stateful<Div> {
+        let selected = self.selected_rows.contains(&(self.page_start() + row_ix));
+        div()
+            .id(("row", row_ix))
+            .when(selected, |tr| tr.bg(cx.theme().tokens.table_active))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |table, event: &MouseDownEvent, _, cx| {
+                    table.delegate_mut().click_row(row_ix, event.modifiers);
+                    cx.notify();
+                }),
+            )
+    }
+
     fn render_td(
         &mut self,
         row_ix: usize,
@@ -300,5 +425,74 @@ impl TableDelegate for ResultsDelegate {
     /// pasted value is the value itself and never the word "NULL".
     fn cell_text(&self, row_ix: usize, col_ix: usize, _: &App) -> String {
         self.cell_value(row_ix, col_ix).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn delegate(rows: usize, page_size: usize) -> ResultsDelegate {
+        let mut delegate = ResultsDelegate::new(page_size);
+        delegate.rows = (0..rows)
+            .map(|ix| vec![Some(ix.to_string()), None])
+            .collect();
+        delegate
+    }
+
+    fn shift() -> Modifiers {
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        }
+    }
+
+    fn selected(delegate: &ResultsDelegate) -> Vec<usize> {
+        delegate.selected_rows.iter().copied().collect()
+    }
+
+    #[test]
+    fn shift_click_takes_range_from_anchor() {
+        let mut delegate = delegate(10, 100);
+        delegate.click_row(5, Modifiers::default());
+        assert!(selected(&delegate).is_empty());
+        delegate.click_row(2, shift());
+        assert_eq!(selected(&delegate), [2, 3, 4, 5]);
+        delegate.click_row(7, shift());
+        assert_eq!(selected(&delegate), [5, 6, 7]);
+    }
+
+    #[test]
+    fn secondary_click_toggles_and_keeps_anchor_row() {
+        let mut delegate = delegate(10, 100);
+        delegate.click_row(1, Modifiers::default());
+        delegate.click_row(4, Modifiers::secondary_key());
+        assert_eq!(selected(&delegate), [1, 4]);
+        delegate.click_row(1, Modifiers::secondary_key());
+        assert_eq!(selected(&delegate), [4]);
+        delegate.click_row(0, Modifiers::default());
+        assert!(selected(&delegate).is_empty());
+    }
+
+    #[test]
+    fn selection_spans_pages_and_copies_every_row() {
+        let mut delegate = delegate(5, 2);
+        delegate.click_row(1, Modifiers::default());
+        assert!(delegate.next_page());
+        delegate.click_row(1, shift());
+        assert_eq!(selected(&delegate), [1, 2, 3]);
+        // A click past the last row of a short page is ignored.
+        assert!(delegate.next_page());
+        delegate.click_row(1, Modifiers::default());
+        assert_eq!(selected(&delegate), [1, 2, 3]);
+
+        delegate.select_all_rows();
+        assert_eq!(delegate.selected_row_count(), 5);
+        assert_eq!(
+            delegate.selected_rows_text().as_deref(),
+            Some("0\t\n1\t\n2\t\n3\t\n4\t")
+        );
+        assert!(delegate.clear_row_selection());
+        assert_eq!(delegate.selected_rows_text(), None);
     }
 }

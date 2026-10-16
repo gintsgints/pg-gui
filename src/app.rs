@@ -33,7 +33,7 @@ use gpui_component::{
     searchable_list::{SearchableListItem, SearchableVec},
     spinner::Spinner,
     tab::{Tab, TabBar},
-    table::{DataTable, TableDelegate as _, TableState},
+    table::{DataTable, TableDelegate as _, TableSelection, TableState},
     tooltip::Tooltip,
     tree::{TreeEvent, TreeItem, TreeState, tree},
     v_flex,
@@ -45,14 +45,14 @@ use gpui_component::{GlobalState, menu::AppMenuBar};
 
 use crate::results::ResultsDelegate;
 use crate::{
-    AiComplete, CancelQuery, CloseTab, Commit, Connect, CopyCell, DebugContinue, DebugStepInto,
-    DebugStepOver, DebugStop, EditConnection, ExplainAnalyze, ExplainPlan, ExportCsv,
-    ExportInserts, FormatScript, NewConnection, NewFile, NextTab, OpenConfig, OpenFile, OpenFolder,
-    OpenGitHub, OpenRecentFolder, OpenSnippets, PrevTab, Quit, RefreshDbTree, Rollback, RunQuery,
-    RunScripts, SaveFile, SetTheme, ShowHelp, StartDebug, ToggleAutocommit, ToggleComment,
-    ToggleDbPanel, ToggleFilesPanel, ToggleFormatOnSave, ToggleResultsPanel, ZoomIn, ZoomOut,
-    ZoomReset, ai, config, db, db_tree, debug, definitions, export, file_tree, highlight, lsp,
-    plan, snippets, statement,
+    AiComplete, CancelQuery, ClearRowSelection, CloseTab, Commit, Connect, CopyCell, DebugContinue,
+    DebugStepInto, DebugStepOver, DebugStop, EditConnection, ExplainAnalyze, ExplainPlan,
+    ExportCsv, ExportInserts, FormatScript, NewConnection, NewFile, NextTab, OpenConfig, OpenFile,
+    OpenFolder, OpenGitHub, OpenRecentFolder, OpenSnippets, PrevTab, Quit, RefreshDbTree, Rollback,
+    RunQuery, RunScripts, SaveFile, SelectAllRows, SetTheme, ShowHelp, StartDebug,
+    ToggleAutocommit, ToggleComment, ToggleDbPanel, ToggleFilesPanel, ToggleFormatOnSave,
+    ToggleResultsPanel, ZoomIn, ZoomOut, ZoomReset, ai, config, db, db_tree, debug, definitions,
+    export, file_tree, highlight, lsp, plan, snippets, statement,
 };
 
 /// The project's GitHub page, opened from the About application menu.
@@ -103,7 +103,15 @@ const COMMANDS: &[(&str, &str)] = &[
     ("cmd-1", "Show or hide the database browser"),
     ("cmd-b / cmd-2", "Show or hide the files panel"),
     ("cmd-3", "Show or hide the results panel"),
-    ("cmd-c", "Copy the selected result cell, row or column"),
+    ("cmd-c", "Copy the selected result cell, row(s) or column"),
+    (
+        "shift/cmd-click",
+        "Select a range of result rows / toggle one row",
+    ),
+    (
+        "cmd-a",
+        "Select every result row (all pages; or click the grid's top-left corner)",
+    ),
     ("cmd-shift-d", "Start debugging a routine"),
     ("f10 / f11", "Debug: step over / step into"),
     ("f5 / shift-f5", "Debug: continue / stop"),
@@ -141,7 +149,15 @@ const COMMANDS: &[(&str, &str)] = &[
     ("ctrl-1", "Show or hide the database browser"),
     ("ctrl-b / ctrl-2", "Show or hide the files panel"),
     ("ctrl-3", "Show or hide the results panel"),
-    ("ctrl-c", "Copy the selected result cell, row or column"),
+    ("ctrl-c", "Copy the selected result cell, row(s) or column"),
+    (
+        "shift/ctrl-click",
+        "Select a range of result rows / toggle one row",
+    ),
+    (
+        "ctrl-a",
+        "Select every result row (all pages; or click the grid's top-left corner)",
+    ),
     ("ctrl-shift-d", "Start debugging a routine"),
     ("f10 / f11", "Debug: step over / step into"),
     ("f5 / shift-f5", "Debug: continue / stop"),
@@ -5143,16 +5159,20 @@ impl PgGuiApp {
 
     /// Copy the results grid's selection to the clipboard (cmd-c, bound in
     /// the `DataTable` key context so it only fires while the grid has
-    /// focus): a cell as its own text, a row as its cells joined by tabs, a
-    /// column as one value per line. Only the current page is copied, since
-    /// that is what the grid holds row indices for.
+    /// focus): a multi-row selection (shift/cmd-click, cmd-a) as one line
+    /// per row with cells joined by tabs, across every page it spans;
+    /// otherwise a cell as its own text, a row as its cells joined by tabs,
+    /// a column as one value per line. A column copies the current page
+    /// only, since that is what the grid holds row indices for.
     fn copy_cell(&mut self, _: &CopyCell, _: &mut Window, cx: &mut Context<Self>) {
         let text = {
             let table = self.results.read(cx);
             let delegate = table.delegate();
             let cols = delegate.columns_count(cx);
             let rows = delegate.rows_count(cx);
-            if let Some((row_ix, col_ix)) = table.selected_cell() {
+            if let Some(text) = delegate.selected_rows_text() {
+                Some(text)
+            } else if let Some((row_ix, col_ix)) = table.selected_cell() {
                 Some(delegate.cell_text(row_ix, col_ix, cx))
             } else if let Some(row_ix) = table.selected_row() {
                 Some(
@@ -5180,6 +5200,40 @@ impl PgGuiApp {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    /// Select every row of the result set, all pages and every fetched row
+    /// (cmd-a while the grid has focus), for cmd-c to copy.
+    fn select_all_rows(&mut self, _: &SelectAllRows, _: &mut Window, cx: &mut Context<Self>) {
+        self.results.update(cx, |table, cx| {
+            table.delegate_mut().select_all_rows();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Escape in the grid: drop the multi-row selection and the table's own
+    /// row/cell/column selection alike.
+    fn clear_row_selection(
+        &mut self,
+        _: &ClearRowSelection,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cleared = self.results.update(cx, |table, cx| {
+            let had_rows = table.delegate_mut().clear_row_selection();
+            let had_selection = table.selection() != TableSelection::None;
+            if had_selection {
+                table.clear_selection(cx);
+            }
+            cx.notify();
+            had_rows || had_selection
+        });
+        if cleared {
+            cx.notify();
+        } else {
+            cx.propagate();
+        }
     }
 
     /// The results table between the result-set selector (when a run produced
@@ -5210,6 +5264,7 @@ impl PgGuiApp {
                 h_flex()
                     .gap_2()
                     .children(self.render_results_pager(cx))
+                    .children(self.render_row_selection_count(cx))
                     .child(div().flex_1())
                     .children(self.plan_view_button(cx))
                     // The Log switch stays visible so the log is always one
@@ -5446,6 +5501,25 @@ impl PgGuiApp {
                 "plan-view-log",
                 cx,
             ))
+    }
+
+    /// "N rows selected" beside the pager while a multi-row selection is
+    /// up, since it can span pages the grid is not showing.
+    fn render_row_selection_count(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        let count = self.results.read(cx).delegate().selected_row_count();
+        (count > 0).then(|| {
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(if count == 1 {
+                    "1 row selected".to_string()
+                } else {
+                    format!("{count} rows selected")
+                })
+        })
     }
 
     fn render_results_pager(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
@@ -8112,6 +8186,8 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::export_csv))
             .on_action(cx.listener(Self::export_inserts))
             .on_action(cx.listener(Self::copy_cell))
+            .on_action(cx.listener(Self::select_all_rows))
+            .on_action(cx.listener(Self::clear_row_selection))
             .on_action(cx.listener(Self::ai_complete))
             .on_action(cx.listener(Self::new_connection))
             .on_action(cx.listener(Self::edit_connection))
