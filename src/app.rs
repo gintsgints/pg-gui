@@ -9,11 +9,12 @@ use futures::StreamExt as _;
 use gpui::Subscription;
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity,
-    EntityInputHandler as _, Focusable as _, Hsla, InteractiveElement as _, IntoElement, Menu,
-    MenuItem, MouseButton, NoAction, ParentElement as _, Pixels, Render, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
+    EntityInputHandler as _, FocusHandle, Focusable as _, Hsla, InteractiveElement as _,
+    IntoElement, Menu, MenuItem, MouseButton, NoAction, ParentElement as _, Pixels, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
     prelude::FluentBuilder as _, px,
 };
+use gpui_base::{SelectableText, TextSelectionHandle};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, IndexPath, Sizable as _, StyledExt as _, Theme, ThemeMode,
     TitleBar, WindowExt as _,
@@ -1406,6 +1407,13 @@ pub struct PgGuiApp {
     /// Scroll state of the Log view, so a running script's new lines can
     /// follow the bottom (see [`PgGuiApp::log_at_bottom`]).
     log_scroll: ScrollHandle,
+    /// Focus target of the Log view. A drag-select there does not move focus
+    /// by itself, so cmd-c would still reach the editor (whose copy writes
+    /// its own, possibly empty, selection) or the results grid; focusing this
+    /// on mouse-down lets cmd-c reach `Root`'s window-selection copy instead.
+    log_focus: FocusHandle,
+    /// Selection participant the Log view's text registers under.
+    log_selection: TextSelectionHandle,
     /// Split state of the editor/results panels; the editor height is
     /// persisted to the config whenever the divider is dragged.
     resizable_state: Entity<ResizableState>,
@@ -1650,8 +1658,16 @@ impl PgGuiApp {
             .editor
             .update(cx, |state, cx| state.focus(window, cx));
 
+        // The log's selection participant. `SelectableText` alone repaints
+        // only on its own frames, so a drag would show the selection just on
+        // release; refreshing the window on every change makes it follow the
+        // pointer.
+        let log_selection = TextSelectionHandle::new(String::new(), cx);
+        let log_selection_refresh = log_selection.refresh_window_on_change(window, cx);
+
         let weak_this = cx.weak_entity();
         let subscriptions = vec![
+            log_selection_refresh,
             // Flush any debounced (not yet written) changes on quit,
             // and stop the language server.
             cx.on_app_quit(|this, _| {
@@ -1689,6 +1705,8 @@ impl PgGuiApp {
             bottom_view: BottomView::Data,
             log: Vec::new(),
             log_scroll: ScrollHandle::new(),
+            log_focus: cx.focus_handle(),
+            log_selection,
             resizable_state,
             sidebar_state,
             tree_state,
@@ -5227,10 +5245,15 @@ impl PgGuiApp {
                     .child("No messages yet."),
             )
         } else {
-            v_flex()
-                .w_full()
-                .gap_0p5()
-                .children(self.log.iter().cloned().map(|line| div().child(line)))
+            // One run for the whole log rather than one per line: a plain
+            // `div` child takes no part in window selection, and runs sharing
+            // a selection handle each overwrite the others' text, so a drag
+            // across several lines (and its cmd-c) needs them in one element.
+            v_flex().w_full().child(SelectableText::with_handle(
+                "log-text",
+                self.log_selection.clone(),
+                SharedString::from(self.log.join("\n")),
+            ))
         };
         v_flex()
             .size_full()
@@ -5239,6 +5262,11 @@ impl PgGuiApp {
             .child(
                 div()
                     .id("log-view")
+                    .track_focus(&self.log_focus)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| window.focus(&this.log_focus, cx)),
+                    )
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
