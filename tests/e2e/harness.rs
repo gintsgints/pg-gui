@@ -43,6 +43,29 @@ const POLL: Duration = Duration::from_millis(100);
 static SCREEN: Mutex<()> = Mutex::new(());
 static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
 
+/// Width the files panel is pinned to by [`App::launch_with_folder`].
+pub const FILES_PANEL_WIDTH: f64 = 240.;
+/// Where the files panel's widgets sit, in points from the window's top
+/// edge, at 100% zoom. Measured from a capture: the window's own title bar
+/// takes 34, the panel's header row (folder name and "+") follows, then
+/// the filter box, then one tree row per 34.
+const FILES_HEADER_Y: f64 = 50.;
+const FILES_FILTER_Y: f64 = 75.;
+const FILES_FIRST_ROW_Y: f64 = 106.;
+const FILES_ROW_HEIGHT: f64 = 34.;
+
+/// A unique, empty scratch directory for one launch.
+fn scratch_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "pg-gui-e2e-{}-{}",
+        std::process::id(),
+        LAUNCHES.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create e2e config dir");
+    dir
+}
+
 /// A modifier held while a key is typed.
 #[derive(Clone, Copy)]
 pub enum Mod {
@@ -70,6 +93,29 @@ pub fn default_seed() -> Value {
     })
 }
 
+/// A key without a printable character, typed by its macOS virtual key code.
+#[derive(Clone, Copy)]
+pub enum Key {
+    Return,
+    Up,
+}
+
+impl Key {
+    fn code(self) -> u8 {
+        match self {
+            Key::Return => 36,
+            Key::Up => 126,
+        }
+    }
+}
+
+/// Which mouse button a click presses.
+#[derive(Clone, Copy)]
+pub enum Button {
+    Left,
+    Right,
+}
+
 /// A launched pg-gui. Killed on drop; when dropped during a failing test it
 /// first saves a screenshot and keeps its scratch directory (config.json,
 /// app log) for inspection.
@@ -89,13 +135,51 @@ impl App {
     /// config.json, and wait for its main window.
     pub fn launch_with(seed: &Value) -> Self {
         let screen = SCREEN.lock().unwrap_or_else(PoisonError::into_inner);
-        let dir = std::env::temp_dir().join(format!(
-            "pg-gui-e2e-{}-{}",
-            std::process::id(),
-            LAUNCHES.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create e2e config dir");
+        Self::start(screen, scratch_dir(), seed)
+    }
+
+    /// Start the app with the files panel open on a fresh working folder
+    /// holding `files` (paths relative to it, created empty — a path ending
+    /// in `/` is a folder). The database panel is hidden and the files
+    /// panel pinned to [`FILES_PANEL_WIDTH`], so its rows sit where
+    /// [`App::click_files_row`] expects them. The folder lives in the scratch
+    /// directory, kept with it when the test fails.
+    pub fn launch_with_folder(files: &[&str]) -> Self {
+        let screen = SCREEN.lock().unwrap_or_else(PoisonError::into_inner);
+        let dir = scratch_dir();
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).expect("create e2e working folder");
+        for file in files {
+            let path = work.join(file);
+            if file.ends_with('/') {
+                std::fs::create_dir_all(&path).expect("create seeded folder");
+                continue;
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create seeded folder");
+            }
+            std::fs::write(&path, "select 1;\n").expect("write seeded file");
+        }
+        // Canonical, as File ▸ Open Folder stores it: the tree's row ids
+        // (and so the paths tabs open) derive from it.
+        let work = work.canonicalize().expect("canonicalize working folder");
+        let mut seed = default_seed();
+        seed["working_dir"] = Value::from(work.to_str().expect("utf-8 temp path"));
+        seed["files_panel_visible"] = Value::from(true);
+        seed["files_panel_width"] = Value::from(FILES_PANEL_WIDTH);
+        seed["db_panel_visible"] = Value::from(false);
+        Self::start(screen, dir, &seed)
+    }
+
+    /// The working folder [`Self::launch_with_folder`] created.
+    pub fn work_dir(&self) -> PathBuf {
+        self.dir
+            .join("work")
+            .canonicalize()
+            .expect("launched without a working folder")
+    }
+
+    fn start(screen: MutexGuard<'static, ()>, dir: PathBuf, seed: &Value) -> Self {
         std::fs::write(
             dir.join("config.json"),
             serde_json::to_string_pretty(seed).expect("serialize seed"),
@@ -178,6 +262,112 @@ impl App {
         osascript(&format!(
             "tell application \"System Events\" to keystroke {key}{using}"
         ));
+    }
+
+    /// Type `text` into whatever has the keyboard focus.
+    pub fn type_text(&mut self, text: &str) {
+        self.focus();
+        let text = applescript_string(text);
+        osascript(&format!(
+            "tell application \"System Events\" to keystroke {text}"
+        ));
+    }
+
+    /// Press a non-printing key with `mods` held.
+    pub fn press(&mut self, mods: &[Mod], key: Key) {
+        self.focus();
+        let using = if mods.is_empty() {
+            String::new()
+        } else {
+            let mods: Vec<_> = mods.iter().map(|m| m.applescript()).collect();
+            format!(" using {{{}}}", mods.join(", "))
+        };
+        osascript(&format!(
+            "tell application \"System Events\" to key code {}{using}",
+            key.code()
+        ));
+    }
+
+    /// The main window's frame in screen points: `(x, y, width, height)`,
+    /// origin at the top left of the main display.
+    pub fn window_frame(&self) -> (f64, f64, f64, f64) {
+        let process = self.process();
+        let frame = osascript(&format!(
+            "tell application \"System Events\" to tell window \"pg-gui\" of {process}\n\
+             set {{x, y}} to position\n\
+             set {{w, h}} to size\n\
+             return (x as text) & \",\" & (y as text) & \",\" & (w as text) & \",\" & (h as text)\n\
+             end tell"
+        ));
+        let parts: Vec<f64> = frame
+            .split(',')
+            .map(|part| part.trim().parse().expect("window frame number"))
+            .collect();
+        (parts[0], parts[1], parts[2], parts[3])
+    }
+
+    /// Click at `(x, y)` points from the main window's top-left corner.
+    ///
+    /// GPUI draws the whole window itself, so there is nothing to address
+    /// but a position; System Events' own `click at` can only press the
+    /// left button, so the events are posted through `CoreGraphics` from
+    /// JXA. The pointer moves there first, so hover state (a row's hidden
+    /// action, a tooltip) settles before the press.
+    pub fn click_at(&mut self, button: Button, x: f64, y: f64) {
+        self.focus();
+        let (left, top, _, _) = self.window_frame();
+        let (x, y) = (left + x, top + y);
+        let (down, up, which) = match button {
+            Button::Left => (
+                "kCGEventLeftMouseDown",
+                "kCGEventLeftMouseUp",
+                "kCGMouseButtonLeft",
+            ),
+            Button::Right => (
+                "kCGEventRightMouseDown",
+                "kCGEventRightMouseUp",
+                "kCGMouseButtonRight",
+            ),
+        };
+        jxa(&format!(
+            "ObjC.import('CoreGraphics');\n\
+             const at = $.CGPointMake({x}, {y});\n\
+             const post = (type, button) => $.CGEventPost($.kCGHIDEventTap,\n\
+                 $.CGEventCreateMouseEvent($(), type, at, button));\n\
+             post($.kCGEventMouseMoved, $.kCGMouseButtonLeft);\n\
+             delay(0.2);\n\
+             post($.{down}, $.{which});\n\
+             delay(0.05);\n\
+             post($.{up}, $.{which});"
+        ));
+    }
+
+    /// Wait for the app to show a window besides the main one (a save
+    /// panel).
+    pub fn wait_for_extra_window(&mut self, what: &str) {
+        self.wait_for(what, REACT_TIMEOUT, |app| app.window_titles().len() > 1);
+    }
+
+    /// Click the files panel's header "+" (new script in the working
+    /// folder).
+    pub fn click_files_new_script(&mut self) {
+        let (_, _, width, _) = self.window_frame();
+        self.click_at(Button::Left, width - 17., FILES_HEADER_Y);
+    }
+
+    /// Replace the files panel's filter text with `text`.
+    pub fn filter_files(&mut self, text: &str) {
+        let (_, _, width, _) = self.window_frame();
+        self.click_at(Button::Left, width - FILES_PANEL_WIDTH / 2., FILES_FILTER_Y);
+        self.send_keys(&[Mod::Cmd], 'a');
+        self.type_text(text);
+    }
+
+    /// Click the files panel's tree row `row` (0 = top) with `button`.
+    pub fn click_files_row(&mut self, button: Button, row: u32) {
+        let (_, _, width, _) = self.window_frame();
+        let y = FILES_FIRST_ROW_Y + f64::from(row) * FILES_ROW_HEIGHT;
+        self.click_at(button, width - FILES_PANEL_WIDTH / 2., y);
     }
 
     /// Titles of the app's windows.
@@ -339,9 +529,18 @@ fn osascript(script: &str) -> String {
     osascript_result(script).unwrap_or_else(|err| panic!("{err}"))
 }
 
+/// Run a JavaScript for Automation script, panicking on failure.
+fn jxa(script: &str) {
+    run_osascript(&["-l", "JavaScript", "-"], script).unwrap_or_else(|err| panic!("{err}"));
+}
+
 fn osascript_result(script: &str) -> Result<String, String> {
+    run_osascript(&["-"], script)
+}
+
+fn run_osascript(args: &[&str], script: &str) -> Result<String, String> {
     let mut child = Command::new("osascript")
-        .arg("-")
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

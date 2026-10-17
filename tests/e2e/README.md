@@ -22,7 +22,7 @@ the app itself.
   ▸ Accessibility. Without it, every test fails with an `osascript` error that
   includes a hint about this permission. After you grant it, restart the
   terminal app.
-- **Leave the machine alone while the tests run** (about 20 s for the smoke
+- **Leave the machine alone while the tests run** (about 40 s for the full
   set). Keystrokes go to whatever app is frontmost, so if you type or click
   somewhere else, the keystrokes land there.
 
@@ -51,6 +51,10 @@ tests, which is harmless but slower.
 | `new_tab_and_close_tab` | cmd-t adds a tab and makes it active; cmd-w on that blank tab closes it with no prompt. |
 | `panel_shortcuts_toggle_panels` | cmd-1, cmd-2 and cmd-3 each flip the database, files and results panels, and pressing again flips them back. |
 | `format_on_save_menu_toggles_check_mark` | Clicking Edit ▸ Format on Save flips the menu's check mark and the stored `format_on_save` setting. |
+| `files_panel_new_script_from_header` | The files panel's header "+" opens the save panel; the typed name is created in the working folder and opened in the active tab. |
+| `files_panel_filter_finds_nested_script` | Typing in the files filter reduces the tree to a script inside collapsed folders (plus its expanded parents); clicking its row opens it. |
+| `files_panel_rename_from_context_menu` | Filter to one file, right-click ▸ Rename…, type a new name: the file is renamed on disk (`.sql` forced back on), neighbours untouched. |
+| `files_panel_delete_from_context_menu` | Filter to one file, right-click ▸ Delete…, Enter confirms: only that file is removed. |
 
 ## Isolation
 
@@ -100,6 +104,22 @@ traffic-light buttons. The tab bar, editor, status bar and results grid
 - **`config.json`.** The app rewrites it whenever a tab, panel or toggle
   changes, so it shows the state of everything drawn inside the window. Tests
   wait on it with `wait_for_config`.
+- **The file system.** The files-panel scenarios check the working folder
+  itself: what was created, renamed or deleted.
+
+Input inside the window has nothing to address but a position. `click_at`
+posts `CoreGraphics` mouse events from JXA (System Events' `click at` cannot
+right-click), moving the pointer there first so hover state settles. The
+files panel is reached at fixed offsets measured from a capture
+(`FILES_*` constants in `harness.rs`), which only hold because
+`launch_with_folder` hides the database panel, pins the files panel to
+`FILES_PANEL_WIDTH` and keeps the zoom at 100%. To hit a row regardless of
+what else the folder holds, the scenarios filter the tree down first, so the
+target is a known row. In-window menus and dialogs are then driven by
+keyboard: gpui-component's popup menu takes Up/Down/Enter (Up with nothing
+selected wraps to the last item), and its dialogs confirm on Enter. If the
+panel's layout changes, re-measure from a `screenshot` and update the
+constants.
 
 ## Writing a test
 
@@ -127,7 +147,12 @@ Harness API:
 | Call | Purpose |
 |---|---|
 | `App::launch()` / `App::launch_with(&Value)` | Starts the app on a scratch config seeded with `default_seed()` or your own JSON, and waits for the window. |
+| `App::launch_with_folder(&[&str])` | Starts the app with the files panel on a fresh working folder holding those (empty) files; a path ending in `/` is a folder. `work_dir()` returns it. |
 | `send_keys(&[Mod], char)` | Brings the app to the front and types the key with modifiers held. |
+| `type_text(str)`, `press(&[Mod], Key)` | Types text into the focused element; presses a non-printing key (`Key::Return`, `Key::Up`). |
+| `click_at(Button, x, y)` | Left- or right-clicks at points from the window's top-left corner. |
+| `click_files_new_script()`, `filter_files(text)`, `click_files_row(Button, row)` | Files panel: the header "+", the filter box (text replaced), tree row `row` (0 = top). |
+| `wait_for_extra_window(what)` | Waits for a second window, such as a save panel. |
 | `click_menu(menu, item)` | Clicks a menu item. The item matches with or without its check mark. |
 | `menu_checked(menu, item)` | Returns whether the item carries a check mark. |
 | `menu_bar()`, `menu_items(menu)`, `window_titles()` | Return the titles shown by the native UI. |
