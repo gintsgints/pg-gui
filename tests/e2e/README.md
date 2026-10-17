@@ -244,6 +244,25 @@ its first cell; what the grid holds in all, off cmd-a and cmd-c.
 | `log_shows_failed_run_and_copies` | No database needed: a run against the seeded dead connection fails, the panel switches to the log, and a mouse sweep plus cmd-c copies the `Connection refused` line. |
 | `log_shows_server_notices` | A `DO` block raising a notice and a warning returns no rows, so the panel shows the log by itself; both messages are there, in the order raised. |
 
+### `definitions`: Go to Definition (needs a database)
+
+cmd-click on a name in the editor resolves it in the catalog and opens its
+definition: the object's `.sql` file from the working folder when one matches
+`definition_file_mask` (default `*_{object}.sql`), else the definition fetched
+from the server, in a tab. The tab holds `select * from <schema>.orders;`,
+launched through `App::launch_for_results` (or `_prepared`, which also hands
+over the scratch directory for a working folder), so the editor's text starts
+at a fixed offset and `App::cmd_click_text(row, col, dwell)` can point at a
+character: it moves the pointer there with cmd in the event's flags, rests,
+and clicks. The editor only resolves the link on that cmd-hover, through a
+lookup that opens a connection of its own, and nothing outside the window says
+when it has, so each scenario repeats the hover-and-click with `retry_until`.
+
+| Test | What it checks |
+|---|---|
+| `cmd_click_opens_fetched_definition` | With no working folder, cmd-click on `orders` opens a new untitled tab holding its `CREATE TABLE`, beside the script's tab. |
+| `cmd_click_opens_matching_file` | With `tables/01_orders.sql` in the working folder, cmd-click on `orders` opens that file instead. |
+
 ### `explain`: query plans (needs a database)
 
 The flame graph cannot be read from outside the window, so the scenarios
@@ -292,7 +311,7 @@ on with Session ▸ Toggle Autocommit, and the change is confirmed through
 
 ## Database-backed scenarios
 
-The `query`, `db_viewer`, `debugger`, `explain`, `export` and `transactions` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
+The `query`, `db_viewer`, `debugger`, `definitions`, `explain`, `export` and `transactions` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
 or provisions one; it uses a database that already exists. Choose it with
 `PG_GUI_E2E_DATABASE`:
 
@@ -439,6 +458,8 @@ Harness API:
 | `wait_for_extra_window(what)` | Waits for a second window, such as a save panel. |
 | `click_menu(menu, item)` | Clicks a menu item. The item matches with or without its check mark. |
 | `start_debug(stop_on_entry)`, `toggle_breakpoint(row)` | Debugger: start a session on the routine under the cursor; click editor row `row`'s breakpoint dot (a `launch_for_results` layout). |
+| `cmd_click_text(row, col, dwell)` | Editor (a `launch_for_results` layout): hover the character at `row`, `col` with cmd held for `dwell`, then click — Go to Definition. |
+| `App::launch_for_results_prepared(url, script, prepare)` | `launch_for_results` with the scratch directory handed to `prepare` first, to write files the seed points at. |
 | `click_submenu(menu, submenu, item)`, `submenu_items(menu, submenu)`, `submenu_checked(menu, submenu, item)` | Click, list or check an item in a submenu (Connection ▸ Recent, View ▸ Theme); items match with or without their check mark. |
 | `brightness_at(x, y)` | Captures the window and returns the brightness (0 black, 1 white) of the pixel at that point, through `NSBitmapImageRep` in JXA — what GPUI actually painted. |
 | `fill_connection_dialog(name, url)` | In the open New Connection dialog, types the name and connection string and presses Connect. |

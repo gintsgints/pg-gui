@@ -512,20 +512,24 @@ impl App {
         script: &str,
         configure: impl FnOnce(&mut Value),
     ) -> Self {
-        let mut seed = url.map_or_else(
-            || {
-                let mut seed = default_seed();
-                seed["tabs"] = serde_json::json!([{ "script": script, "file": null }]);
-                seed
-            },
-            |url| database_seed(url, script),
-        );
-        seed["db_panel_visible"] = Value::from(false);
-        seed["files_panel_visible"] = Value::from(false);
-        seed["results_panel_visible"] = Value::from(true);
-        seed["editor_height"] = Value::from(EDITOR_HEIGHT);
+        let mut seed = results_seed(url, script);
         configure(&mut seed);
         Self::launch_with(&seed)
+    }
+
+    /// [`Self::launch_for_results_with`] with `prepare` also given the
+    /// scratch directory before launch, to write files there (a working
+    /// folder the seed then points at).
+    pub fn launch_for_results_prepared(
+        url: Option<&str>,
+        script: &str,
+        prepare: impl FnOnce(&Path, &mut Value),
+    ) -> Self {
+        let screen = SCREEN.lock().unwrap_or_else(PoisonError::into_inner);
+        let dir = scratch_dir();
+        let mut seed = results_seed(url, script);
+        prepare(&dir, &mut seed);
+        Self::start(screen, dir, &seed)
     }
 
     /// Click `button` of the results pager, for a launch through
@@ -1027,6 +1031,38 @@ impl App {
         );
     }
 
+    /// Hold cmd over editor text at buffer `row`, column `col` (0-based,
+    /// in characters), wait `dwell` for the editor to resolve what is
+    /// under the pointer, and click there — Go to Definition. For a launch
+    /// through [`Self::launch_for_results`]: the editor's text starts at a
+    /// fixed offset and is monospaced. The pointer moves with cmd already
+    /// in the event's flags, since gpui reads a hover's modifiers from the
+    /// mouse event, and the link only resolves on a cmd-hover.
+    pub fn cmd_click_text(&mut self, row: u32, col: u32, dwell: Duration) {
+        self.focus();
+        let (left, top, _, _) = self.window_frame();
+        let x = left + EDITOR_TEXT_X + EDITOR_CHAR_WIDTH * (f64::from(col) + 0.5);
+        let y = top + EDITOR_FIRST_LINE_Y + EDITOR_LINE_HEIGHT * f64::from(row);
+        let cmd = Mod::Cmd.event_flag();
+        let dwell = dwell.as_secs_f64();
+        jxa(&format!(
+            "ObjC.import('CoreGraphics');\n\
+             const at = $.CGPointMake({x}, {y});\n\
+             const post = (type) => {{\n\
+                 const event = $.CGEventCreateMouseEvent($(), type, at, $.kCGMouseButtonLeft);\n\
+                 $.CGEventSetFlags(event, {cmd});\n\
+                 $.CGEventPost($.kCGHIDEventTap, event);\n\
+             }};\n\
+             post($.kCGEventMouseMoved);\n\
+             delay({dwell});\n\
+             post($.kCGEventMouseMoved);\n\
+             delay(0.1);\n\
+             post($.kCGEventLeftMouseDown);\n\
+             delay(0.05);\n\
+             post($.kCGEventLeftMouseUp);"
+        ));
+    }
+
     /// The config.json the app last wrote (or the seed, before its first
     /// write). A half-written file reads as `Null`; callers poll anyway.
     pub fn config(&self) -> Value {
@@ -1150,6 +1186,11 @@ const STOP_ON_ENTRY_OFFSET: (f64, f64) = (-215., 204.);
 const BREAKPOINT_X: f64 = 22.;
 const EDITOR_FIRST_LINE_Y: f64 = 85.;
 const EDITOR_LINE_HEIGHT: f64 = 20.;
+/// Left edge of the editor's text and the width of one character of its
+/// monospaced font, for the same launch. Measured from a capture at 100%
+/// zoom.
+const EDITOR_TEXT_X: f64 = 76.8;
+const EDITOR_CHAR_WIDTH: f64 = 7.8;
 
 /// A widget of the connection dialog.
 #[derive(Clone, Copy)]
@@ -1170,6 +1211,25 @@ impl ConnectionDialog {
             ConnectionDialog::Connect => (202., 523.),
         }
     }
+}
+
+/// The seed of [`App::launch_for_results`]: `url` (the dead seeded
+/// connection when `None`) with one tab holding `script`, both side panels
+/// hidden and the editor pinned to [`EDITOR_HEIGHT`].
+fn results_seed(url: Option<&str>, script: &str) -> Value {
+    let mut seed = url.map_or_else(
+        || {
+            let mut seed = default_seed();
+            seed["tabs"] = serde_json::json!([{ "script": script, "file": null }]);
+            seed
+        },
+        |url| database_seed(url, script),
+    );
+    seed["db_panel_visible"] = Value::from(false);
+    seed["files_panel_visible"] = Value::from(false);
+    seed["results_panel_visible"] = Value::from(true);
+    seed["editor_height"] = Value::from(EDITOR_HEIGHT);
+    seed
 }
 
 /// Top edge of the results panel's content (inside its padding), in window
