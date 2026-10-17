@@ -20,6 +20,18 @@ Do **not** touch the related forks (gpui-kit `my_fixes3`, pgls `pg_gui_2`, pgdap
 
 pg-gui currently has **no UI end-to-end tests** — coverage is unit tests in `app.rs` and one ignored docker-backed LSP integration test. Because this is a GPUI desktop app with no out-of-process test harness, E2E means driving the running application through the macOS window server and observing its UI state.
 
+### Status (2026-10-17)
+
+First cut landed: `tests/e2e/harness.rs` + `tests/e2e/main.rs`, run with `cargo test --test e2e -- --ignored`. Four smoke scenarios pass: launch (window + menus), cmd-t / cmd-w tab open/close, cmd-1/2/3 panel toggles, Edit ▸ Format on Save check mark — each ending in a clean cmd-q.
+
+Findings that change the plan below:
+
+- **GPUI exposes no AX tree for window content.** The window's only AX children are the traffic-light buttons, so `read_status_bar()` / `read_results_table()` via AXUIElement are not possible without adding accessibility support to gpui (a fork change, out of scope). Observable instead: native menus (check marks appear as a `✓ ` title prefix), window titles, and `config.json` (rewritten on tab/panel/toggle changes) — that file is the state oracle.
+- osascript + System Events covers launch/keys/menus/screenshots with zero new crates; a CGEvent/AX Rust binding is not needed yet.
+- New tab is **cmd-t**, not cmd-n.
+- `PG_GUI_CONFIG_DIR` was added so test launches are isolated from the user's config and running instance.
+- Still open: DB-backed scenarios (results content is not readable from outside — options are screenshot/OCR, or a debug-only state dump the app writes on request), theme switch scenario, CI workflow (needs Accessibility permission granted on the runner, which GitHub-hosted macOS runners do not do for arbitrary binaries out of the box — verify before relying on it).
+
 ### Tooling options (macOS-native)
 
 | Approach | How it works | Pros | Cons |
