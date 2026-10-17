@@ -33,6 +33,7 @@ the app itself.
 ```sh
 cargo test --features e2e --test e2e                          # all scenarios
 cargo test --features e2e --test e2e new_tab_and_close_tab    # one scenario
+cargo test --features e2e --test e2e files_panel::            # one module
 cargo test --features e2e --test e2e -- --nocapture           # show harness output
 cargo test --features e2e --test e2e -- --list                # list scenarios
 PG_GUI_E2E_DATABASE=docker cargo test --features e2e --test e2e   # include database scenarios
@@ -48,21 +49,64 @@ tests, which is harmless but slower.
 
 ## Scenarios
 
+`main.rs` only declares the modules. Each kind of scenario lives in its own
+file, and a test's full name is `module::test`.
+
+### `general`: the app as a whole
+
 | Test | What it checks |
 |---|---|
 | `launches_with_main_window_and_menus` | The window titled `pg-gui` appears, the main menus are present, and cmd-q exits cleanly. |
 | `new_tab_and_close_tab` | cmd-t adds a tab and makes it active; cmd-w on that blank tab closes it with no prompt. |
 | `panel_shortcuts_toggle_panels` | cmd-1, cmd-2 and cmd-3 each flip the database, files and results panels, and pressing again flips them back. |
 | `format_on_save_menu_toggles_check_mark` | Clicking Edit ▸ Format on Save flips the menu's check mark and the stored `format_on_save` setting. |
-| `files_panel_new_script_from_header` | The files panel's header "+" opens the save panel; the typed name is created in the working folder and opened in the active tab. |
-| `files_panel_filter_finds_nested_script` | Typing in the files filter reduces the tree to a script inside collapsed folders (plus its expanded parents); clicking its row opens it. |
-| `files_panel_rename_from_context_menu` | Filter to one file, right-click ▸ Rename…, type a new name: the file is renamed on disk (`.sql` forced back on), neighbours untouched. |
-| `files_panel_delete_from_context_menu` | Filter to one file, right-click ▸ Delete…, Enter confirms: only that file is removed. |
-| `run_query_executes_against_database` | *Database.* A tab holding `create table …`; cmd-enter runs it, and the table appears in the database. The table is dropped afterwards, pass or fail. |
+
+### `files_panel`: scripts in the working folder
+
+| Test | What it checks |
+|---|---|
+| `new_script_from_header` | The files panel's header "+" opens the save panel; the typed name is created in the working folder and opened in the active tab. |
+| `filter_finds_nested_script` | Typing in the files filter reduces the tree to a script inside collapsed folders (plus its expanded parents); clicking its row opens it. |
+| `rename_from_context_menu` | Filter to one file, right-click ▸ Rename…, type a new name: the file is renamed on disk (`.sql` forced back on), neighbours untouched. |
+| `delete_from_context_menu` | Filter to one file, right-click ▸ Delete…, Enter confirms: only that file is removed. |
+
+### `query`: running SQL (needs a database)
+
+| Test | What it checks |
+|---|---|
+| `run_query_executes_against_database` | A tab holding `create table …`; cmd-enter runs it, and the table appears in the database. |
+
+### `db_viewer`: the database panel (needs a database)
+
+Each scenario creates one table (with a primary key), one view and one
+function in its scratch schema. It then walks the panel's tree to one of them
+and clicks it, and checks the definition that opens in the active tab.
+
+| Test | Path in the tree | The tab holds |
+|---|---|---|
+| `opens_table_definition` | schema ▸ Tables ▸ `orders` ▸ definition | `CREATE TABLE` with the column and the primary key. The blank seeded tab is reused, not a second one opened. |
+| `opens_view_definition` | schema ▸ Views ▸ `orders_view` | `CREATE OR REPLACE VIEW "orders_view"`. |
+| `opens_function_definition` | schema ▸ Functions ▸ `answer()` | `CREATE OR REPLACE FUNCTION` with the body. |
+| `opens_index_definition` | schema ▸ Tables ▸ `orders` ▸ Indexes ▸ `orders_pkey` | `CREATE UNIQUE INDEX orders_pkey`. |
+
+The tree cannot be read from outside the window, so rows are addressed by
+position. That works because the scratch schema is always the first row: its
+name, `_e2e_<pid>_<n>`, sorts before every lowercase schema name. A schema
+whose name starts with an upper-case letter or punctuation would sort ahead of
+it and throw the positions off.
+
+A folder loads its objects in the background the first time it is expanded,
+and nothing outside the window shows when that load is done. So each scenario
+repeats one attempt with `retry_until` until the definition shows up. The
+attempt expands every folder on the path, then clicks the object row.
+`expand_db_row` clicks the row and then presses Right, which expands only a
+shut folder, so it is safe to repeat. A click that lands on a loading
+placeholder or on a folder further down cannot move the rows above it, so the
+next attempt still finds them.
 
 ## Database-backed scenarios
 
-Scenarios marked *Database* need a running PostgreSQL. The harness never starts
+The `query` and `db_viewer` scenarios need a running PostgreSQL. The harness never starts
 or provisions one; it uses a database that already exists. Choose it with
 `PG_GUI_E2E_DATABASE`:
 
@@ -82,14 +126,20 @@ PG_GUI_E2E_DATABASE=docker cargo test --features e2e --test e2e
 When the variable is set, an unreachable server fails the scenario instead of
 skipping it, because you asked for those scenarios to run.
 
-The test opens its own connection (`harness::Db`) beside the app to check what
-the app did, since the results grid cannot be read from outside the window.
-`App::launch_with_database(url, script)` starts the app connected to that
-database, saved under the name `e2e`, with one tab holding `script`. Objects a
-scenario creates are named with `harness::unique_name(prefix)`
-(`prefix_<pid>_<n>`) so runs never collide, and are dropped when the scenario
-ends, pass or fail. The scenarios create objects only in the `public` schema
-and never touch the project's own tables.
+Each scenario works in a scratch schema of its own, `harness::Schema`. It
+creates `_e2e_<pid>_<n>` on a connection of the test's own, and drops it with
+`CASCADE` when the scenario ends, pass or fail. Everything the scenario creates
+goes inside that schema, so runs never collide and the project's own objects
+are never touched. Only one scratch schema exists at a time: the
+database scenarios run one after another, and each drops any `_e2e_*` schema
+an interrupted earlier run (ctrl-c) left behind before creating its own. Two
+at once would both be listed in the panel, and the wrong one could take the
+first row. The same connection checks what the app did, since query
+output cannot be read from outside the window.
+`App::launch_with_database(&schema, script)` starts the app connected to that
+database, saved under the name `e2e`, with one tab holding `script`. The
+database panel is shown and pinned to `DB_PANEL_WIDTH`, and the files panel is
+hidden.
 
 ## Isolation
 
@@ -145,10 +195,13 @@ traffic-light buttons. The tab bar, editor, status bar and results grid
 Input inside the window has nothing to address but a position. `click_at`
 posts `CoreGraphics` mouse events from JXA (System Events' `click at` cannot
 right-click), moving the pointer there first so hover state settles. The
-files panel is reached at fixed offsets measured from a capture
-(`FILES_*` constants in `harness.rs`), which only hold because
-`launch_with_folder` hides the database panel, pins the files panel to
-`FILES_PANEL_WIDTH` and keeps the zoom at 100%. To hit a row regardless of
+side panels are reached at fixed offsets measured from a capture of the files
+panel (`PANEL_*` constants in `harness.rs`). The database panel is built the
+same way (header row, small filter box, tree rows of the same height), so it
+uses the same offsets. They only hold because `launch_with_folder` hides the
+database panel and pins the files panel to `FILES_PANEL_WIDTH`,
+`launch_with_database` hides the files panel and pins the database panel to
+`DB_PANEL_WIDTH`, and the zoom stays at 100%. To hit a row regardless of
 what else the folder holds, the scenarios filter the tree down first, so the
 target is a known row. In-window menus and dialogs are then driven by
 keyboard: gpui-component's popup menu takes Up/Down/Enter (Up with nothing
@@ -158,7 +211,8 @@ constants.
 
 ## Writing a test
 
-Add a function to `main.rs`:
+Add a function to the module for its kind, or to a new module declared in
+`main.rs`:
 
 ```rust
 #[test]
@@ -182,8 +236,11 @@ Harness API:
 | Call | Purpose |
 |---|---|
 | `App::launch()` / `App::launch_with(&Value)` | Starts the app on a scratch config seeded with `default_seed()` or your own JSON, and waits for the window. |
-| `App::launch_with_database(url, script)` | Starts the app connected to `url` with one tab holding `script`. Get `url` from `Db::connect`. |
-| `Db::connect(test)` | Returns the test's own database connection and the URL, or `None` (the scenario returns early) when `PG_GUI_E2E_DATABASE` is unset. `execute(sql)`, `table_exists(name)`. |
+| `Schema::create(test)` | Creates the scenario's scratch schema, or returns `None` (the scenario returns early) when `PG_GUI_E2E_DATABASE` is unset. `name()`, `execute(sql)` (`{schema}` is replaced by the name), `table_exists(table)`. Dropped with `CASCADE` on drop. |
+| `App::launch_with_database(&Schema, script)` | Starts the app connected to the schema's database, the database panel showing, with one tab holding `script`. |
+| `click_db_row(Button, row)`, `expand_db_row(row)` | Database panel: click tree row `row` (0 = top); make sure folder row `row` is expanded (safe to repeat). |
+| `retry_until(what, timeout, attempt, pred)` | Repeats `attempt` until `config.json` satisfies `pred`, for steps nothing outside the window reports on. Each attempt must be safe to repeat. |
+| `harness::active_script(&config)` | Returns the active tab's text. |
 | `App::launch_with_folder(&[&str])` | Starts the app with the files panel on a fresh working folder holding those (empty) files; a path ending in `/` is a folder. `work_dir()` returns it. |
 | `send_keys(&[Mod], char)` | Brings the app to the front and types the key with modifiers held. |
 | `type_text(str)`, `press(&[Mod], Key)` | Types text into the focused element; presses a non-printing key (`Key::Return`, `Key::Up`). |
@@ -206,6 +263,8 @@ Guidelines:
   instead of building it up with key presses.
 - **End with `quit()`** when the scenario should also prove a clean exit.
   Otherwise the drop handler kills the process.
+- **Database scenarios start with `Schema::create`** and return when it gives
+  `None`. Create their objects inside the schema, never elsewhere.
 - **Only `Mod::Cmd` exists for now.** When a scenario needs another modifier,
   add the variant and its System Events name in `Mod::applescript`. Clippy
   rejects a variant that nothing uses.

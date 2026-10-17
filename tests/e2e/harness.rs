@@ -46,18 +46,31 @@ const POLL: Duration = Duration::from_millis(100);
 /// GUI tests share one screen, one keyboard focus and one menu bar, so they
 /// must never overlap; every [`App`] holds this for its whole life.
 static SCREEN: Mutex<()> = Mutex::new(());
+/// Held by every [`Schema`] for its whole life, so only one scratch schema
+/// exists at a time. A second one would be listed in the database panel
+/// too, and could sort ahead of the running scenario's (`_e2e_1_10` before
+/// `_e2e_1_4`) and take the first row it addresses. Taken before
+/// [`SCREEN`], and never the other way round.
+static DATABASE: Mutex<()> = Mutex::new(());
 static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
 
 /// Width the files panel is pinned to by [`App::launch_with_folder`].
 pub const FILES_PANEL_WIDTH: f64 = 240.;
-/// Where the files panel's widgets sit, in points from the window's top
-/// edge, at 100% zoom. Measured from a capture: the window's own title bar
-/// takes 34, the panel's header row (folder name and "+") follows, then
-/// the filter box, then one tree row per 34.
-const FILES_HEADER_Y: f64 = 50.;
-const FILES_FILTER_Y: f64 = 75.;
-const FILES_FIRST_ROW_Y: f64 = 106.;
-const FILES_ROW_HEIGHT: f64 = 34.;
+/// Width the database panel is pinned to by [`App::launch_with_database`].
+pub const DB_PANEL_WIDTH: f64 = 260.;
+/// Where a side panel's widgets sit, in points from the window's top edge,
+/// at 100% zoom. Measured from a capture of the files panel: the window's
+/// own title bar takes 34, the panel's header row (folder name and "+")
+/// follows, then the filter box, then one tree row per 34. The database
+/// panel is built the same way (header row, `xsmall` filter, tree of the
+/// same row height), so it shares them.
+const PANEL_HEADER_Y: f64 = 50.;
+const PANEL_FILTER_Y: f64 = 75.;
+const PANEL_FIRST_ROW_Y: f64 = 106.;
+const PANEL_ROW_HEIGHT: f64 = 34.;
+/// How long one attempt of [`App::retry_until`] waits for its condition
+/// before trying again.
+const ATTEMPT_WAIT: Duration = Duration::from_millis(1500);
 
 /// Names the pre-created database the database-backed scenarios run
 /// against: a connection string, or `docker` for the project's own
@@ -82,59 +95,116 @@ pub fn database_url() -> Option<String> {
     }
 }
 
-/// A connection of the test's own to the database [`database_url`] names,
-/// for setting up and checking what a scenario did through the app. Opening
-/// one fails the test outright: the user asked for the database scenarios,
-/// so an unreachable server is an error, not a skip.
-pub struct Db {
+/// A scratch schema a database scenario owns, on a connection of the
+/// test's own to the database [`database_url`] names. Everything the
+/// scenario creates goes inside it, and dropping it drops the schema with
+/// `CASCADE`, pass or fail, so the shared database is left as it was.
+///
+/// Its name, `_e2e_<pid>_<n>`, is unique per run and sorts before every
+/// lowercase schema name (`nspname` compares bytewise), so it is the first
+/// row of the database panel — the one row a scenario can address without
+/// knowing what else the database holds.
+///
+/// Creating one fails the test outright when the server cannot be reached:
+/// the user asked for the database scenarios, so that is an error, not a
+/// skip.
+pub struct Schema {
     client: postgres::Client,
+    name: String,
+    url: String,
+    _database: MutexGuard<'static, ()>,
 }
 
-impl Db {
-    /// Connect, or return `None` (after saying so) when [`DATABASE_ENV`] is
-    /// unset, so the calling scenario can skip.
-    pub fn connect(test: &str) -> Option<(Self, String)> {
+impl Schema {
+    /// Connect and create the schema, or return `None` (after saying so)
+    /// when [`DATABASE_ENV`] is unset, so the calling scenario can skip.
+    pub fn create(test: &str) -> Option<Self> {
         let Some(url) = database_url() else {
             eprintln!("e2e: {test} skipped; set {DATABASE_ENV}=docker (or a URL) to run it");
             return None;
         };
+        let database = DATABASE.lock().unwrap_or_else(PoisonError::into_inner);
         let client = postgres::Client::connect(&url, postgres::NoTls).unwrap_or_else(|err| {
             panic!(
                 "{DATABASE_ENV} is set but the database is unreachable: {err}\n\
                  hint: start the project database with `docker compose up -d`"
             )
         });
-        Some((Self { client }, url))
+        let name = format!(
+            "_e2e_{}_{}",
+            std::process::id(),
+            LAUNCHES.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut schema = Self {
+            client,
+            name,
+            url,
+            _database: database,
+        };
+        schema.drop_leftovers();
+        schema.execute(&format!("create schema {}", schema.name));
+        Some(schema)
     }
 
-    /// Run `sql` (one or more statements), panicking on failure.
+    /// Drop the scratch schemas of earlier runs. A run cut short (ctrl-c, a
+    /// killed process) never reaches [`Drop`], and its schema would sort
+    /// ahead of this one in the database panel.
+    fn drop_leftovers(&mut self) {
+        let leftovers: Vec<String> = self
+            .client
+            .query(
+                "select nspname::text from pg_namespace where nspname like '\\_e2e\\_%'",
+                &[],
+            )
+            .unwrap_or_else(|err| panic!("e2e database: {err}"))
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        for name in leftovers {
+            eprintln!("e2e: dropping leftover schema {name}");
+            self.execute(&format!("drop schema if exists \"{name}\" cascade"));
+        }
+    }
+
+    /// The schema's name, safe to splice into SQL unquoted.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The connection string, for [`App::launch_with_database`].
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Run `sql` (one or more statements), panicking on failure. Every
+    /// `{schema}` in it is replaced by the schema's name.
     pub fn execute(&mut self, sql: &str) {
+        let sql = sql.replace("{schema}", &self.name);
         self.client
-            .batch_execute(sql)
+            .batch_execute(&sql)
             .unwrap_or_else(|err| panic!("e2e database: {err}\nsql: {sql}"));
     }
 
-    /// Whether a table named `name` exists in the `public` schema.
-    pub fn table_exists(&mut self, name: &str) -> bool {
+    /// Whether a table named `table` exists in the schema.
+    pub fn table_exists(&mut self, table: &str) -> bool {
         self.client
             .query_one(
                 "select exists (select 1 from pg_tables \
-                 where schemaname = 'public' and tablename = $1)",
-                &[&name],
+                 where schemaname = $1 and tablename = $2)",
+                &[&self.name, &table],
             )
             .and_then(|row| row.try_get(0))
             .unwrap_or_else(|err| panic!("e2e database: {err}"))
     }
 }
 
-/// A name unique to this test process and call, for objects a scenario
-/// creates in the shared database (`prefix_<pid>_<n>`).
-pub fn unique_name(prefix: &str) -> String {
-    format!(
-        "{prefix}_{}_{}",
-        std::process::id(),
-        LAUNCHES.fetch_add(1, Ordering::Relaxed)
-    )
+impl Drop for Schema {
+    fn drop(&mut self) {
+        let sql = format!("drop schema if exists {} cascade", self.name);
+        if let Err(err) = self.client.batch_execute(&sql) {
+            eprintln!("e2e: could not drop schema {}: {err}", self.name);
+        }
+    }
 }
 
 /// A unique, empty scratch directory for one launch.
@@ -181,6 +251,7 @@ pub fn default_seed() -> Value {
 pub enum Key {
     Return,
     Up,
+    Right,
 }
 
 impl Key {
@@ -188,6 +259,7 @@ impl Key {
         match self {
             Key::Return => 36,
             Key::Up => 126,
+            Key::Right => 124,
         }
     }
 }
@@ -254,13 +326,20 @@ impl App {
         Self::start(screen, dir, &seed)
     }
 
-    /// Start the app connected to `url` (see [`Db::connect`]) with one tab
-    /// holding `script`. The connection is saved under the name `e2e`.
-    pub fn launch_with_database(url: &str, script: &str) -> Self {
+    /// Start the app connected to `schema`'s database with one tab holding
+    /// `script`. The connection is saved under the name `e2e`. The database
+    /// panel is shown and pinned to [`DB_PANEL_WIDTH`] and the files panel
+    /// hidden, so the panel's rows sit where [`App::click_db_row`] expects
+    /// them.
+    pub fn launch_with_database(schema: &Schema, script: &str) -> Self {
+        let url = schema.url();
         let mut seed = default_seed();
         seed["connection_string"] = Value::from(url);
         seed["recent_connections"] = serde_json::json!([{ "name": "e2e", "url": url }]);
         seed["tabs"] = serde_json::json!([{ "script": script, "file": null }]);
+        seed["db_panel_visible"] = Value::from(true);
+        seed["db_panel_width"] = Value::from(DB_PANEL_WIDTH);
+        seed["files_panel_visible"] = Value::from(false);
         Self::launch_with(&seed)
     }
 
@@ -445,13 +524,13 @@ impl App {
     /// folder).
     pub fn click_files_new_script(&mut self) {
         let (_, _, width, _) = self.window_frame();
-        self.click_at(Button::Left, width - 17., FILES_HEADER_Y);
+        self.click_at(Button::Left, width - 17., PANEL_HEADER_Y);
     }
 
     /// Replace the files panel's filter text with `text`.
     pub fn filter_files(&mut self, text: &str) {
         let (_, _, width, _) = self.window_frame();
-        self.click_at(Button::Left, width - FILES_PANEL_WIDTH / 2., FILES_FILTER_Y);
+        self.click_at(Button::Left, width - FILES_PANEL_WIDTH / 2., PANEL_FILTER_Y);
         self.send_keys(&[Mod::Cmd], 'a');
         self.type_text(text);
     }
@@ -459,8 +538,56 @@ impl App {
     /// Click the files panel's tree row `row` (0 = top) with `button`.
     pub fn click_files_row(&mut self, button: Button, row: u32) {
         let (_, _, width, _) = self.window_frame();
-        let y = FILES_FIRST_ROW_Y + f64::from(row) * FILES_ROW_HEIGHT;
-        self.click_at(button, width - FILES_PANEL_WIDTH / 2., y);
+        self.click_at(button, width - FILES_PANEL_WIDTH / 2., row_y(row));
+    }
+
+    /// Click the database panel's tree row `row` (0 = top) with `button`.
+    /// A folder row toggles open or shut; an object row opens its
+    /// definition.
+    pub fn click_db_row(&mut self, button: Button, row: u32) {
+        self.click_at(button, DB_PANEL_WIDTH / 2., row_y(row));
+    }
+
+    /// Make sure the database panel's folder row `row` is expanded, whatever
+    /// state it was in: the click toggles it and focuses the tree, then
+    /// Right expands it only if the click shut it. Safe to repeat, and a
+    /// no-op on an empty row or a disabled placeholder.
+    pub fn expand_db_row(&mut self, row: u32) {
+        self.click_db_row(Button::Left, row);
+        self.press(&[], Key::Right);
+    }
+
+    /// Repeat `attempt` until `config.json` satisfies `pred`, giving each
+    /// attempt [`ATTEMPT_WAIT`] to show; panics after `timeout`.
+    ///
+    /// For steps that wait on something nothing outside the window reports —
+    /// the database panel's lazy folder loads — so the scenario cannot wait
+    /// for it before the next click. Each attempt must be safe to repeat
+    /// (see [`App::expand_db_row`]).
+    pub fn retry_until(
+        &mut self,
+        what: &str,
+        timeout: Duration,
+        mut attempt: impl FnMut(&mut Self),
+        pred: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let start = Instant::now();
+        loop {
+            attempt(self);
+            let tried = Instant::now();
+            while tried.elapsed() < ATTEMPT_WAIT {
+                let config = self.config();
+                if pred(&config) {
+                    return config;
+                }
+                std::thread::sleep(POLL);
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "timed out after {timeout:?} retrying {what}; last config.json: {}",
+                self.config()
+            );
+        }
     }
 
     /// Titles of the app's windows.
@@ -610,6 +737,17 @@ impl Drop for App {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
+}
+
+/// Top edge offset of side-panel tree row `row`, in window points.
+fn row_y(row: u32) -> f64 {
+    PANEL_FIRST_ROW_Y + f64::from(row) * PANEL_ROW_HEIGHT
+}
+
+/// The text of the active tab, if any.
+pub fn active_script(config: &Value) -> Option<&str> {
+    let active = usize::try_from(config["active_tab"].as_u64()?).ok()?;
+    config["tabs"][active]["script"].as_str()
 }
 
 /// An item title without gpui's check-mark prefix.
