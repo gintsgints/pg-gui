@@ -224,6 +224,15 @@ impl Schema {
             .and_then(|row| row.try_get(0))
             .unwrap_or_else(|err| panic!("e2e database: {err}"))
     }
+
+    /// Number of rows in the schema's table `table`.
+    pub fn row_count(&mut self, table: &str) -> i64 {
+        let sql = format!("select count(*) from {}.{table}", self.name);
+        self.client
+            .query_one(&sql, &[])
+            .and_then(|row| row.try_get(0))
+            .unwrap_or_else(|err| panic!("e2e database: {err}\nsql: {sql}"))
+    }
 }
 
 impl Drop for Schema {
@@ -356,11 +365,26 @@ impl App {
     /// [`App::click_files_row`] expects them. The folder lives in the scratch
     /// directory, kept with it when the test fails.
     pub fn launch_with_folder(files: &[&str]) -> Self {
+        let files: Vec<_> = files.iter().map(|file| (*file, "select 1;\n")).collect();
+        Self::launch_folder(default_seed(), &files)
+    }
+
+    /// [`Self::launch_with_folder`] connected to `schema`'s database (saved
+    /// under the name `e2e`), each file holding the given script, for
+    /// scenarios that run scripts from the files panel.
+    pub fn launch_with_scripts(schema: &Schema, files: &[(&str, &str)]) -> Self {
+        Self::launch_folder(database_seed(schema.url(), ""), files)
+    }
+
+    /// Seed a working folder with `files` (path and content; a path ending
+    /// in `/` is a folder) and start on `seed` with the files panel laid
+    /// out as [`Self::launch_with_folder`] describes.
+    fn launch_folder(mut seed: Value, files: &[(&str, &str)]) -> Self {
         let screen = SCREEN.lock().unwrap_or_else(PoisonError::into_inner);
         let dir = scratch_dir();
         let work = dir.join("work");
         std::fs::create_dir_all(&work).expect("create e2e working folder");
-        for file in files {
+        for (file, content) in files {
             let path = work.join(file);
             if file.ends_with('/') {
                 std::fs::create_dir_all(&path).expect("create seeded folder");
@@ -369,12 +393,11 @@ impl App {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).expect("create seeded folder");
             }
-            std::fs::write(&path, "select 1;\n").expect("write seeded file");
+            std::fs::write(&path, content).expect("write seeded file");
         }
         // Canonical, as File ▸ Open Folder stores it: the tree's row ids
         // (and so the paths tabs open) derive from it.
         let work = work.canonicalize().expect("canonicalize working folder");
-        let mut seed = default_seed();
         seed["working_dir"] = Value::from(work.to_str().expect("utf-8 temp path"));
         seed["files_panel_visible"] = Value::from(true);
         seed["files_panel_width"] = Value::from(FILES_PANEL_WIDTH);

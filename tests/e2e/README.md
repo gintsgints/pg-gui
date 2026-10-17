@@ -145,6 +145,7 @@ lints, without spending a run on a failed connection attempt.
 | Test | What it checks |
 |---|---|
 | `run_query_executes_against_database` | A tab holding `create table …`; cmd-enter runs it, and the table appears in the database. |
+| `run_script_from_files_panel_menu` | Two scripts in the working folder; filter to one, right-click ▸ Run Script, Enter confirms: its table is created and holds the three rows it inserts, and the other script's table does not exist. |
 
 ### `db_viewer`: the database panel (needs a database)
 
@@ -343,12 +344,13 @@ Harness API:
 | Call | Purpose |
 |---|---|
 | `App::launch()` / `App::launch_with(&Value)` | Starts the app on a scratch config seeded with `default_seed()` or your own JSON, and waits for the window. |
-| `Schema::create(test)` | Creates the scenario's scratch schema, or returns `None` (the scenario returns early) when `PG_GUI_E2E_DATABASE` is unset. `name()`, `execute(sql)` (`{schema}` is replaced by the name), `table_exists(table)`. Dropped with `CASCADE` on drop. |
+| `Schema::create(test)` | Creates the scenario's scratch schema, or returns `None` (the scenario returns early) when `PG_GUI_E2E_DATABASE` is unset. `name()`, `execute(sql)` (`{schema}` is replaced by the name), `table_exists(table)`, `row_count(table)`. Dropped with `CASCADE` on drop. |
 | `App::launch_with_database(&Schema, script)` | Starts the app connected to the schema's database, the database panel showing, with one tab holding `script`. |
 | `click_db_row(Button, row)`, `expand_db_row(row)` | Database panel: click tree row `row` (0 = top); make sure folder row `row` is expanded (safe to repeat). |
 | `retry_until(what, timeout, attempt, pred)` | Repeats `attempt` until `config.json` satisfies `pred`, for steps nothing outside the window reports on. Each attempt must be safe to repeat. |
 | `harness::active_script(&config)` | Returns the active tab's text. |
 | `App::launch_with_folder(&[&str])` | Starts the app with the files panel on a fresh working folder holding those (empty) files; a path ending in `/` is a folder. `work_dir()` returns it. |
+| `App::launch_with_scripts(&Schema, &[(&str, &str)])` | Like `launch_with_folder`, with each file holding the given script and the app connected to the schema's database. |
 | `send_keys(&[Mod], char)` | Brings the app to the front and types the key with modifiers held. |
 | `type_text(str)`, `press(&[Mod], Key)` | Types text into the focused element; presses a non-printing key (`Key::Return`, `Key::Up`). |
 | `click_at(Button, x, y)` | Left- or right-clicks at points from the window's top-left corner. |
