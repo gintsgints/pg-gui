@@ -1,0 +1,92 @@
+//! The snippet picker (Edit ▸ Snippets, cmd-p): built-in snippets and the
+//! user's own `.sql` files under `snippets/` in the config directory,
+//! inserted at the cursor as a statement of their own. No database needed.
+//!
+//! As in `editor`, the buffer is read back through the tab's `script` in
+//! config.json, and typed text avoids quotes and brackets.
+
+use crate::harness::{self, App, Key};
+
+/// Start with one untitled tab holding `script` (the cursor at its start)
+/// and the user snippets `snippets` (file stem, SQL) in the scratch config
+/// directory.
+fn launch(script: &str, snippets: &[(&str, &str)]) -> App {
+    App::launch_prepared(|dir, seed| {
+        let folder = dir.join("snippets");
+        std::fs::create_dir_all(&folder).expect("create snippets dir");
+        for (name, sql) in snippets {
+            std::fs::write(folder.join(format!("{name}.sql")), sql).expect("write snippet");
+        }
+        seed["tabs"] = serde_json::json!([{ "script": script, "file": null }]);
+    })
+}
+
+/// Wait until the active tab's text is exactly `expected`.
+fn wait_for_script(app: &mut App, what: &str, expected: &str) {
+    app.wait_for_config(&format!("{what}: {expected:?}"), |config| {
+        harness::active_script(config) == Some(expected)
+    });
+}
+
+#[test]
+fn picker_inserts_user_snippet_as_own_statement() {
+    let mut app = launch("select 1;", &[("Zebra probe", "select 4242;")]);
+
+    // Inserted at the cursor (the buffer's start), on a line of its own.
+    app.pick_snippet("zebra");
+    wait_for_script(
+        &mut app,
+        "the snippet above the script",
+        "select 4242;\nselect 1;",
+    );
+
+    app.quit();
+}
+
+#[test]
+fn filter_snippet_leaves_caret_between_percents() {
+    let mut app = launch("", &[]);
+
+    // A built-in whose name filter defaults to `ILIKE '%%'`: the caret
+    // lands between the two `%`, so typing narrows the filter.
+    app.pick_snippet("table & index breakdown");
+    app.wait_for_config("the snippet inserted", |c| {
+        harness::active_script(c).is_some_and(|s| s.contains("ILIKE '%%'"))
+    });
+    app.type_text("orders");
+    app.wait_for_config("the filter typed between the percents", |c| {
+        harness::active_script(c).is_some_and(|s| s.contains("WHERE relname ILIKE '%orders%'"))
+    });
+
+    app.quit();
+}
+
+#[test]
+fn tab_stops_take_typed_values_in_order() {
+    let mut app = launch(
+        "",
+        &[("Zebra stops", "select ${1:columns} from ${2:source};")],
+    );
+
+    // Each marker turns into its placeholder only when its stop is
+    // reached, selected so typing replaces it; Tab moves to the next one.
+    app.pick_snippet("zebra");
+    wait_for_script(
+        &mut app,
+        "the first stop resolved",
+        "select columns from ${2:source};\n",
+    );
+    app.type_text("id");
+    wait_for_script(
+        &mut app,
+        "the first stop typed",
+        "select id from ${2:source};\n",
+    );
+    app.press(&[], Key::Tab);
+    app.type_text("orders");
+    // Close a completion menu the typing may have opened.
+    app.press(&[], Key::Escape);
+    wait_for_script(&mut app, "both stops filled", "select id from orders;\n");
+
+    app.quit();
+}

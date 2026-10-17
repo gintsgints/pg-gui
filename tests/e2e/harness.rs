@@ -372,6 +372,7 @@ pub fn default_seed() -> Value {
 #[derive(Clone, Copy)]
 pub enum Key {
     Return,
+    Tab,
     Escape,
     Up,
     Down,
@@ -385,6 +386,7 @@ impl Key {
     fn code(self) -> u8 {
         match self {
             Key::Return => 36,
+            Key::Tab => 48,
             Key::Escape => 53,
             Key::Up => 126,
             Key::Down => 125,
@@ -1014,6 +1016,19 @@ impl App {
         if !stop_on_entry {
             self.click_in_dialog(STOP_ON_ENTRY_OFFSET);
         }
+        self.press(&[], Key::Return);
+    }
+
+    /// Insert a snippet through the Edit ▸ Snippets picker (cmd-p): its
+    /// search box starts focused, `filter` narrows the list, and Enter
+    /// inserts the first match at the cursor.
+    pub fn pick_snippet(&mut self, filter: &str) {
+        self.send_keys(&[Mod::Cmd], 'p');
+        // As in `fill_connection_dialog`: nothing outside the window says
+        // when the picker has drawn, nor when the filter has applied.
+        std::thread::sleep(DIALOG_SETTLE);
+        self.type_text(filter);
+        std::thread::sleep(DIALOG_SETTLE);
         self.press(&[], Key::Return);
     }
 

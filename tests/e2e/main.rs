@@ -10,11 +10,12 @@
 //! cargo e2e   # alias: cargo test --features e2e --test e2e -- --test-threads=1
 //! ```
 //!
-//! One module per kind of scenario. `general`, `connections`, `editor` and
-//! `files_panel` need no database, nor do `results`' failed-run log scenario
-//! and all but the last of `editor_syntax`'s. `query`, `db_viewer`,
-//! `debugger`, `definitions`, `explain`, `export`, `transactions` and the
-//! rest of `results` and `editor_syntax` run only when `PG_GUI_E2E_DATABASE` names one that is
+//! One module per kind of scenario. `general`, `connections`, `editor`,
+//! `files_panel` and `snippets` need no database, nor do `results`'
+//! failed-run log scenario and all but the last of `editor_syntax`'s.
+//! `query`, `db_viewer`, `debugger`, `definitions`, `explain`, `export`,
+//! `transactions` and the rest of `results` and `editor_syntax` run only
+//! when `PG_GUI_E2E_DATABASE` names one that is
 //! already running — `docker` for the project's
 //! `docker compose` server — and skip otherwise:
 //!
@@ -38,4 +39,5 @@ mod files_panel;
 mod general;
 mod query;
 mod results;
+mod snippets;
 mod transactions;

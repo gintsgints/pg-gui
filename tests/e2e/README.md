@@ -110,6 +110,21 @@ editor may pair on its own.
 | `save_writes_file_with_format_on_save` | On a file tab, cmd-s formats and writes; the file holds the formatted text and the tab matches it. |
 | `save_writes_file_verbatim_without_format_on_save` | With format-on-save off, cmd-s writes exactly what was typed. |
 
+### `snippets`: the snippet picker
+
+No database needed. Edit ▸ Snippets (cmd-p) opens a searchable picker over the
+built-in snippets and the user's own `.sql` files under `snippets/` in the
+config directory; `App::pick_snippet(filter)` opens it, types the filter and
+inserts the first match with Enter. User snippets are written into the scratch
+config directory before launch, and the buffer is read back through the tab's
+`script`, as in `editor`.
+
+| Test | What it checks |
+|---|---|
+| `picker_inserts_user_snippet_as_own_statement` | A user snippet picked with the cursor at the start of `select 1;` lands there on a line of its own. |
+| `filter_snippet_leaves_caret_between_percents` | A built-in whose filter defaults to `ILIKE '%%'` leaves the caret between the two `%`, so typed text narrows the filter. |
+| `tab_stops_take_typed_values_in_order` | A user snippet with `${1:columns}` and `${2:source}`: the first marker turns into its selected placeholder and typing replaces it, the second stays a marker until Tab reaches it, and the result reads `select id from orders;`. |
+
 ### `editor_syntax`: SQL syntax checking
 
 The embedded language server's diagnostics, reached the way a user reaches
@@ -459,6 +474,7 @@ Harness API:
 | `click_menu(menu, item)` | Clicks a menu item. The item matches with or without its check mark. |
 | `start_debug(stop_on_entry)`, `toggle_breakpoint(row)` | Debugger: start a session on the routine under the cursor; click editor row `row`'s breakpoint dot (a `launch_for_results` layout). |
 | `cmd_click_text(row, col, dwell)` | Editor (a `launch_for_results` layout): hover the character at `row`, `col` with cmd held for `dwell`, then click — Go to Definition. |
+| `pick_snippet(filter)` | Opens the snippet picker (cmd-p), types `filter` and inserts the first match with Enter. |
 | `App::launch_for_results_prepared(url, script, prepare)` | `launch_for_results` with the scratch directory handed to `prepare` first, to write files the seed points at. |
 | `click_submenu(menu, submenu, item)`, `submenu_items(menu, submenu)`, `submenu_checked(menu, submenu, item)` | Click, list or check an item in a submenu (Connection ▸ Recent, View ▸ Theme); items match with or without their check mark. |
 | `brightness_at(x, y)` | Captures the window and returns the brightness (0 black, 1 white) of the pixel at that point, through `NSBitmapImageRep` in JXA — what GPUI actually painted. |
