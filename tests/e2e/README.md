@@ -190,6 +190,23 @@ lints, without spending a run on a failed connection attempt.
 | `rename_from_context_menu` | Filter to one file, right-click ▸ Rename…, type a new name: the file is renamed on disk (`.sql` forced back on), neighbours untouched. |
 | `delete_from_context_menu` | Filter to one file, right-click ▸ Delete…, Enter confirms: only that file is removed. |
 
+### `hover`: hover in the editor (needs a database)
+
+Resting the pointer on a name asks the embedded language server about it,
+which answers from its schema cache. The popup cannot be read from outside the
+window, but the app logs every answer (`server hover blocks=N`, the number of
+markdown blocks returned) to `pg-gui.log`, which `App::log` reads.
+`App::hover_text(row, col)` moves the pointer onto an editor character (from a
+blank spot further right, so the editor always sees a fresh move), on the
+`launch_for_results` layout `cmd_click_text` uses. The cache loads in the
+background, so the scenarios re-hover until an answer with content arrives.
+
+| Test | What it checks |
+|---|---|
+| `hover_on_table_name_answers` | Hovering the table in `select zebra_total from <schema>.zebra_orders;` gets an answer with content. |
+| `hover_on_column_name_answers` | Hovering the column `zebra_total` gets an answer with content. |
+| `hover_on_keyword_answers_nothing` | Once the table has been answered (so the cache is loaded), hovering `select` gets only empty answers. |
+
 ### `query`: running SQL (needs a database)
 
 | Test | What it checks |
@@ -360,7 +377,7 @@ on with Session ▸ Toggle Autocommit, and the change is confirmed through
 
 ## Database-backed scenarios
 
-The `completion` (but its snippet one), `query`, `db_viewer`, `debugger`, `definitions`, `explain`, `export` and `transactions` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
+The `completion` (but its snippet one), `query`, `db_viewer`, `debugger`, `definitions`, `explain`, `export`, `hover` and `transactions` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
 or provisions one; it uses a database that already exists. Choose it with
 `PG_GUI_E2E_DATABASE`:
 
@@ -508,6 +525,7 @@ Harness API:
 | `click_menu(menu, item)` | Clicks a menu item. The item matches with or without its check mark. |
 | `start_debug(stop_on_entry)`, `toggle_breakpoint(row)` | Debugger: start a session on the routine under the cursor; click editor row `row`'s breakpoint dot (a `launch_for_results` layout). |
 | `cmd_click_text(row, col, dwell)` | Editor (a `launch_for_results` layout): hover the character at `row`, `col` with cmd held for `dwell`, then click — Go to Definition. |
+| `hover_text(row, col)` | Editor (a `launch_for_results` layout): move the pointer onto the character at `row`, `col`, coming in from a blank spot. |
 | `pick_snippet(filter)` | Opens the snippet picker (cmd-p), types `filter` and inserts the first match with Enter. |
 | `App::launch_for_results_prepared(url, script, prepare)` | `launch_for_results` with the scratch directory handed to `prepare` first, to write files the seed points at. |
 | `click_submenu(menu, submenu, item)`, `submenu_items(menu, submenu)`, `submenu_checked(menu, submenu, item)` | Click, list or check an item in a submenu (Connection ▸ Recent, View ▸ Theme); items match with or without their check mark. |

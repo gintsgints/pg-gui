@@ -1056,8 +1056,8 @@ impl App {
     pub fn cmd_click_text(&mut self, row: u32, col: u32, dwell: Duration) {
         self.focus();
         let (left, top, _, _) = self.window_frame();
-        let x = left + EDITOR_TEXT_X + EDITOR_CHAR_WIDTH * (f64::from(col) + 0.5);
-        let y = top + EDITOR_FIRST_LINE_Y + EDITOR_LINE_HEIGHT * f64::from(row);
+        let (x, y) = text_point(row, col);
+        let (x, y) = (left + x, top + y);
         let cmd = Mod::Cmd.event_flag();
         let dwell = dwell.as_secs_f64();
         jxa(&format!(
@@ -1075,6 +1075,27 @@ impl App {
              post($.kCGEventLeftMouseDown);\n\
              delay(0.05);\n\
              post($.kCGEventLeftMouseUp);"
+        ));
+    }
+
+    /// Rest the pointer on editor text at buffer `row`, column `col`, as
+    /// [`Self::cmd_click_text`] addresses it, with no button or modifier:
+    /// a hover. It comes in from a blank spot further right, so the editor
+    /// sees a fresh move onto the text even when the pointer was already
+    /// there.
+    pub fn hover_text(&mut self, row: u32, col: u32) {
+        self.focus();
+        let (left, top, width, _) = self.window_frame();
+        let (x, y) = text_point(row, col);
+        let (x, y) = (left + x, top + y);
+        let away = left + width - 40.;
+        jxa(&format!(
+            "ObjC.import('CoreGraphics');\n\
+             const move = (x) => $.CGEventPost($.kCGHIDEventTap,\n\
+                 $.CGEventCreateMouseEvent($(), $.kCGEventMouseMoved, $.CGPointMake(x, {y}), $.kCGMouseButtonLeft));\n\
+             move({away});\n\
+             delay(0.2);\n\
+             move({x});"
         ));
     }
 
@@ -1226,6 +1247,15 @@ impl ConnectionDialog {
             ConnectionDialog::Connect => (202., 523.),
         }
     }
+}
+
+/// The middle of the editor character at buffer `row`, column `col`, in
+/// window points, for a launch through [`App::launch_for_results`].
+fn text_point(row: u32, col: u32) -> (f64, f64) {
+    (
+        EDITOR_TEXT_X + EDITOR_CHAR_WIDTH * (f64::from(col) + 0.5),
+        EDITOR_FIRST_LINE_Y + EDITOR_LINE_HEIGHT * f64::from(row),
+    )
 }
 
 /// The seed of [`App::launch_for_results`]: `url` (the dead seeded

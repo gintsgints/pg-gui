@@ -14,10 +14,10 @@
 //! `files_panel`, `format` and `snippets` need no database, nor do `results`'
 //! failed-run log scenario, the snippet one of `completion` and all but the
 //! last of `editor_syntax`'s. The rest of `completion`, `query`, `db_viewer`,
-//! `debugger`, `definitions`, `explain`, `export`, `transactions` and the
-//! rest of `results` and `editor_syntax` run only when `PG_GUI_E2E_DATABASE`
-//! names one that is already running — `docker` for the project's
-//! `docker compose` server — and skip otherwise:
+//! `debugger`, `definitions`, `explain`, `export`, `hover`, `transactions`
+//! and the rest of `results` and `editor_syntax` run only when
+//! `PG_GUI_E2E_DATABASE` names one that is already running — `docker` for
+//! the project's `docker compose` server — and skip otherwise:
 //!
 //! ```sh
 //! PG_GUI_E2E_DATABASE=docker cargo e2e
@@ -39,6 +39,7 @@ mod export;
 mod files_panel;
 mod format;
 mod general;
+mod hover;
 mod query;
 mod results;
 mod snippets;
