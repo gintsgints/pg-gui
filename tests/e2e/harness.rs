@@ -9,7 +9,9 @@
 //!   bakes into the item title as a `✓ ` prefix;
 //! - the window list and window titles;
 //! - `config.json`, which the app rewrites whenever a tab, panel or toggle
-//!   changes — the state oracle for everything drawn inside the window.
+//!   changes — the state oracle for everything drawn inside the window;
+//! - the app's diagnostics log, `pg-gui.log` beside it, which reports when
+//!   the language server has finished a run ([`App::log`]).
 //!
 //! Input goes through System Events (`keystroke` posts `CGEvent`s to the
 //! frontmost app), reads through its AX bridge. Both are reached with
@@ -42,6 +44,10 @@ const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for a UI reaction (a config write, a menu change).
 pub const REACT_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(100);
+/// `PG_GUI_LOG` for every launch: warnings and errors from everything, plus
+/// the language-server boundary at `debug`, whose "server diagnostics" line
+/// is the only outside sign that a diagnostics run has been published.
+const LOG_FILTER: &str = "warn,pg_gui::lsp=debug";
 
 /// GUI tests share one screen, one keyboard focus and one menu bar, so they
 /// must never overlap; every [`App`] holds this for its whole life.
@@ -446,7 +452,7 @@ impl App {
         let log = std::fs::File::create(dir.join("stdio.log")).expect("create stdio log");
         let child = Command::new(env!("CARGO_BIN_EXE_pg-gui"))
             .env("PG_GUI_CONFIG_DIR", &dir)
-            .env("PG_GUI_LOG", "warn")
+            .env("PG_GUI_LOG", LOG_FILTER)
             .stdin(Stdio::null())
             .stdout(log.try_clone().expect("clone stdio log"))
             .stderr(log)
@@ -776,6 +782,12 @@ impl App {
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or(Value::Null)
+    }
+
+    /// The app's diagnostics log so far (`pg-gui.log`, filtered by
+    /// [`LOG_FILTER`]); empty before the app has written it.
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.join("pg-gui.log")).unwrap_or_default()
     }
 
     /// Poll until `config.json` satisfies `pred`; panics with the last config

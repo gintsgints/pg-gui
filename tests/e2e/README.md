@@ -91,6 +91,28 @@ editor may pair on its own.
 | `save_writes_file_with_format_on_save` | On a file tab, cmd-s formats and writes; the file holds the formatted text and the tab matches it. |
 | `save_writes_file_verbatim_without_format_on_save` | With format-on-save off, cmd-s writes exactly what was typed. |
 
+### `editor_syntax`: SQL syntax checking
+
+The embedded language server's diagnostics, reached the way a user reaches
+them: Next Problem (cmd-j) leaves the cursor on the start of the problem it
+lands on, so the scenario types a `#` there and reads the tab's `script` back.
+With no problem the cursor stays put and the `#` lands where it was. Every walk
+starts from the buffer's end (cmd-a, Right), where the first press wraps round
+to the first error. Diagnostics are published on a debounce, and a press before
+they arrive finds nothing, so each scenario first waits for the
+`server diagnostics count=N` line the app logs per published run
+(`App::log`). The offline scenarios run on a connection string the driver
+cannot parse, which the server takes as "no database": it still parses and
+lints, without spending a run on a failed connection attempt.
+
+| Test | What it checks |
+|---|---|
+| `valid_script_reports_no_problems` | Two valid statements: the run reports nothing and cmd-j leaves the cursor where it was. |
+| `syntax_error_is_located_at_its_statement` | A broken statement between two valid ones: cmd-j lands on the start of the broken one. |
+| `next_problem_walks_every_error` | Two broken statements around a valid one: the first press lands on the first, the second on the next, past the valid one. |
+| `typed_error_is_flagged_and_its_fix_clears_it` | Typing a broken statement gets it flagged; replacing it with a valid one clears it. |
+| `syntax_error_is_flagged_with_database_connected` | Database needed: with the schema cache loaded, a syntax error is still flagged and a valid query on an existing table is not. |
+
 ### `files_panel`: scripts in the working folder
 
 | Test | What it checks |
@@ -173,7 +195,7 @@ its first cell; what the grid holds in all, off cmd-a and cmd-c.
 
 ## Database-backed scenarios
 
-The `query` and `db_viewer` scenarios, and all of `results` but the failed-run log one, need a running PostgreSQL. The harness never starts
+The `query` and `db_viewer` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
 or provisions one; it uses a database that already exists. Choose it with
 `PG_GUI_E2E_DATABASE`:
 
@@ -233,7 +255,7 @@ directory, which is kept and holds:
 |---|---|
 | `failure.png` | A capture of the app window at the moment of failure. |
 | `stdio.log` | The app's stdout and stderr. |
-| `pg-gui.log` | The app's diagnostics log (`PG_GUI_LOG=warn`). |
+| `pg-gui.log` | The app's diagnostics log (`PG_GUI_LOG=warn,pg_gui::lsp=debug`). |
 | `config.json` | The last state the app saved. |
 
 Delete these directories when you are done with them; nothing else cleans them
