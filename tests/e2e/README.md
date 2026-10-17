@@ -181,15 +181,29 @@ next attempt still finds them.
 
 Needs a server with `plugin_debugger` in `shared_preload_libraries` and the
 `pldbgapi` extension, which the project's `docker compose` server has. The
-debug panel cannot be read from outside the window, so the scenario watches
-the routine's effects: its procedure commits after each insert, so a row
-turns visible to the scenario's own connection exactly when the debugger lets
-that statement run. Step Over and Continue are pressed as F10 and F5
-(`Key::F10`, `Key::F5`).
+debug panel cannot be read from outside the window, so the scenarios watch
+the routine's effects: each statement of the procedure calls `nextval` on a
+sequence, and a sequence is not transactional, so the scenario's own
+connection sees each call (`Schema::sequence_calls`) exactly when the
+debugger lets that statement run. The routine holds no `COMMIT`: continuing
+from a breakpoint after one hung the target backend inside pldebugger, where
+not even `pg_terminate_backend` reaches it, until the server was restarted.
+
+Each launch goes through `App::launch_for_results_with`, with the editor tall
+enough to show the whole procedure, so `App::toggle_breakpoint(row)` can click
+a line's breakpoint dot at a fixed offset. `App::start_debug(stop_on_entry)`
+opens the launch dialog with cmd-shift-d (the routine's name is filled in from
+the `CREATE` under the cursor), unticks "Stop on entry" unless asked for it,
+and starts with Enter. Step Over and Continue are pressed as F10 and F5
+(`Key::F10`, `Key::F5`). After each stop the scenario checks the count holds
+for a moment, because a routine that ran straight through could be caught
+between two statements.
 
 | Test | What it checks |
 |---|---|
-| `step_over_and_continue_procedure` | A tab holding the procedure's `CREATE`; cmd-shift-d and Enter start a session stopped on entry. Step Over is pressed until the first insert commits, the second stays out while the session holds, and Continue runs the rest. |
+| `step_over_and_continue_procedure` | Stopped on entry: Step Over is pressed until the first statement runs, the second stays off while the session holds, and Continue runs the rest. |
+| `breakpoints_stop_where_set` | Gutter breakpoints on statements 2 and 3, no stop on entry: the session runs to 2 by itself, Continue stops at 3, and Continue again runs to the end. |
+| `breakpoints_toggled_mid_session` | Breakpoints on 2 and 3; stopped at 2, the one on 3 is cleared and one on 4 set in the gutter. Continue runs through 3 and stops at 4, then runs to the end. |
 
 ### `results`: the results grid and the message log
 
@@ -360,7 +374,7 @@ Harness API:
 | Call | Purpose |
 |---|---|
 | `App::launch()` / `App::launch_with(&Value)` | Starts the app on a scratch config seeded with `default_seed()` or your own JSON, and waits for the window. |
-| `Schema::create(test)` | Creates the scenario's scratch schema, or returns `None` (the scenario returns early) when `PG_GUI_E2E_DATABASE` is unset. `name()`, `execute(sql)` (`{schema}` is replaced by the name), `table_exists(table)`, `row_count(table)`. Dropped with `CASCADE` on drop. |
+| `Schema::create(test)` | Creates the scenario's scratch schema, or returns `None` (the scenario returns early) when `PG_GUI_E2E_DATABASE` is unset. `name()`, `execute(sql)` (`{schema}` is replaced by the name), `table_exists(table)`, `row_count(table)`, `sequence_calls(sequence)`. Before dropping, it ends any other backend whose query names the schema (a debug target left trapped). Dropped with `CASCADE` on drop. |
 | `App::launch_with_database(&Schema, script)` | Starts the app connected to the schema's database, the database panel showing, with one tab holding `script`. |
 | `click_db_row(Button, row)`, `expand_db_row(row)` | Database panel: click tree row `row` (0 = top); make sure folder row `row` is expanded (safe to repeat). |
 | `retry_until(what, timeout, attempt, pred)` | Repeats `attempt` until `config.json` satisfies `pred`, for steps nothing outside the window reports on. Each attempt must be safe to repeat. |
@@ -374,6 +388,7 @@ Harness API:
 | `click_files_row_with(&[Mod], row, picked)`, `click_files_run_bar()` | Files panel: a shift- or cmd-click on tree row `row`, and the "Run N script(s)" bar. The bar shows above the tree while two or more scripts are picked and pushes the rows down, so `picked` says whether it is up before the click. |
 | `wait_for_extra_window(what)` | Waits for a second window, such as a save panel. |
 | `click_menu(menu, item)` | Clicks a menu item. The item matches with or without its check mark. |
+| `start_debug(stop_on_entry)`, `toggle_breakpoint(row)` | Debugger: start a session on the routine under the cursor; click editor row `row`'s breakpoint dot (a `launch_for_results` layout). |
 | `click_submenu(menu, submenu, item)` | Clicks an item in a submenu, such as Connection ▸ Recent ▸ a saved connection. |
 | `fill_connection_dialog(name, url)` | In the open New Connection dialog, types the name and connection string and presses Connect. |
 | `menu_checked(menu, item)` | Returns whether the item carries a check mark. |

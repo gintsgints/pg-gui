@@ -193,9 +193,29 @@ impl Schema {
             .iter()
             .map(|row| row.get(0))
             .collect();
+        if !leftovers.is_empty() {
+            self.end_backends_naming("_e2e_");
+        }
         for name in leftovers {
             eprintln!("e2e: dropping leftover schema {name}");
             self.execute(&format!("drop schema if exists \"{name}\" cascade"));
+        }
+    }
+
+    /// Terminate every other backend whose current statement names
+    /// `needle`. A debug scenario's target backend stays trapped in the
+    /// routine it runs (`CALL <schema>.…`) for as long as nothing continues
+    /// it — after a failure, or once the app is killed — and holds locks in
+    /// the schema that would make dropping it wait forever.
+    fn end_backends_naming(&mut self, needle: &str) {
+        let result = self.client.execute(
+            "select pg_terminate_backend(pid) from pg_stat_activity \
+             where pid <> pg_backend_pid() and datname = current_database() \
+             and strpos(query, $1) > 0",
+            &[&needle],
+        );
+        if let Err(err) = result {
+            eprintln!("e2e: could not end backends using {needle}: {err}");
         }
     }
 
@@ -238,10 +258,27 @@ impl Schema {
             .and_then(|row| row.try_get(0))
             .unwrap_or_else(|err| panic!("e2e database: {err}\nsql: {sql}"))
     }
+
+    /// How many times `nextval` has been called on the schema's sequence
+    /// `sequence`: its value once called, 0 before. Sequences are not
+    /// transactional, so this sees a call the moment it is made, even inside
+    /// a transaction that has not committed.
+    pub fn sequence_calls(&mut self, sequence: &str) -> i64 {
+        let sql = format!(
+            "select case when is_called then last_value else 0 end from {}.{sequence}",
+            self.name
+        );
+        self.client
+            .query_one(&sql, &[])
+            .and_then(|row| row.try_get(0))
+            .unwrap_or_else(|err| panic!("e2e database: {err}\nsql: {sql}"))
+    }
 }
 
 impl Drop for Schema {
     fn drop(&mut self) {
+        let name = self.name.clone();
+        self.end_backends_naming(&name);
         let sql = format!("drop schema if exists {} cascade", self.name);
         if let Err(err) = self.client.batch_execute(&sql) {
             eprintln!("e2e: could not drop schema {}: {err}", self.name);
@@ -866,11 +903,45 @@ impl App {
 
     /// Click `target` in the open connection dialog.
     fn click_connection_dialog(&mut self, target: ConnectionDialog) {
+        self.click_in_dialog(target.offset());
+    }
+
+    /// Click at `(dx, dy)` in the open dialog: points from the window's
+    /// centre horizontally, and from the dialog's top edge vertically.
+    fn click_in_dialog(&mut self, (dx, dy): (f64, f64)) {
         let (_, _, width, height) = self.window_frame();
-        let (dx, dy) = target.offset();
         // gpui-component centres a dialog horizontally and puts its top a
         // tenth of the window's height down.
         self.click_at(Button::Left, width / 2. + dx, height / 10. + dy);
+    }
+
+    /// Start a debug session on the routine whose `CREATE` is under the
+    /// cursor: cmd-shift-d opens the launch dialog with its name filled in,
+    /// the "Stop on entry" box (checked by default) is unticked unless
+    /// `stop_on_entry`, and Enter starts the session.
+    pub fn start_debug(&mut self, stop_on_entry: bool) {
+        self.send_keys(&[Mod::Cmd, Mod::Shift], 'd');
+        // As in `fill_connection_dialog`: nothing outside the window says
+        // when the dialog has drawn.
+        std::thread::sleep(DIALOG_SETTLE);
+        if !stop_on_entry {
+            self.click_in_dialog(STOP_ON_ENTRY_OFFSET);
+        }
+        self.press(&[], Key::Return);
+    }
+
+    /// Click the breakpoint dot of editor line `row` (0 = first buffer
+    /// line), setting or clearing its breakpoint, for a launch through
+    /// [`Self::launch_for_results`] (or `_with`): the editor then starts at
+    /// the window's left edge right under the tab bar, scrolled to the top,
+    /// so `row` must fit inside the editor's height — [`EDITOR_HEIGHT`]
+    /// unless the launch set another.
+    pub fn toggle_breakpoint(&mut self, row: u32) {
+        self.click_at(
+            Button::Left,
+            BREAKPOINT_X,
+            EDITOR_FIRST_LINE_Y + EDITOR_LINE_HEIGHT * f64::from(row),
+        );
     }
 
     /// The config.json the app last wrote (or the seed, before its first
@@ -985,6 +1056,17 @@ fn database_seed(url: &str, script: &str) -> Value {
 
 /// How long [`App::fill_connection_dialog`] waits for the dialog to draw.
 const DIALOG_SETTLE: Duration = Duration::from_millis(500);
+
+/// Where the debug launch dialog's "Stop on entry" checkbox sits, as
+/// [`App::click_in_dialog`] takes it. Measured from a capture at 100% zoom.
+const STOP_ON_ENTRY_OFFSET: (f64, f64) = (-215., 204.);
+/// The editor's breakpoint dots, for a launch through
+/// [`App::launch_for_results`]: their horizontal middle, the vertical middle
+/// of the first line's, and the line height. Measured from a capture at
+/// 100% zoom.
+const BREAKPOINT_X: f64 = 22.;
+const EDITOR_FIRST_LINE_Y: f64 = 85.;
+const EDITOR_LINE_HEIGHT: f64 = 20.;
 
 /// A widget of the connection dialog.
 #[derive(Clone, Copy)]
