@@ -177,6 +177,20 @@ shut folder, so it is safe to repeat. A click that lands on a loading
 placeholder or on a folder further down cannot move the rows above it, so the
 next attempt still finds them.
 
+### `debugger`: PL/pgSQL step debugging (needs a database)
+
+Needs a server with `plugin_debugger` in `shared_preload_libraries` and the
+`pldbgapi` extension, which the project's `docker compose` server has. The
+debug panel cannot be read from outside the window, so the scenario watches
+the routine's effects: its procedure commits after each insert, so a row
+turns visible to the scenario's own connection exactly when the debugger lets
+that statement run. Step Over and Continue are pressed as F10 and F5
+(`Key::F10`, `Key::F5`).
+
+| Test | What it checks |
+|---|---|
+| `step_over_and_continue_procedure` | A tab holding the procedure's `CREATE`; cmd-shift-d and Enter start a session stopped on entry. Step Over is pressed until the first insert commits, the second stays out while the session holds, and Continue runs the rest. |
+
 ### `results`: the results grid and the message log
 
 The grid and the log cannot be read from outside the window, so every scenario
@@ -216,7 +230,7 @@ its first cell; what the grid holds in all, off cmd-a and cmd-c.
 
 ## Database-backed scenarios
 
-The `query` and `db_viewer` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
+The `query`, `db_viewer` and `debugger` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
 or provisions one; it uses a database that already exists. Choose it with
 `PG_GUI_E2E_DATABASE`:
 

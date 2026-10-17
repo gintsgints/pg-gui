@@ -308,6 +308,8 @@ pub enum Key {
     Down,
     Left,
     Right,
+    F5,
+    F10,
 }
 
 impl Key {
@@ -319,6 +321,8 @@ impl Key {
             Key::Down => 125,
             Key::Left => 123,
             Key::Right => 124,
+            Key::F5 => 96,
+            Key::F10 => 109,
         }
     }
 }

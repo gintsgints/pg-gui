@@ -13,8 +13,8 @@
 //! One module per kind of scenario. `general`, `connections`, `editor` and
 //! `files_panel` need no
 //! database, nor do `results`' failed-run log scenario and all but the last
-//! of `editor_syntax`'s. `query`, `db_viewer` and the rest of `results` and
-//! `editor_syntax` run only when `PG_GUI_E2E_DATABASE`
+//! of `editor_syntax`'s. `query`, `db_viewer`, `debugger` and the rest of `results`
+//! and `editor_syntax` run only when `PG_GUI_E2E_DATABASE`
 //! names one that is already running — `docker` for the project's
 //! `docker compose` server — and skip otherwise:
 //!
@@ -28,6 +28,7 @@ mod harness;
 
 mod connections;
 mod db_viewer;
+mod debugger;
 mod editor;
 mod editor_syntax;
 mod files_panel;
