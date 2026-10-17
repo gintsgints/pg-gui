@@ -145,6 +145,7 @@ lints, without spending a run on a failed connection attempt.
 | Test | What it checks |
 |---|---|
 | `run_query_executes_against_database` | A tab holding `create table …`; cmd-enter runs it, and the table appears in the database. |
+| `cancel_query_stops_running_statement` | `insert … select 1 from pg_sleep(60)` runs (the app's backend is `active` on it); Session ▸ Cancel Query puts the backend back to `idle` within seconds, and the row never lands. |
 | `run_script_from_files_panel_menu` | Two scripts in the working folder; filter to one, right-click ▸ Run Script, Enter confirms: its table is created and holds the three rows it inserts, and the other script's table does not exist. |
 | `run_selected_scripts_in_tree_order` | Four scripts; a click, a shift-click and two cmd-clicks pick the first, second and fourth. Connection ▸ Run Selected Scripts, Enter confirms: the fourth's insert lands after the first's `create table`, so the batch ran in tree order, and the dropped third script never ran. |
 | `run_bar_runs_cmd_picked_scripts` | A click and a cmd-click pick two of three scripts; the files panel's "Run N script(s)" bar runs them, and only them. |

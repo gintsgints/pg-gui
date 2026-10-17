@@ -1,5 +1,6 @@
-//! Running SQL against the database: from the editor, and a script file
-//! from the files panel. Needs `PG_GUI_E2E_DATABASE`; skipped without it.
+//! Running SQL against the database: from the editor, cancelling a run, and
+//! script files from the files panel. Needs `PG_GUI_E2E_DATABASE`; skipped
+//! without it.
 
 use crate::harness::{self, App, Button, Key, Mod, Schema};
 
@@ -143,6 +144,42 @@ fn run_bar_runs_cmd_picked_scripts() {
         !schema.table_exists("not_run"),
         "the unpicked script does not run"
     );
+
+    app.quit();
+}
+
+#[test]
+fn cancel_query_stops_running_statement() {
+    let Some(mut schema) = Schema::create("query::cancel_query_stops_running_statement") else {
+        return;
+    };
+    schema.execute("create table {schema}.t (n int)");
+    // The row would land only once the sleep is over; the sleep is far
+    // longer than anything the scenario waits for.
+    let script = format!(
+        "insert into {}.t select 1 from pg_sleep(60);",
+        schema.name()
+    );
+    let mut app = App::launch_with_database(&schema, &script);
+
+    app.press(&[Mod::Cmd], Key::Return);
+    app.wait_for("the statement running", harness::DB_TIMEOUT, |_| {
+        schema
+            .backends()
+            .iter()
+            .any(|(state, query)| state == "active" && query.contains("pg_sleep"))
+    });
+
+    // Cancelled, the tab's session goes idle — out of any transaction, as
+    // autocommit leaves it — and the insert never happens.
+    app.click_menu("Session", "Cancel Query");
+    app.wait_for("the statement cancelled", harness::DB_TIMEOUT, |_| {
+        schema
+            .backends()
+            .iter()
+            .any(|(state, query)| state == "idle" && query.contains("pg_sleep"))
+    });
+    assert_eq!(schema.row_count("t"), 0, "the cancelled insert never lands");
 
     app.quit();
 }
