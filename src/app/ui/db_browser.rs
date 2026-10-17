@@ -69,7 +69,7 @@ impl PgGuiApp {
 
     /// The browser panel's body: one of the empty/error/loading placeholders,
     /// or the object tree itself.
-    pub(in crate::app) fn render_db_body(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_db_body(&self, cx: &mut Context<Self>) -> AnyElement {
         let message = |text: &str, danger: bool| {
             let color = if danger {
                 cx.theme().danger

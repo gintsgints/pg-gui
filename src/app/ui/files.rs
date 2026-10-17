@@ -25,7 +25,7 @@ use crate::{OpenFolder, RunScripts};
 
 impl PgGuiApp {
     /// The files panel before a working folder has been picked.
-    pub(in crate::app) fn render_no_folder(cx: &mut Context<Self>) -> gpui::Div {
+    fn render_no_folder(cx: &mut Context<Self>) -> gpui::Div {
         v_flex()
             .size_full()
             .items_center()
@@ -50,7 +50,7 @@ impl PgGuiApp {
     /// A folder row in the files panel: the tree's own click handling
     /// expands it, so the row only adds the "+" that creates a script
     /// inside it, hidden until the row is hovered.
-    pub(in crate::app) fn render_folder_row(
+    fn render_folder_row(
         list_item: ListItem,
         label_row: gpui::Div,
         id: &SharedString,
@@ -83,7 +83,7 @@ impl PgGuiApp {
     ///
     /// The tree builds this with a [`Context<TreeState>`], so the app is
     /// reached through its own entity rather than through `cx`.
-    pub(in crate::app) fn file_row_menu(
+    fn file_row_menu(
         view: &Entity<Self>,
         id: &SharedString,
         is_dir: bool,
@@ -150,7 +150,7 @@ impl PgGuiApp {
     /// The files panel's title row: the working folder's name, and the "+"
     /// that creates a script directly inside it — the root has no row of
     /// its own in the tree, where every other folder carries its own.
-    pub(in crate::app) fn render_files_header(
+    fn render_files_header(
         root: PathBuf,
         folder_name: String,
         cx: &mut Context<Self>,
@@ -181,10 +181,7 @@ impl PgGuiApp {
 
     /// The files panel's "Run N script(s)" bar, shown while scripts are
     /// picked: runs them in tree order, or drops the selection.
-    pub(in crate::app) fn render_script_run_bar(
-        picked: usize,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    fn render_script_run_bar(picked: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         h_flex()
             .px_1()
             .pb_1()
@@ -247,10 +244,7 @@ impl PgGuiApp {
     /// The files panel's tree widget: the row renderer plus the per-row
     /// right-click menu. Split out of [`Self::render_files_panel`] because
     /// both closures capture, and both are long.
-    pub(in crate::app) fn render_files_tree(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    fn render_files_tree(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let dirs = self.tree_dirs.clone();
         let selected: Rc<HashSet<SharedString>> = Rc::new(self.selected_scripts.clone());
         let view = cx.entity();

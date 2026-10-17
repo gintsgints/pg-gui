@@ -81,7 +81,7 @@ impl PgGuiApp {
     /// The clock is read from the tab's start instant on every frame, so it
     /// keeps counting across a tab switch; the repaints come from
     /// [`Self::start_progress_tick`].
-    pub(in crate::app) fn render_run_indicator(&self) -> AnyElement {
+    fn render_run_indicator(&self) -> AnyElement {
         let Some(progress) = self
             .tabs
             .get(self.active_tab)
@@ -198,10 +198,7 @@ impl PgGuiApp {
     /// Cancel button (enabled while a query runs), and the new-tab "+".
     /// They act on the active tab's session; the buttons are labelled with
     /// text glyphs rather than `IconName` SVGs.
-    pub(in crate::app) fn render_session_toolbar(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    fn render_session_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let autocommit = self.active_autocommit();
         let running = self.active_running();
         // Commit/Rollback only make sense on a manual transaction that has

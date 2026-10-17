@@ -14,10 +14,7 @@ impl PgGuiApp {
     /// The editor (with its tab bar) over the results table, split by a
     /// draggable divider; the split position is persisted to the config on
     /// drag and restored on launch via the editor panel's initial size.
-    pub(in crate::app) fn render_editor_results(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    fn render_editor_results(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         // The SQL editor with its tab bar; always shown.
         let editor = v_flex().size_full().child(self.render_tab_bar(cx)).child(
             div().flex_1().min_h(px(0.)).p_2().child(

@@ -16,7 +16,10 @@ use gpui_component::{
 };
 
 use crate::app::{BottomView, PgGuiApp, mask_credentials};
-use crate::{CancelQuery, ExplainAnalyze, ExplainPlan, RunQuery, RunScripts, db, plan, statement};
+use crate::{
+    CancelQuery, Commit, ExplainAnalyze, ExplainPlan, Rollback, RunQuery, RunScripts,
+    ToggleAutocommit, db, plan, statement,
+};
 
 impl PgGuiApp {
     /// The SQL an action should operate on, with a scope label for status
@@ -174,12 +177,7 @@ impl PgGuiApp {
     /// autocommit/transaction, same cancel token — but the statement's output
     /// is one JSON document rather than a stream of result sets, so it takes
     /// no progress channel.
-    pub(in crate::app) fn start_explain(
-        &mut self,
-        analyze: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn start_explain(&mut self, analyze: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active_tab) else {
             return;
         };
@@ -262,7 +260,7 @@ impl PgGuiApp {
     /// rather than thrown away silently — the JSON came from the server, so a
     /// failure here is pg-gui's problem to see.
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::app) fn on_plan_ok(
+    fn on_plan_ok(
         &mut self,
         tab_id: u64,
         epoch: u64,
@@ -329,7 +327,7 @@ impl PgGuiApp {
     /// The picked scripts as `(label, path)`, in run order. The label is
     /// the path relative to the working folder — what the panel shows —
     /// since the absolute path is mostly noise in a log line.
-    pub(in crate::app) fn selected_script_batch(&self) -> Vec<(String, PathBuf)> {
+    fn selected_script_batch(&self) -> Vec<(String, PathBuf)> {
         self.selected_script_paths()
             .into_iter()
             .map(|path| {
@@ -356,7 +354,7 @@ impl PgGuiApp {
     /// edits to one of them would run something other than what its editor
     /// shows; note that in the log rather than silently running the old
     /// text.
-    pub(in crate::app) fn note_unsaved_scripts(&mut self, ix: usize, files: &[(String, PathBuf)]) {
+    fn note_unsaved_scripts(&mut self, ix: usize, files: &[(String, PathBuf)]) {
         let unsaved: Vec<String> = files
             .iter()
             .filter(|(_, path)| {
@@ -423,7 +421,7 @@ impl PgGuiApp {
 
     /// The name the current connection goes by in the UI — its saved name,
     /// or its URL with the password masked when it has none.
-    pub(in crate::app) fn connection_label(&self) -> String {
+    fn connection_label(&self) -> String {
         self.config
             .recent_connections
             .iter()
@@ -439,7 +437,7 @@ impl PgGuiApp {
     /// whatever connection the window happens to be on — so it names the
     /// target and lists the files rather than starting on a stray
     /// cmd-shift-enter.
-    pub(in crate::app) fn prompt_run_scripts(
+    fn prompt_run_scripts(
         &mut self,
         files: Vec<(String, PathBuf)>,
         window: &mut Window,
@@ -530,7 +528,7 @@ impl PgGuiApp {
     }
 
     /// Run a confirmed batch: see [`PgGuiApp::run_scripts`].
-    pub(in crate::app) fn start_script_run(
+    fn start_script_run(
         &mut self,
         files: Vec<(String, PathBuf)>,
         window: &mut Window,
@@ -622,12 +620,7 @@ impl PgGuiApp {
     /// state. Returns the tab index to display the result on, or `None` when
     /// the tab was closed, the connection changed underneath it, or the
     /// connection died (session discarded so the next Run reconnects).
-    pub(in crate::app) fn settle_session(
-        &mut self,
-        tab_id: u64,
-        epoch: u64,
-        session: db::Session,
-    ) -> Option<usize> {
+    fn settle_session(&mut self, tab_id: u64, epoch: u64, session: db::Session) -> Option<usize> {
         let ix = self.tab_index_by_id(tab_id)?;
         self.tabs[ix].running = false;
         self.clear_progress(ix);
@@ -644,7 +637,7 @@ impl PgGuiApp {
     /// Apply one streamed run event to its tab: a log line, or a result set
     /// that joins the selector and is shown right away, so a long block's
     /// output appears statement by statement instead of all at the end.
-    pub(in crate::app) fn on_run_event(
+    fn on_run_event(
         &mut self,
         tab_id: u64,
         epoch: u64,
@@ -706,7 +699,7 @@ impl PgGuiApp {
     /// Whether this log line should pull the bottom panel over to the log:
     /// the run has produced no result set, so the table has nothing to show,
     /// and it has not already done so once (see [`RunProgress::log_shown`]).
-    pub(in crate::app) fn show_log_for_run(&mut self, ix: usize) -> bool {
+    fn show_log_for_run(&mut self, ix: usize) -> bool {
         if !self.tabs[ix].result.results.is_empty() {
             return false;
         }
@@ -720,7 +713,7 @@ impl PgGuiApp {
 
     /// Switch the bottom panel to `view` and open the panel (cmd-3) if it is
     /// closed, so a run's output is never produced into a hidden panel.
-    pub(in crate::app) fn reveal_bottom_view(&mut self, view: BottomView, cx: &mut Context<Self>) {
+    fn reveal_bottom_view(&mut self, view: BottomView, cx: &mut Context<Self>) {
         self.bottom_view = view;
         if !self.config.results_panel_visible {
             self.config.results_panel_visible = true;
@@ -732,7 +725,7 @@ impl PgGuiApp {
     /// it did. The rows and log lines already arrived through
     /// [`Self::on_run_event`].
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::app) fn on_query_ok(
+    fn on_query_ok(
         &mut self,
         tab_id: u64,
         epoch: u64,
@@ -770,7 +763,7 @@ impl PgGuiApp {
     /// Record a failed query on its tab: keep a live session (so an aborted
     /// transaction can still be rolled back), discard a dead or superseded
     /// one, clear the tab's result, and surface the error.
-    pub(in crate::app) fn on_query_error(
+    fn on_query_error(
         &mut self,
         tab_id: u64,
         epoch: u64,
@@ -919,6 +912,109 @@ impl PgGuiApp {
                         ),
                         cx,
                     );
+                }
+                Err(err) => {
+                    this.on_query_error(tab_id, epoch, Some(session), &err, window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Toggle the active tab's autocommit mode. Turning it ON commits any
+    /// transaction the tab left open while it was OFF.
+    pub(in crate::app) fn toggle_autocommit(
+        &mut self,
+        _: &ToggleAutocommit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ix = self.active_tab;
+        if self.tabs.get(ix).is_none_or(|tab| tab.running) {
+            return;
+        }
+        let now_on = !self.tabs[ix].autocommit;
+        self.tabs[ix].autocommit = now_on;
+        // Remember the toggle as the default that seeds future tabs and
+        // survives restart; without this the change is lost on exit.
+        self.config.autocommit = now_on;
+        self.save_config();
+        if now_on && self.active_in_txn() {
+            self.end_txn(true, window, cx);
+        } else {
+            self.set_status(
+                format!("Autocommit {}", if now_on { "on" } else { "off" }),
+                cx,
+            );
+            cx.notify();
+        }
+    }
+
+    pub(in crate::app) fn commit_txn(
+        &mut self,
+        _: &Commit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.end_txn(true, window, cx);
+    }
+
+    pub(in crate::app) fn rollback_txn(
+        &mut self,
+        _: &Rollback,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.end_txn(false, window, cx);
+    }
+
+    /// Commit or roll back the active tab's open transaction on its session.
+    fn end_txn(&mut self, commit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let ix = self.active_tab;
+        let Some(tab) = self.tabs.get_mut(ix) else {
+            return;
+        };
+        // Nothing to do without an open transaction, and never mid-query.
+        if tab.running || !tab.session.as_ref().is_some_and(db::Session::in_txn) {
+            return;
+        }
+        let Some(mut session) = tab.session.take() else {
+            return;
+        };
+        let tab_id = tab.id;
+        let epoch = self.db_epoch;
+        let verb = if commit { "Commit" } else { "Rollback" };
+        self.start_progress(ix, verb, cx);
+        self.set_status(
+            if commit {
+                "Committing…"
+            } else {
+                "Rolling back…"
+            },
+            cx,
+        );
+
+        cx.spawn_in(window, async move |this, cx| {
+            let (session, result) = cx
+                .background_spawn(async move {
+                    let result = if commit {
+                        session.commit()
+                    } else {
+                        session.rollback()
+                    };
+                    (session, result)
+                })
+                .await;
+
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => {
+                    if let Some(ix) = this.settle_session(tab_id, epoch, session) {
+                        // Ending the transaction closed any cursor with it.
+                        this.tabs[ix].result.has_more = false;
+                    }
+                    this.set_status(if commit { "Committed" } else { "Rolled back" }, cx);
+                    cx.notify();
                 }
                 Err(err) => {
                     this.on_query_error(tab_id, epoch, Some(session), &err, window, cx);

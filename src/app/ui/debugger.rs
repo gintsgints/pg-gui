@@ -115,7 +115,7 @@ impl PgGuiApp {
     /// for the target to trap), plus any output or error, so a run that never
     /// traps is visible rather than silent. Once stopped, the panel shows the
     /// variables/stack instead and the source is read in the editor.
-    pub(in crate::app) fn render_debug_status(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_debug_status(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(dbg) = self.debug.as_ref() else {
             return div().into_any_element();
         };
@@ -142,7 +142,7 @@ impl PgGuiApp {
 
     /// Variables of the active frame (click to change) over the call stack
     /// (click a frame to inspect it).
-    pub(in crate::app) fn render_debug_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_debug_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(stop) = self.debug.as_ref().and_then(|d| d.stop.as_ref()) else {
             return div().into_any_element();
         };

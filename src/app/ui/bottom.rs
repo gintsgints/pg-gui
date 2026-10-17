@@ -22,7 +22,7 @@ impl PgGuiApp {
     /// when everything fits on one page.
     /// A small outline button that switches the bottom panel to `view`. The
     /// icon is a text glyph, like the rest of the app's small controls.
-    pub(in crate::app) fn bottom_view_button(
+    fn bottom_view_button(
         view: BottomView,
         glyph: &'static str,
         tooltip: &'static str,
@@ -44,10 +44,7 @@ impl PgGuiApp {
 
     /// The Plan switch button, present only once the tab holds a plan — the
     /// view has nothing to show before the first `EXPLAIN`.
-    pub(in crate::app) fn plan_view_button(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement + use<>> {
+    fn plan_view_button(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         self.tabs
             .get(self.active_tab)?
             .result
@@ -67,10 +64,7 @@ impl PgGuiApp {
     /// The row of buttons switching between the result sets a multi-statement
     /// run produced, one per statement that returned rows. `None` when the run
     /// produced at most one.
-    pub(in crate::app) fn render_result_selector(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement + use<>> {
+    fn render_result_selector(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let result = &self.tabs.get(self.active_tab)?.result;
         if result.results.len() < 2 {
             return None;
@@ -300,7 +294,7 @@ impl PgGuiApp {
     /// the whole stack: the chart fills the area it is handed and clips what
     /// does not fit, so a plan deeper than the pane scrolls rather than
     /// squeezing its rows.
-    pub(in crate::app) fn render_plan_chart(
+    fn render_plan_chart(
         plan: &plan::Plan,
         focus: Option<FlamePath>,
         cx: &mut Context<Self>,
@@ -333,7 +327,7 @@ impl PgGuiApp {
     /// The plan view's bottom row: the switches back to the table and the log,
     /// plus — once there is a plan to zoom — the way out of a zoom. `zoomed`
     /// is `None` before the first `EXPLAIN`, when there is nothing to reset.
-    pub(in crate::app) fn render_plan_footer(
+    fn render_plan_footer(
         zoomed: Option<bool>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
@@ -373,7 +367,7 @@ impl PgGuiApp {
 
     /// "N rows selected" beside the pager while a multi-row selection is
     /// up, since it can span pages the grid is not showing.
-    pub(in crate::app) fn render_row_selection_count(
+    fn render_row_selection_count(
         &self,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement + use<>> {
@@ -390,10 +384,7 @@ impl PgGuiApp {
         })
     }
 
-    pub(in crate::app) fn render_results_pager(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement + use<>> {
+    fn render_results_pager(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let delegate = self.results.read(cx).delegate();
         let (page, page_count, total_rows) = (
             delegate.page(),

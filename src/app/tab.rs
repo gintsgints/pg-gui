@@ -366,7 +366,7 @@ impl PgGuiApp {
 
     /// Whether any tab still has work in flight; the tick loop runs only
     /// while this holds.
-    pub(super) fn any_progress(&self) -> bool {
+    fn any_progress(&self) -> bool {
         self.tabs.iter().any(|tab| tab.progress.is_some())
     }
 
@@ -579,12 +579,7 @@ impl PgGuiApp {
 
     /// Continue closing a tab once any open transaction has been dealt with:
     /// prompt for work the close would lose, otherwise close.
-    pub(super) fn after_txn_close(
-        &mut self,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn after_txn_close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.close_loses_work(ix) {
             self.prompt_save_before_close(ix, window, cx);
         } else {
@@ -600,7 +595,7 @@ impl PgGuiApp {
     /// disk. Quitting is the other way round: an untitled tab's text survives
     /// a quit (config.json holds it, parked or not), so the quit guard stays
     /// on `dirty` alone.
-    pub(super) fn close_loses_work(&self, ix: usize) -> bool {
+    fn close_loses_work(&self, ix: usize) -> bool {
         let Some(tab) = self.tabs.get(ix) else {
             return false;
         };
@@ -617,12 +612,7 @@ impl PgGuiApp {
     /// closing drops the connection, which rolls the transaction back.
     /// Committing on close is intentionally not offered; commit explicitly
     /// first if the work should be kept.
-    pub(super) fn prompt_txn_before_close(
-        &mut self,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn prompt_txn_before_close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if window.has_active_dialog(cx) {
             return;
         }
@@ -666,12 +656,7 @@ impl PgGuiApp {
 
     /// Ask whether to save a tab before closing it — its unsaved edits, or,
     /// for an untitled tab, the script itself.
-    pub(super) fn prompt_save_before_close(
-        &mut self,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn prompt_save_before_close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if window.has_active_dialog(cx) {
             return;
         }
@@ -784,12 +769,7 @@ impl PgGuiApp {
 
     /// Save a tab (prompting for a path if it has no file) and close it
     /// once the write succeeds.
-    pub(super) fn save_tab_then_close(
-        &mut self,
-        ix: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn save_tab_then_close(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_tab(ix, window, cx);
         self.save_active(true, window, cx);
     }
