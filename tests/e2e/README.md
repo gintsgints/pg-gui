@@ -258,14 +258,18 @@ which tells the two kinds apart: a plain plan never runs it, `ANALYZE` does.
 
 ### `export`: exporting a result set (needs a database)
 
-Connection ▸ Export as CSV… re-runs the statement under the cursor through
-`COPY … TO STDOUT WITH (FORMAT csv, HEADER)` and writes it to the file the
-platform's save panel names. The scenario seeds `last_dir` with its scratch
-directory, so the panel opens there, and checks the file on disk.
+Connection ▸ Export as CSV… and Export as INSERT… re-run the statement under
+the cursor and write its result to the file the platform's save panel names:
+CSV through `COPY … TO STDOUT WITH (FORMAT csv, HEADER)`, INSERT as one
+statement per row. The scenarios seed `last_dir` with their scratch
+directory, so the panel opens there, and check the file on disk. Their query
+returns four rows whose values an export has to quote or spell out: a comma,
+a double quote, a single quote, and a NULL.
 
 | Test | What it checks |
 |---|---|
-| `export_csv_writes_result_set` | A four-row query with a comma, a double quote and a NULL among its values exports to exactly the header line plus one line per row, the comma and quote values quoted and the NULL left empty. |
+| `export_csv_writes_result_set` | The CSV holds exactly the header line plus one line per row: the comma and double-quote values quoted (the quote doubled), the NULL left empty. |
+| `export_inserts_writes_replayable_script` | The script holds exactly one `INSERT INTO <schema>.items ("id", "label") VALUES (…);` per row, every value a literal (the single quote doubled) and the NULL spelled out; run against the emptied table, it puts all four rows back. |
 
 ### `transactions`: autocommit, Commit and Rollback (needs a database)
 
