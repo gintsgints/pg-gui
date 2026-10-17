@@ -1,6 +1,11 @@
 //! Rendering, split by panel. Pieces several panels share live here.
 
+mod bottom;
+mod chrome;
+mod db_browser;
+mod debugger;
 mod files;
+mod workspace;
 
 use gpui::{
     App, ClickEvent, InteractiveElement as _, MouseButton, ParentElement as _, Pixels,
