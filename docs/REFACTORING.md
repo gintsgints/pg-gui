@@ -103,12 +103,13 @@ Findings that change the plan below:
 - Step 1 done: `src/app/tab.rs`. New modules are *child* modules of `app` (`src/app/<name>.rs`, declared in `app.rs`) rather than crate-level siblings, so their `impl PgGuiApp` blocks keep reading `PgGuiApp`'s private fields; only the moved methods and the moved types' fields become `pub(super)`. Besides the items listed below it also took the run-progress clock (`start_progress*`, `PROGRESS_TICK`), the close/quit guards, and `tab_label`/`set_tab_path`/`mark_saved`.
 
 - Step 2 done: rendering is in `src/app/ui/`, one file per panel rather than one `ui/panels.rs` — `files.rs` (files panel), `db_browser.rs` (object browser), `bottom.rs` (result table, log, plan view, pager, result selector), `chrome.rs` (title bar, tab bar, session toolbar, status bar), `debugger.rs` (debug panel), `workspace.rs` (the resizable layout that composes them). The tree-row helpers the files panel and the object browser share (`tree_row_height`, `clip_label`, `tree_row_action`) sit in `src/app/ui.rs`. Methods there are `pub(in crate::app)`. Only `impl Render for PgGuiApp` stays in `app.rs`, as planned.
+- Step 3 done: `src/app/queries.rs` holds the runners (`run_query`, `run_scripts`/`run_one_script`/`prompt_run_scripts`/`start_script_run`, `explain_*`/`start_explain`), what they share once started (`on_run_event`, `settle_session`, `on_query_ok`/`on_query_error`/`on_plan_ok`, `show_query_error`, `reveal_bottom_view`), `cancel_query`, `fetch_more_rows`, and the free `run_files`. The planned separate `session.rs` folded into it: `settle_session`/`on_query_*` exist for these paths (transaction control is their only other caller), so a module of their own would have been three methods. Transaction control (`toggle_autocommit`, `commit_txn`/`rollback_txn`/`end_txn`) is left for `commands.rs`.
 
 ### Suggested order
 
 1. ~~**`tab.rs`**~~ (done) — move `EditorTab`, `TabResult`, `RunProgress`, `build_tab`, `activate_tab`, `close_tab_at`, `refresh_dirty`, `show_tab_result`, `add_tab`/`insert_tab_at`. Lowest coupling, highest clarity gain.
 2. ~~**One render panel at a time**~~ (done) — e.g. `render_files_panel` + helpers into `ui/panels.rs`. Keep `render` in `app.rs` until the end.
-3. **`queries.rs`** — `run_query`, `run_scripts`, `start_explain` and their `on_*` settle helpers.
+3. ~~**`queries.rs`**~~ (done) — `run_query`, `run_scripts`, `start_explain` and their `on_*` settle helpers.
 4. **`commands.rs`** — remaining action handlers.
 5. Delete nothing until the split compiles and tests pass; then remove the old code from `app.rs`.
 
