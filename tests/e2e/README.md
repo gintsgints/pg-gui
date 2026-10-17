@@ -242,6 +242,20 @@ its first cell; what the grid holds in all, off cmd-a and cmd-c.
 | `log_shows_failed_run_and_copies` | No database needed: a run against the seeded dead connection fails, the panel switches to the log, and a mouse sweep plus cmd-c copies the `Connection refused` line. |
 | `log_shows_server_notices` | A `DO` block raising a notice and a warning returns no rows, so the panel shows the log by itself; both messages are there, in the order raised. |
 
+### `explain`: query plans (needs a database)
+
+The flame graph cannot be read from outside the window, so the scenarios
+watch the tab's session from the database instead: once an explain has
+finished, the app's backend sits idle with the `EXPLAIN (…)` it sent as its
+last statement (`Schema::backends`). The statement explained is an insert,
+which tells the two kinds apart: a plain plan never runs it, `ANALYZE` does.
+
+| Test | What it checks |
+|---|---|
+| `explain_plan_does_not_run_statement` | cmd-e sends `EXPLAIN (FORMAT JSON)` over the statement under the cursor, and the insert never runs. |
+| `explain_analyze_runs_statement` | cmd-shift-e sends `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`, which runs the insert; with autocommit on, the row is committed. |
+| `explain_analyze_rolls_back_without_autocommit` | With autocommit off, the analyzed insert lands in the tab's open transaction, uncommitted, and Session ▸ Rollback undoes it. |
+
 ### `transactions`: autocommit, Commit and Rollback (needs a database)
 
 Each scenario runs `insert into <schema>.t values (1);` from the editor and
@@ -261,7 +275,7 @@ on with Session ▸ Toggle Autocommit, and the change is confirmed through
 
 ## Database-backed scenarios
 
-The `query`, `db_viewer`, `debugger` and `transactions` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
+The `query`, `db_viewer`, `debugger`, `explain` and `transactions` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
 or provisions one; it uses a database that already exists. Choose it with
 `PG_GUI_E2E_DATABASE`:
 
@@ -391,7 +405,7 @@ Harness API:
 | Call | Purpose |
 |---|---|
 | `App::launch()` / `App::launch_with(&Value)` | Starts the app on a scratch config seeded with `default_seed()` or your own JSON, and waits for the window. |
-| `Schema::create(test)` | Creates the scenario's scratch schema, or returns `None` (the scenario returns early) when `PG_GUI_E2E_DATABASE` is unset. `name()`, `execute(sql)` (`{schema}` is replaced by the name), `table_exists(table)`, `row_count(table)`, `sequence_calls(sequence)`, `open_transactions()`. Before dropping, it ends any other backend whose query names the schema (a debug target left trapped). Dropped with `CASCADE` on drop. |
+| `Schema::create(test)` | Creates the scenario's scratch schema, or returns `None` (the scenario returns early) when `PG_GUI_E2E_DATABASE` is unset. `name()`, `execute(sql)` (`{schema}` is replaced by the name), `table_exists(table)`, `row_count(table)`, `sequence_calls(sequence)`, `open_transactions()`, `backends()`. Before dropping, it ends any other backend whose query names the schema (a debug target left trapped). Dropped with `CASCADE` on drop. |
 | `App::launch_with_database(&Schema, script)` | Starts the app connected to the schema's database, the database panel showing, with one tab holding `script`. |
 | `click_db_row(Button, row)`, `expand_db_row(row)` | Database panel: click tree row `row` (0 = top); make sure folder row `row` is expanded (safe to repeat). |
 | `retry_until(what, timeout, attempt, pred)` | Repeats `attempt` until `config.json` satisfies `pred`, for steps nothing outside the window reports on. Each attempt must be safe to repeat. |

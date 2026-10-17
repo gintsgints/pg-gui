@@ -274,6 +274,23 @@ impl Schema {
             .unwrap_or_else(|err| panic!("e2e database: {err}"))
     }
 
+    /// The state (`idle`, `idle in transaction`, `active`, …) and last
+    /// statement of every other backend whose last statement named the
+    /// schema — the app's sessions, seen from outside.
+    pub fn backends(&mut self) -> Vec<(String, String)> {
+        self.client
+            .query(
+                "select coalesce(state, ''), query from pg_stat_activity \
+                 where pid <> pg_backend_pid() and datname = current_database() \
+                 and strpos(query, $1) > 0",
+                &[&self.name],
+            )
+            .unwrap_or_else(|err| panic!("e2e database: {err}"))
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect()
+    }
+
     /// How many times `nextval` has been called on the schema's sequence
     /// `sequence`: its value once called, 0 before. Sequences are not
     /// transactional, so this sees a call the moment it is made, even inside
