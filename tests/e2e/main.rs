@@ -12,10 +12,11 @@
 //!
 //! One module per kind of scenario. `general`, `connections`, `editor`,
 //! `files_panel`, `format` and `snippets` need no database, nor do `results`'
-//! failed-run log scenario, the snippet one of `completion` and all but the
-//! last of `editor_syntax`'s. The rest of `completion`, `query`, `db_viewer`,
-//! `debugger`, `definitions`, `explain`, `export`, `hover`, `transactions`
-//! and the rest of `results` and `editor_syntax` run only when
+//! failed-run log scenario, the snippet one of `completion`, the first four
+//! of `status_bar` and all but the last of `editor_syntax`'s. The rest of
+//! `completion`, `query`, `db_viewer`, `debugger`, `definitions`, `explain`,
+//! `export`, `hover`, `transactions` and the rest of `results`, `status_bar`
+//! and `editor_syntax` run only when
 //! `PG_GUI_E2E_DATABASE` names one that is already running — `docker` for
 //! the project's `docker compose` server — and skip otherwise:
 //!
@@ -43,4 +44,5 @@ mod hover;
 mod query;
 mod results;
 mod snippets;
+mod status_bar;
 mod transactions;

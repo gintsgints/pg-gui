@@ -358,6 +358,29 @@ a double quote, a single quote, and a NULL.
 | `export_csv_writes_result_set` | The CSV holds exactly the header line plus one line per row: the comma and double-quote values quoted (the quote doubled), the NULL left empty. |
 | `export_inserts_writes_replayable_script` | The script holds exactly one `INSERT INTO <schema>.items ("id", "label") VALUES (…);` per row, every value a literal (the single quote doubled) and the NULL spelled out; run against the emptied table, it puts all four rows back. |
 
+### `status_bar`: the status bar
+
+The bar is drawn by GPUI, so it is read with text recognition:
+`App::status_bar_text` captures the window, runs the Vision framework's
+`VNRecognizeTextRequest` over it from JXA (no extra crates), and keeps the
+text whose box sits in the bottom `STATUS_BAR_HEIGHT` points, left to right.
+The whole window is recognised because the thin strip alone loses whole runs
+of text. Recognition is good but not exact (`AI` reads as `Al`, `·` as `•` or
+`-`), so the scenarios match distinctive words. The run scenarios read the
+bar in a loop until the summary shows, keeping every reading, and check the
+progress in them: each statement sleeps two seconds, long enough to be read
+at least once. The first four need no database.
+
+| Test | What it checks |
+|---|---|
+| `shows_format_on_save_state` | `fmt: on`, and `fmt: off` after Edit ▸ Format on Save. |
+| `shows_unreachable_database` | On the seeded dead connection: `database unreachable`. |
+| `shows_no_database` | On a connection string the driver cannot parse: `no schema — no database`. |
+| `shows_failed_run` | A run against the dead connection leaves `Error: connection failed…`. |
+| `shows_schema_loaded` | Connected: `SQL LSP: schema loaded`. |
+| `shows_run_progress_and_summary` | cmd-a, cmd-enter over three statements: `Running selection` with a `statement n/3` counter that climbs, then `selection: 3 statement(s) executed …`. |
+| `shows_script_batch_progress_and_summary` | Two picked scripts run from Connection ▸ Run Selected Scripts: `Running 2 script(s)` naming `alpha.sql`, then `beta.sql`, with a file's own `n/2` counter, then `2 script(s): 3 statement(s) executed …`. |
+
 ### `transactions`: autocommit, Commit and Rollback (needs a database)
 
 Each scenario runs `insert into <schema>.t values (1);` from the editor and
@@ -462,6 +485,8 @@ traffic-light buttons. The tab bar, editor, status bar and results grid
   wait on it with `wait_for_config`.
 - **Pixels.** `brightness_at` reads one pixel of a window capture, which is
   how the theme scenario sees the colours GPUI painted.
+- **Text on screen.** `status_bar_text` runs macOS's own text recognition
+  (Vision) over a window capture, which is how the status bar is read.
 - **The file system.** The files-panel scenarios check the working folder
   itself: what was created, renamed or deleted.
 
@@ -530,6 +555,7 @@ Harness API:
 | `App::launch_for_results_prepared(url, script, prepare)` | `launch_for_results` with the scratch directory handed to `prepare` first, to write files the seed points at. |
 | `click_submenu(menu, submenu, item)`, `submenu_items(menu, submenu)`, `submenu_checked(menu, submenu, item)` | Click, list or check an item in a submenu (Connection ▸ Recent, View ▸ Theme); items match with or without their check mark. |
 | `brightness_at(x, y)` | Captures the window and returns the brightness (0 black, 1 white) of the pixel at that point, through `NSBitmapImageRep` in JXA — what GPUI actually painted. |
+| `status_bar_text()` | Reads the status bar with the Vision framework's text recognition; match on distinctive words. |
 | `fill_connection_dialog(name, url)` | In the open New Connection dialog, types the name and connection string and presses Connect. |
 | `menu_checked(menu, item)` | Returns whether the item carries a check mark. |
 | `menu_bar()`, `menu_items(menu)`, `window_titles()` | Return the titles shown by the native UI. |

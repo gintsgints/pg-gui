@@ -44,6 +44,8 @@ const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for a UI reaction (a config write, a menu change).
 pub const REACT_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(100);
+/// How long a failed window lookup is retried ([`App::window_frame`]).
+const LOOKUP_RETRY: Duration = Duration::from_secs(2);
 /// `PG_GUI_LOG` for every launch: warnings and errors from everything, plus
 /// the language-server boundary at `debug`, whose "server diagnostics" line
 /// is the only outside sign that a diagnostics run has been published.
@@ -661,15 +663,27 @@ impl App {
 
     /// The main window's frame in screen points: `(x, y, width, height)`,
     /// origin at the top left of the main display.
+    ///
+    /// System Events now and then fails to find a window that is plainly
+    /// there ("Invalid index") — seen under a tight loop of captures — so a
+    /// failed lookup is retried for a moment before it counts.
     pub fn window_frame(&self) -> (f64, f64, f64, f64) {
         let process = self.process();
-        let frame = osascript(&format!(
+        let script = format!(
             "tell application \"System Events\" to tell (first window of {process} whose name starts with \"pg-gui\")\n\
              set {{x, y}} to position\n\
              set {{w, h}} to size\n\
              return (x as text) & \",\" & (y as text) & \",\" & (w as text) & \",\" & (h as text)\n\
              end tell"
-        ));
+        );
+        let start = Instant::now();
+        let frame = loop {
+            match osascript_result(&script) {
+                Ok(frame) => break frame,
+                Err(err) if start.elapsed() > LOOKUP_RETRY => panic!("{err}"),
+                Err(_) => std::thread::sleep(POLL),
+            }
+        };
         let parts: Vec<f64> = frame
             .split(',')
             .map(|part| part.trim().parse().expect("window frame number"))
@@ -946,6 +960,47 @@ impl App {
         ));
     }
 
+    /// The status bar's text, read off a capture of the window with the
+    /// Vision framework's text recognition (from JXA, so no extra crates):
+    /// the status bar is drawn by GPUI and has no other way out. The whole
+    /// window is recognised and the runs whose box sits within
+    /// [`STATUS_BAR_HEIGHT`] of its bottom edge are kept, left to right,
+    /// joined by single spaces — recognising the thin strip alone loses
+    /// whole runs of it. OCR is good but not exact (`AI` reads as `Al`, a
+    /// `·` as `•` or `-`), so callers match on distinctive words.
+    pub fn status_bar_text(&self) -> String {
+        let (_, _, _, height) = self.window_frame();
+        let shot = self.dir.join("status-bar.png");
+        assert!(self.screenshot(&shot), "capture the window");
+        let path = shot.to_str().expect("utf-8 temp path");
+        // Vision's boxes are normalised, origin at the bottom left.
+        let band = STATUS_BAR_HEIGHT / height;
+        let text = run_osascript(
+            &["-l", "JavaScript", "-"],
+            &format!(
+                "ObjC.import('Vision');\n\
+                 const request = $.VNRecognizeTextRequest.alloc.init;\n\
+                 request.usesLanguageCorrection = false;\n\
+                 const handler = $.VNImageRequestHandler.alloc\n\
+                     .initWithURLOptions($.NSURL.fileURLWithPath({path:?}), $({{}}));\n\
+                 handler.performRequestsError($([request]), null);\n\
+                 const found = [];\n\
+                 const results = request.results;\n\
+                 for (let i = 0; i < results.count; i++) {{\n\
+                     const observation = results.objectAtIndex(i);\n\
+                     const box = observation.boundingBox;\n\
+                     if (box.origin.y + box.size.height / 2 > {band}) continue;\n\
+                     found.push([box.origin.x,\n\
+                         observation.topCandidates(1).objectAtIndex(0).string.js]);\n\
+                 }}\n\
+                 found.sort((a, b) => a[0] - b[0]).map(f => f[1]).join(' ');"
+            ),
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        let _ = std::fs::remove_file(&shot);
+        text
+    }
+
     /// Brightness (0 = black, 1 = white) of the pixel drawn at `(x, y)`
     /// points from the main window's top-left corner, read off a capture of
     /// the window — the one way to see what GPUI actually painted.
@@ -1209,6 +1264,10 @@ pub fn database_seed(url: &str, script: &str) -> Value {
     seed
 }
 
+/// Height of the band at the window's bottom that [`App::status_bar_text`]
+/// reads: the status bar (a small line with its padding) and nothing above
+/// it. Measured from a capture at 100% zoom.
+const STATUS_BAR_HEIGHT: f64 = 28.;
 /// How long [`App::fill_connection_dialog`] waits for the dialog to draw.
 const DIALOG_SETTLE: Duration = Duration::from_millis(500);
 
