@@ -110,6 +110,21 @@ editor may pair on its own.
 | `save_writes_file_with_format_on_save` | On a file tab, cmd-s formats and writes; the file holds the formatted text and the tab matches it. |
 | `save_writes_file_verbatim_without_format_on_save` | With format-on-save off, cmd-s writes exactly what was typed. |
 
+### `format`: the SQL formatter
+
+No database needed. Formatting goes through the embedded language server,
+which starts in the background; a format sent before it is up only reports
+that it is unavailable, so each scenario clicks Edit ▸ Format until the buffer
+changes (formatting formatted text is a no-op) and then compares the exact
+text. The casing settings are seeded into `config.json`. The cmd-shift-f
+shortcut and format-on-save are covered in `editor`.
+
+| Test | What it checks |
+|---|---|
+| `format_menu_formats_every_statement` | Two statements are both spaced (`a, b`, `a = 1`) and lower-cased, the string literal left as it was. |
+| `upper_keywords_lower_constants` | `keyword_case` upper, `constant_case` lower: keywords (`IS NULL` among them) upper-cased, `TRUE` lower-cased, `'X'` untouched. |
+| `lower_keywords_upper_constants` | The other way round: keywords lower-cased, `TRUE` upper-cased. |
+
 ### `snippets`: the snippet picker
 
 No database needed. Edit ▸ Snippets (cmd-p) opens a searchable picker over the

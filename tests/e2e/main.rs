@@ -11,7 +11,7 @@
 //! ```
 //!
 //! One module per kind of scenario. `general`, `connections`, `editor`,
-//! `files_panel` and `snippets` need no database, nor do `results`'
+//! `files_panel`, `format` and `snippets` need no database, nor do `results`'
 //! failed-run log scenario and all but the last of `editor_syntax`'s.
 //! `query`, `db_viewer`, `debugger`, `definitions`, `explain`, `export`,
 //! `transactions` and the rest of `results` and `editor_syntax` run only
@@ -36,6 +36,7 @@ mod editor_syntax;
 mod explain;
 mod export;
 mod files_panel;
+mod format;
 mod general;
 mod query;
 mod results;
