@@ -69,6 +69,7 @@ file, and a test's full name is `module::test`.
 | `new_tab_and_close_tab` | cmd-t adds a tab and makes it active; cmd-w on that blank tab closes it with no prompt. |
 | `panel_shortcuts_toggle_panels` | cmd-1, cmd-2 and cmd-3 each flip the database, files and results panels, and pressing again flips them back. |
 | `format_on_save_menu_toggles_check_mark` | Clicking Edit ▸ Format on Save flips the menu's check mark and the stored `format_on_save` setting. |
+| `theme_menu_switches_theme` | View ▸ Theme ▸ Dark, Light and System each move the check mark to themselves alone and store `theme`; Dark paints the window dark and Light paints it light, read off a pixel of a window capture. |
 
 ### `connections`: saved connections and switching
 
@@ -374,6 +375,8 @@ traffic-light buttons. The tab bar, editor, status bar and results grid
 - **`config.json`.** The app rewrites it whenever a tab, panel or toggle
   changes, so it shows the state of everything drawn inside the window. Tests
   wait on it with `wait_for_config`.
+- **Pixels.** `brightness_at` reads one pixel of a window capture, which is
+  how the theme scenario sees the colours GPUI painted.
 - **The file system.** The files-panel scenarios check the working folder
   itself: what was created, renamed or deleted.
 
@@ -436,7 +439,8 @@ Harness API:
 | `wait_for_extra_window(what)` | Waits for a second window, such as a save panel. |
 | `click_menu(menu, item)` | Clicks a menu item. The item matches with or without its check mark. |
 | `start_debug(stop_on_entry)`, `toggle_breakpoint(row)` | Debugger: start a session on the routine under the cursor; click editor row `row`'s breakpoint dot (a `launch_for_results` layout). |
-| `click_submenu(menu, submenu, item)` | Clicks an item in a submenu, such as Connection ▸ Recent ▸ a saved connection. |
+| `click_submenu(menu, submenu, item)`, `submenu_items(menu, submenu)`, `submenu_checked(menu, submenu, item)` | Click, list or check an item in a submenu (Connection ▸ Recent, View ▸ Theme); items match with or without their check mark. |
+| `brightness_at(x, y)` | Captures the window and returns the brightness (0 black, 1 white) of the pixel at that point, through `NSBitmapImageRep` in JXA — what GPUI actually painted. |
 | `fill_connection_dialog(name, url)` | In the open New Connection dialog, types the name and connection string and presses Connect. |
 | `menu_checked(menu, item)` | Returns whether the item carries a check mark. |
 | `menu_bar()`, `menu_items(menu)`, `window_titles()` | Return the titles shown by the native UI. |
@@ -479,7 +483,6 @@ Guidelines:
   read from outside the window, so database scenarios check side effects in the
   database instead. Checking the output itself would need OCR on `screenshot`,
   or a debug-only state dump the app writes on request.
-- **The theme-switch scenario.**
 - **CI.** A runner would need Accessibility permission for the terminal process.
   GitHub-hosted macOS runners do not grant it by default, so check whether they
   allow it before adding a workflow.

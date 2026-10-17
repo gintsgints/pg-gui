@@ -899,19 +899,70 @@ impl App {
         ));
     }
 
+    /// Titles of the items in the `submenu` of the top-level `menu`,
+    /// separators omitted. A checked item keeps gpui's `✓ ` prefix.
+    pub fn submenu_items(&self, menu: &str, submenu: &str) -> Vec<String> {
+        let (menu, submenu) = (applescript_string(menu), applescript_string(submenu));
+        let process = self.process();
+        list(&osascript(&format!(
+            "tell application \"System Events\" to return name of every menu item of menu 1 of menu item {submenu} of menu 1 of menu bar item {menu} of menu bar 1 of {process}"
+        )))
+        .into_iter()
+        .filter(|title| title != "missing value")
+        .collect()
+    }
+
+    /// The live title of `item` in a submenu, matched with or without its
+    /// check mark.
+    fn submenu_item_title(&self, menu: &str, submenu: &str, item: &str) -> String {
+        let items = self.submenu_items(menu, submenu);
+        items
+            .iter()
+            .find(|title| unchecked(title) == item)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {item:?} in {menu} ▸ {submenu}: {items:?}"))
+    }
+
+    /// Whether `item` in the `submenu` of `menu` carries a check mark.
+    pub fn submenu_checked(&self, menu: &str, submenu: &str, item: &str) -> bool {
+        self.submenu_item_title(menu, submenu, item) != item
+    }
+
     /// Click `item` in the `submenu` of the top-level `menu` (Connection ▸
-    /// Recent ▸ a saved connection).
+    /// Recent ▸ a saved connection), matched with or without its check mark.
     pub fn click_submenu(&mut self, menu: &str, submenu: &str, item: &str) {
         self.focus();
-        let (menu, submenu, item) = (
-            applescript_string(menu),
-            applescript_string(submenu),
-            applescript_string(item),
-        );
+        let item = applescript_string(&self.submenu_item_title(menu, submenu, item));
+        let (menu, submenu) = (applescript_string(menu), applescript_string(submenu));
         let process = self.process();
         osascript(&format!(
             "tell application \"System Events\" to click menu item {item} of menu 1 of menu item {submenu} of menu 1 of menu bar item {menu} of menu bar 1 of {process}"
         ));
+    }
+
+    /// Brightness (0 = black, 1 = white) of the pixel drawn at `(x, y)`
+    /// points from the main window's top-left corner, read off a capture of
+    /// the window — the one way to see what GPUI actually painted.
+    pub fn brightness_at(&self, x: f64, y: f64) -> f64 {
+        let shot = self.dir.join("brightness.png");
+        assert!(self.screenshot(&shot), "capture the window");
+        let path = shot.to_str().expect("utf-8 temp path");
+        // The capture is in pixels, the window in points: scale by their
+        // ratio (2 on a Retina display).
+        let out = run_osascript(
+            &["-l", "JavaScript", "-"],
+            &format!(
+                "ObjC.import('AppKit');\n\
+                 const rep = $.NSBitmapImageRep.imageRepWithContentsOfFile({path:?});\n\
+                 const scale = rep.pixelsWide / rep.size.width;\n\
+                 const color = rep.colorAtXY(Math.round({x} * scale), Math.round({y} * scale))\n\
+                     .colorUsingColorSpace($.NSColorSpace.sRGBColorSpace);\n\
+                 (color.redComponent + color.greenComponent + color.blueComponent) / 3;"
+            ),
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        let _ = std::fs::remove_file(&shot);
+        out.parse().expect("brightness number")
     }
 
     /// Fill the connection dialog (Connection ▸ New Connection…, already

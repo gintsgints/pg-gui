@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::harness::{App, Mod};
+use crate::harness::{self, App, Mod};
 
 fn tab_count(config: &Value) -> usize {
     config["tabs"].as_array().map_or(0, Vec::len)
@@ -76,6 +76,46 @@ fn format_on_save_menu_toggles_check_mark() {
     app.click_menu("Edit", "Format on Save");
     app.wait_for_config("format_on_save on", |c| c["format_on_save"] == true);
     assert!(app.menu_checked("Edit", "Format on Save"));
+
+    app.quit();
+}
+
+/// Brightness of the results panel's empty background, well clear of the
+/// side panels and the panel's placeholder icon.
+fn background_brightness(app: &App) -> f64 {
+    let (_, _, width, height) = app.window_frame();
+    app.brightness_at(width * 0.3, height * 0.85)
+}
+
+#[test]
+fn theme_menu_switches_theme() {
+    let mut app = App::launch();
+    let checked = |app: &App| -> Vec<String> {
+        ["Light", "Dark", "System"]
+            .into_iter()
+            .filter(|theme| app.submenu_checked("View", "Theme", theme))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(checked(&app), ["System"], "the default follows the OS");
+
+    app.click_submenu("View", "Theme", "Dark");
+    app.wait_for_config("theme dark", |c| c["theme"] == "dark");
+    assert_eq!(checked(&app), ["Dark"]);
+    app.wait_for("a dark window", harness::REACT_TIMEOUT, |app| {
+        background_brightness(app) < 0.35
+    });
+
+    app.click_submenu("View", "Theme", "Light");
+    app.wait_for_config("theme light", |c| c["theme"] == "light");
+    assert_eq!(checked(&app), ["Light"]);
+    app.wait_for("a light window", harness::REACT_TIMEOUT, |app| {
+        background_brightness(app) > 0.65
+    });
+
+    app.click_submenu("View", "Theme", "System");
+    app.wait_for_config("theme system", |c| c["theme"] == "system");
+    assert_eq!(checked(&app), ["System"]);
 
     app.quit();
 }
