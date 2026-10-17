@@ -10,7 +10,8 @@
 //! cargo e2e   # alias: cargo test --features e2e --test e2e -- --test-threads=1
 //! ```
 //!
-//! One module per kind of scenario. `general`, `editor` and `files_panel` need no
+//! One module per kind of scenario. `general`, `connections`, `editor` and
+//! `files_panel` need no
 //! database, nor do `results`' failed-run log scenario and all but the last
 //! of `editor_syntax`'s. `query`, `db_viewer` and the rest of `results` and
 //! `editor_syntax` run only when `PG_GUI_E2E_DATABASE`
@@ -25,6 +26,7 @@
 
 mod harness;
 
+mod connections;
 mod db_viewer;
 mod editor;
 mod editor_syntax;

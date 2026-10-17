@@ -775,6 +775,49 @@ impl App {
         ));
     }
 
+    /// Click `item` in the `submenu` of the top-level `menu` (Connection ▸
+    /// Recent ▸ a saved connection).
+    pub fn click_submenu(&mut self, menu: &str, submenu: &str, item: &str) {
+        self.focus();
+        let (menu, submenu, item) = (
+            applescript_string(menu),
+            applescript_string(submenu),
+            applescript_string(item),
+        );
+        let process = self.process();
+        osascript(&format!(
+            "tell application \"System Events\" to click menu item {item} of menu 1 of menu item {submenu} of menu 1 of menu bar item {menu} of menu bar 1 of {process}"
+        ));
+    }
+
+    /// Fill the connection dialog (Connection ▸ New Connection…, already
+    /// opened) with `name` and the connection string `url`, then press its
+    /// Connect button. The dialog's fields have no tab order, so each is
+    /// clicked at its offset ([`ConnectionDialog`]) and typed into; the
+    /// connection string drives the host, port, database and user fields.
+    pub fn fill_connection_dialog(&mut self, name: &str, url: &str) {
+        // Nothing outside the window reports the dialog opening; it shows on
+        // the frame after the menu action, so give it a moment rather than
+        // clicking through to the editor below.
+        std::thread::sleep(DIALOG_SETTLE);
+        self.click_connection_dialog(ConnectionDialog::Name);
+        self.send_keys(&[Mod::Cmd], 'a');
+        self.type_text(name);
+        self.click_connection_dialog(ConnectionDialog::ConnectionString);
+        self.send_keys(&[Mod::Cmd], 'a');
+        self.type_text(url);
+        self.click_connection_dialog(ConnectionDialog::Connect);
+    }
+
+    /// Click `target` in the open connection dialog.
+    fn click_connection_dialog(&mut self, target: ConnectionDialog) {
+        let (_, _, width, height) = self.window_frame();
+        let (dx, dy) = target.offset();
+        // gpui-component centres a dialog horizontally and puts its top a
+        // tenth of the window's height down.
+        self.click_at(Button::Left, width / 2. + dx, height / 10. + dy);
+    }
+
     /// The config.json the app last wrote (or the seed, before its first
     /// write). A half-written file reads as `Null`; callers poll anyway.
     pub fn config(&self) -> Value {
@@ -883,6 +926,30 @@ fn database_seed(url: &str, script: &str) -> Value {
     seed["tabs"] = serde_json::json!([{ "script": script, "file": null }]);
     seed["files_panel_visible"] = Value::from(false);
     seed
+}
+
+/// How long [`App::fill_connection_dialog`] waits for the dialog to draw.
+const DIALOG_SETTLE: Duration = Duration::from_millis(500);
+
+/// A widget of the connection dialog.
+#[derive(Clone, Copy)]
+enum ConnectionDialog {
+    Name,
+    ConnectionString,
+    Connect,
+}
+
+impl ConnectionDialog {
+    /// Where the widget's middle sits, in points: horizontally from the
+    /// window's centre, vertically from the dialog's top edge. Measured from
+    /// a capture at 100% zoom; the dialog is a fixed 520 wide.
+    fn offset(self) -> (f64, f64) {
+        match self {
+            ConnectionDialog::Name => (0., 87.),
+            ConnectionDialog::ConnectionString => (0., 459.),
+            ConnectionDialog::Connect => (202., 523.),
+        }
+    }
 }
 
 /// Top edge of the results panel's content (inside its padding), in window

@@ -70,6 +70,24 @@ file, and a test's full name is `module::test`.
 | `panel_shortcuts_toggle_panels` | cmd-1, cmd-2 and cmd-3 each flip the database, files and results panels, and pressing again flips them back. |
 | `format_on_save_menu_toggles_check_mark` | Clicking Edit ▸ Format on Save flips the menu's check mark and the stored `format_on_save` setting. |
 
+### `connections`: saved connections and switching
+
+No database needed: both connections point at `127.0.0.1:1`, where nothing
+listens, which is all a switch needs. Untitled tabs belong to the connection,
+so switching parks them in `config.json`'s `parked_tabs` under the outgoing
+connection's name and brings back the incoming one's; the scenarios check
+both lists. Connection ▸ Recent is a native submenu, clicked with
+`click_submenu`. The New Connection dialog's fields have no tab order, so
+`fill_connection_dialog` clicks the Name and Connection string fields and the
+Connect button at offsets measured from a capture (`ConnectionDialog` in
+`harness.rs`): from the window's centre horizontally, and from the dialog's
+top edge, which gpui-component puts a tenth of the window's height down.
+
+| Test | What it checks |
+|---|---|
+| `recent_menu_switches_untitled_tabs` | With an untitled and a file tab on `first`, Recent ▸ `second` parks the untitled tab and keeps the file tab; a tab typed on `second` is parked when switching back, `first`'s returns to its old slot, and switching again restores `second`'s. |
+| `new_connection_dialog_creates_and_switches` | New Connection… with a name and connection string saves and selects it on a blank tab, parking `first`'s script; Recent ▸ `first` brings the script back. |
+
 ### `editor`: the SQL editor
 
 No database needed. The editor cannot be read from outside the window, but the
@@ -337,6 +355,8 @@ Harness API:
 | `click_files_new_script()`, `filter_files(text)`, `click_files_row(Button, row)` | Files panel: the header "+", the filter box (text replaced), tree row `row` (0 = top). |
 | `wait_for_extra_window(what)` | Waits for a second window, such as a save panel. |
 | `click_menu(menu, item)` | Clicks a menu item. The item matches with or without its check mark. |
+| `click_submenu(menu, submenu, item)` | Clicks an item in a submenu, such as Connection ▸ Recent ▸ a saved connection. |
+| `fill_connection_dialog(name, url)` | In the open New Connection dialog, types the name and connection string and presses Connect. |
 | `menu_checked(menu, item)` | Returns whether the item carries a check mark. |
 | `menu_bar()`, `menu_items(menu)`, `window_titles()` | Return the titles shown by the native UI. |
 | `config()` | Returns the `config.json` the app last wrote, as `serde_json::Value`. |
