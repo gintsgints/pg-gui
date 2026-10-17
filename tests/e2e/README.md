@@ -2,7 +2,9 @@
 
 These tests launch the real `pg-gui` binary and drive it the way a user would.
 They press shortcuts, click menu items and quit with cmd-q, then check what the
-app did. They run on macOS only and need no database.
+app did. They run on macOS only. Most need no database; the few that do are
+opt-in and run against one you have already started (see
+[Database-backed scenarios](#database-backed-scenarios)).
 
 ```sh
 cargo test --features e2e --test e2e
@@ -33,6 +35,7 @@ cargo test --features e2e --test e2e                          # all scenarios
 cargo test --features e2e --test e2e new_tab_and_close_tab    # one scenario
 cargo test --features e2e --test e2e -- --nocapture           # show harness output
 cargo test --features e2e --test e2e -- --list                # list scenarios
+PG_GUI_E2E_DATABASE=docker cargo test --features e2e --test e2e   # include database scenarios
 ```
 
 Cargo builds the binary before the tests run, so the tests always drive the
@@ -55,6 +58,38 @@ tests, which is harmless but slower.
 | `files_panel_filter_finds_nested_script` | Typing in the files filter reduces the tree to a script inside collapsed folders (plus its expanded parents); clicking its row opens it. |
 | `files_panel_rename_from_context_menu` | Filter to one file, right-click ▸ Rename…, type a new name: the file is renamed on disk (`.sql` forced back on), neighbours untouched. |
 | `files_panel_delete_from_context_menu` | Filter to one file, right-click ▸ Delete…, Enter confirms: only that file is removed. |
+| `run_query_executes_against_database` | *Database.* A tab holding `create table …`; cmd-enter runs it, and the table appears in the database. The table is dropped afterwards, pass or fail. |
+
+## Database-backed scenarios
+
+Scenarios marked *Database* need a running PostgreSQL. The harness never starts
+or provisions one; it uses a database that already exists. Choose it with
+`PG_GUI_E2E_DATABASE`:
+
+| Value | Database |
+|---|---|
+| unset or empty | None. The database scenarios print a "skipped" line and pass. |
+| `docker` | The project's `docker compose` server: `postgres://pgui:pgui@127.0.0.1:5433/pgui_test`. |
+| any other value | Used as the connection string. |
+
+With the project database:
+
+```sh
+docker compose up -d
+PG_GUI_E2E_DATABASE=docker cargo test --features e2e --test e2e
+```
+
+When the variable is set, an unreachable server fails the scenario instead of
+skipping it, because you asked for those scenarios to run.
+
+The test opens its own connection (`harness::Db`) beside the app to check what
+the app did, since the results grid cannot be read from outside the window.
+`App::launch_with_database(url, script)` starts the app connected to that
+database, saved under the name `e2e`, with one tab holding `script`. Objects a
+scenario creates are named with `harness::unique_name(prefix)`
+(`prefix_<pid>_<n>`) so runs never collide, and are dropped when the scenario
+ends, pass or fail. The scenarios create objects only in the `public` schema
+and never touch the project's own tables.
 
 ## Isolation
 
@@ -65,9 +100,9 @@ result:
 - Your own `config.json`, snippets and log are never read or changed.
 - A pg-gui you already have open is left alone. Its single-instance socket lives
   in the real config directory, so the test instance does not find it.
-- No database server is contacted. The seeded `config.json` points at
-  `127.0.0.1:1`, where nothing listens, so connection attempts fail
-  immediately.
+- No database server is contacted unless you opt in with
+  `PG_GUI_E2E_DATABASE`. The seeded `config.json` points at `127.0.0.1:1`,
+  where nothing listens, so connection attempts fail immediately.
 
 When a test passes, its directory is removed.
 
@@ -147,6 +182,8 @@ Harness API:
 | Call | Purpose |
 |---|---|
 | `App::launch()` / `App::launch_with(&Value)` | Starts the app on a scratch config seeded with `default_seed()` or your own JSON, and waits for the window. |
+| `App::launch_with_database(url, script)` | Starts the app connected to `url` with one tab holding `script`. Get `url` from `Db::connect`. |
+| `Db::connect(test)` | Returns the test's own database connection and the URL, or `None` (the scenario returns early) when `PG_GUI_E2E_DATABASE` is unset. `execute(sql)`, `table_exists(name)`. |
 | `App::launch_with_folder(&[&str])` | Starts the app with the files panel on a fresh working folder holding those (empty) files; a path ending in `/` is a folder. `work_dir()` returns it. |
 | `send_keys(&[Mod], char)` | Brings the app to the front and types the key with modifiers held. |
 | `type_text(str)`, `press(&[Mod], Key)` | Types text into the focused element; presses a non-printing key (`Key::Return`, `Key::Up`). |
@@ -189,9 +226,10 @@ Guidelines:
 
 ## Not covered yet
 
-- **Database-backed scenarios** (running a query, viewing results or the plan).
-  The results grid cannot be read from outside the window. The options are OCR
-  on `screenshot`, or a debug-only state dump the app writes on request.
+- **Reading query output** (the results grid, the log, the plan). It cannot be
+  read from outside the window, so database scenarios check side effects in the
+  database instead. Checking the output itself would need OCR on `screenshot`,
+  or a debug-only state dump the app writes on request.
 - **The theme-switch scenario.**
 - **CI.** A runner would need Accessibility permission for the terminal process.
   GitHub-hosted macOS runners do not grant it by default, so check whether they

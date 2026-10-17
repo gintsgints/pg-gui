@@ -10,7 +10,13 @@
 //! cargo test --features e2e --test e2e
 //! ```
 //!
-//! None of them needs a database.
+//! Most need no database. The database-backed ones run only when
+//! `PG_GUI_E2E_DATABASE` names one that is already running — `docker` for
+//! the project's `docker compose` server — and skip otherwise:
+//!
+//! ```sh
+//! PG_GUI_E2E_DATABASE=docker cargo test --features e2e --test e2e
+//! ```
 
 #![cfg(target_os = "macos")]
 
@@ -18,7 +24,7 @@ mod harness;
 
 use std::path::Path;
 
-use harness::{App, Button, Key, Mod};
+use harness::{App, Button, Db, Key, Mod};
 use serde_json::Value;
 
 fn tab_count(config: &Value) -> usize {
@@ -206,6 +212,42 @@ fn files_panel_delete_from_context_menu() {
         work.join("a_keep.sql").is_file(),
         "only the filtered row goes"
     );
+
+    app.quit();
+}
+
+/// Drops a table the scenario created, pass or fail.
+struct DropTable<'a> {
+    db: &'a mut Db,
+    name: String,
+}
+
+impl Drop for DropTable<'_> {
+    fn drop(&mut self) {
+        self.db
+            .execute(&format!("drop table if exists public.{}", self.name));
+    }
+}
+
+#[test]
+fn run_query_executes_against_database() {
+    let Some((mut db, url)) = Db::connect("run_query_executes_against_database") else {
+        return;
+    };
+    let table = harness::unique_name("e2e_run_query");
+    let cleanup = DropTable {
+        db: &mut db,
+        name: table.clone(),
+    };
+
+    // One statement and the cursor at the buffer's start, so cmd-enter runs
+    // exactly it; a new tab autocommits.
+    let mut app =
+        App::launch_with_database(&url, &format!("create table public.{table} (id int);"));
+    app.press(&[Mod::Cmd], Key::Return);
+    app.wait_for("the table created by the run", harness::DB_TIMEOUT, |_| {
+        cleanup.db.table_exists(&table)
+    });
 
     app.quit();
 }

@@ -21,6 +21,11 @@
 //! Every launch gets its own `PG_GUI_CONFIG_DIR`, which keeps the user's
 //! config.json untouched and keeps the instance socket from finding (and
 //! activating) the user's own running pg-gui.
+//!
+//! Database-backed scenarios are opt-in: they run against a database the
+//! user has already started (normally the project's `docker compose`
+//! server) named by [`DATABASE_ENV`], and skip themselves when it is unset.
+//! The harness never starts, stops or provisions a server.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -53,6 +58,84 @@ const FILES_HEADER_Y: f64 = 50.;
 const FILES_FILTER_Y: f64 = 75.;
 const FILES_FIRST_ROW_Y: f64 = 106.;
 const FILES_ROW_HEIGHT: f64 = 34.;
+
+/// Names the pre-created database the database-backed scenarios run
+/// against: a connection string, or `docker` for the project's own
+/// `docker compose` server ([`DOCKER_DATABASE_URL`]). Unset or empty, those
+/// scenarios skip.
+pub const DATABASE_ENV: &str = "PG_GUI_E2E_DATABASE";
+/// The server `docker-compose.yml` starts: host port 5433, user, password
+/// and database `pgui`/`pgui`/`pgui_test`.
+pub const DOCKER_DATABASE_URL: &str = "postgres://pgui:pgui@127.0.0.1:5433/pgui_test";
+/// How long to wait for something that has to reach the database: the
+/// app's first Run opens its session then.
+pub const DB_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The connection string [`DATABASE_ENV`] selects, or `None` when the
+/// database-backed scenarios are off.
+pub fn database_url() -> Option<String> {
+    let value = std::env::var(DATABASE_ENV).ok()?;
+    match value.trim() {
+        "" => None,
+        "docker" => Some(DOCKER_DATABASE_URL.to_string()),
+        url => Some(url.to_string()),
+    }
+}
+
+/// A connection of the test's own to the database [`database_url`] names,
+/// for setting up and checking what a scenario did through the app. Opening
+/// one fails the test outright: the user asked for the database scenarios,
+/// so an unreachable server is an error, not a skip.
+pub struct Db {
+    client: postgres::Client,
+}
+
+impl Db {
+    /// Connect, or return `None` (after saying so) when [`DATABASE_ENV`] is
+    /// unset, so the calling scenario can skip.
+    pub fn connect(test: &str) -> Option<(Self, String)> {
+        let Some(url) = database_url() else {
+            eprintln!("e2e: {test} skipped; set {DATABASE_ENV}=docker (or a URL) to run it");
+            return None;
+        };
+        let client = postgres::Client::connect(&url, postgres::NoTls).unwrap_or_else(|err| {
+            panic!(
+                "{DATABASE_ENV} is set but the database is unreachable: {err}\n\
+                 hint: start the project database with `docker compose up -d`"
+            )
+        });
+        Some((Self { client }, url))
+    }
+
+    /// Run `sql` (one or more statements), panicking on failure.
+    pub fn execute(&mut self, sql: &str) {
+        self.client
+            .batch_execute(sql)
+            .unwrap_or_else(|err| panic!("e2e database: {err}\nsql: {sql}"));
+    }
+
+    /// Whether a table named `name` exists in the `public` schema.
+    pub fn table_exists(&mut self, name: &str) -> bool {
+        self.client
+            .query_one(
+                "select exists (select 1 from pg_tables \
+                 where schemaname = 'public' and tablename = $1)",
+                &[&name],
+            )
+            .and_then(|row| row.try_get(0))
+            .unwrap_or_else(|err| panic!("e2e database: {err}"))
+    }
+}
+
+/// A name unique to this test process and call, for objects a scenario
+/// creates in the shared database (`prefix_<pid>_<n>`).
+pub fn unique_name(prefix: &str) -> String {
+    format!(
+        "{prefix}_{}_{}",
+        std::process::id(),
+        LAUNCHES.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 /// A unique, empty scratch directory for one launch.
 fn scratch_dir() -> PathBuf {
@@ -169,6 +252,16 @@ impl App {
         seed["files_panel_width"] = Value::from(FILES_PANEL_WIDTH);
         seed["db_panel_visible"] = Value::from(false);
         Self::start(screen, dir, &seed)
+    }
+
+    /// Start the app connected to `url` (see [`Db::connect`]) with one tab
+    /// holding `script`. The connection is saved under the name `e2e`.
+    pub fn launch_with_database(url: &str, script: &str) -> Self {
+        let mut seed = default_seed();
+        seed["connection_string"] = Value::from(url);
+        seed["recent_connections"] = serde_json::json!([{ "name": "e2e", "url": url }]);
+        seed["tabs"] = serde_json::json!([{ "script": script, "file": null }]);
+        Self::launch_with(&seed)
     }
 
     /// The working folder [`Self::launch_with_folder`] created.
