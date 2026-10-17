@@ -242,9 +242,26 @@ its first cell; what the grid holds in all, off cmd-a and cmd-c.
 | `log_shows_failed_run_and_copies` | No database needed: a run against the seeded dead connection fails, the panel switches to the log, and a mouse sweep plus cmd-c copies the `Connection refused` line. |
 | `log_shows_server_notices` | A `DO` block raising a notice and a warning returns no rows, so the panel shows the log by itself; both messages are there, in the order raised. |
 
+### `transactions`: autocommit, Commit and Rollback (needs a database)
+
+Each scenario runs `insert into <schema>.t values (1);` from the editor and
+watches the row from the scenario's own connection, which sees it only once the
+app's transaction has committed. To tell "ran but not committed" from "not run
+yet", it waits for the app's backend to show up as `idle in transaction` in
+`pg_stat_activity` (`Schema::open_transactions`). Autocommit is turned off and
+on with Session ▸ Toggle Autocommit, and the change is confirmed through
+`config.json`'s `autocommit`.
+
+| Test | What it checks |
+|---|---|
+| `autocommit_commits_each_run` | With autocommit on (the default), the row is visible right after the run and no transaction is left open. |
+| `manual_commit_needs_commit` | With autocommit off, the run leaves the row in an open transaction, invisible; Session ▸ Commit makes it visible and ends the transaction. |
+| `manual_rollback_discards` | With autocommit off, Session ▸ Rollback ends the transaction and the row never lands. |
+| `autocommit_on_commits_open_transaction` | With autocommit off and a run left open, turning autocommit back on commits it. |
+
 ## Database-backed scenarios
 
-The `query`, `db_viewer` and `debugger` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
+The `query`, `db_viewer`, `debugger` and `transactions` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
 or provisions one; it uses a database that already exists. Choose it with
 `PG_GUI_E2E_DATABASE`:
 
@@ -374,7 +391,7 @@ Harness API:
 | Call | Purpose |
 |---|---|
 | `App::launch()` / `App::launch_with(&Value)` | Starts the app on a scratch config seeded with `default_seed()` or your own JSON, and waits for the window. |
-| `Schema::create(test)` | Creates the scenario's scratch schema, or returns `None` (the scenario returns early) when `PG_GUI_E2E_DATABASE` is unset. `name()`, `execute(sql)` (`{schema}` is replaced by the name), `table_exists(table)`, `row_count(table)`, `sequence_calls(sequence)`. Before dropping, it ends any other backend whose query names the schema (a debug target left trapped). Dropped with `CASCADE` on drop. |
+| `Schema::create(test)` | Creates the scenario's scratch schema, or returns `None` (the scenario returns early) when `PG_GUI_E2E_DATABASE` is unset. `name()`, `execute(sql)` (`{schema}` is replaced by the name), `table_exists(table)`, `row_count(table)`, `sequence_calls(sequence)`, `open_transactions()`. Before dropping, it ends any other backend whose query names the schema (a debug target left trapped). Dropped with `CASCADE` on drop. |
 | `App::launch_with_database(&Schema, script)` | Starts the app connected to the schema's database, the database panel showing, with one tab holding `script`. |
 | `click_db_row(Button, row)`, `expand_db_row(row)` | Database panel: click tree row `row` (0 = top); make sure folder row `row` is expanded (safe to repeat). |
 | `retry_until(what, timeout, attempt, pred)` | Repeats `attempt` until `config.json` satisfies `pred`, for steps nothing outside the window reports on. Each attempt must be safe to repeat. |

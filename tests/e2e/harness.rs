@@ -259,6 +259,21 @@ impl Schema {
             .unwrap_or_else(|err| panic!("e2e database: {err}\nsql: {sql}"))
     }
 
+    /// How many other backends sit in an open transaction whose last
+    /// statement named the schema — a tab with autocommit off that has run
+    /// something and not yet committed or rolled back.
+    pub fn open_transactions(&mut self) -> i64 {
+        self.client
+            .query_one(
+                "select count(*) from pg_stat_activity \
+                 where pid <> pg_backend_pid() and datname = current_database() \
+                 and state like 'idle in transaction%' and strpos(query, $1) > 0",
+                &[&self.name],
+            )
+            .and_then(|row| row.try_get(0))
+            .unwrap_or_else(|err| panic!("e2e database: {err}"))
+    }
+
     /// How many times `nextval` has been called on the schema's sequence
     /// `sequence`: its value once called, 0 before. Sequences are not
     /// transactional, so this sees a call the moment it is made, even inside
