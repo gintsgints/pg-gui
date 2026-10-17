@@ -1,0 +1,6 @@
+[alias]
+# UI end-to-end tests (tests/e2e/). One test thread: the tests share one
+# screen and queue on a harness mutex anyway, and libtest's hard-coded
+# "has been running for over 60 seconds" clock would otherwise count the
+# time spent waiting in that queue. Filters pass through: `cargo e2e results::`.
+e2e = "test --features e2e --test e2e -- --test-threads=1"

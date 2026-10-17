@@ -7,7 +7,7 @@
 //! runs on request:
 //!
 //! ```sh
-//! cargo test --features e2e --test e2e
+//! cargo e2e   # alias: cargo test --features e2e --test e2e -- --test-threads=1
 //! ```
 //!
 //! One module per kind of scenario. `general` and `files_panel` need no
@@ -17,7 +17,7 @@
 //! `docker compose` server — and skip otherwise:
 //!
 //! ```sh
-//! PG_GUI_E2E_DATABASE=docker cargo test --features e2e --test e2e
+//! PG_GUI_E2E_DATABASE=docker cargo e2e
 //! ```
 
 #![cfg(target_os = "macos")]

@@ -7,11 +7,13 @@ opt-in and run against one you have already started (see
 [Database-backed scenarios](#database-backed-scenarios)).
 
 ```sh
-cargo test --features e2e --test e2e
+cargo e2e
 ```
 
-The test target is built only with the `e2e` Cargo feature (`required-features`
-in `Cargo.toml`), because the tests take over the keyboard focus. Without the
+`cargo e2e` is an alias (`.cargo/config.toml`) for
+`cargo test --features e2e --test e2e -- --test-threads=1`. The test target is
+built only with the `e2e` Cargo feature (`required-features` in `Cargo.toml`),
+because the tests take over the keyboard focus. Without the
 feature, `cargo test` skips the target completely: it is not built, not run and
 not listed. That includes `cargo test -- --ignored`, so these tests never run
 alongside the database-backed tests in `src/`. The feature changes nothing in
@@ -24,28 +26,35 @@ the app itself.
   ▸ Accessibility. Without it, every test fails with an `osascript` error that
   includes a hint about this permission. After you grant it, restart the
   terminal app.
-- **Leave the machine alone while the tests run** (about 40 s for the full
-  set). Keystrokes go to whatever app is frontmost, so if you type or click
+- **Leave the machine alone while the tests run** (about a minute for the
+  full set, about two with the database scenarios). Keystrokes go to whatever app is frontmost, so if you type or click
   somewhere else, the keystrokes land there.
 
 ## Running
 
 ```sh
-cargo test --features e2e --test e2e                          # all scenarios
-cargo test --features e2e --test e2e new_tab_and_close_tab    # one scenario
-cargo test --features e2e --test e2e files_panel::            # one module
-cargo test --features e2e --test e2e -- --nocapture           # show harness output
-cargo test --features e2e --test e2e -- --list                # list scenarios
-PG_GUI_E2E_DATABASE=docker cargo test --features e2e --test e2e   # include database scenarios
+cargo e2e                                # all scenarios
+cargo e2e new_tab_and_close_tab          # one scenario
+cargo e2e files_panel::                  # one module
+cargo e2e --nocapture                    # show harness output
+cargo e2e --list                         # list scenarios
+PG_GUI_E2E_DATABASE=docker cargo e2e     # include database scenarios
 ```
+
+The alias already ends with `--`, so filters and test flags (`--nocapture`,
+`--list`, `--exact`) go straight after `cargo e2e`, without another `--`.
 
 Cargo builds the binary before the tests run, so the tests always drive the
 current code. The tests run one at a time even without `--test-threads=1`,
 because they share one screen and one menu bar. A mutex in the harness takes
-care of that.
+care of that. The alias still passes `--test-threads=1`: with several threads,
+tests queue on that mutex while libtest's clock runs, and its hard-coded
+"has been running for over 60 seconds" notice fires for tests that are only
+waiting their turn. The total time is the same either way.
 
-Leaving out `--test e2e` (`cargo test --features e2e`) also runs the unit
-tests, which is harmless but slower.
+Running cargo directly works too. Leaving out `--test e2e`
+(`cargo test --features e2e`) also runs the unit tests, which is harmless but
+slower.
 
 ## Scenarios
 
@@ -147,7 +156,7 @@ With the project database:
 
 ```sh
 docker compose up -d
-PG_GUI_E2E_DATABASE=docker cargo test --features e2e --test e2e
+PG_GUI_E2E_DATABASE=docker cargo e2e
 ```
 
 When the variable is set, an unreachable server fails the scenario instead of
