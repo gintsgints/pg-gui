@@ -70,6 +70,27 @@ file, and a test's full name is `module::test`.
 | `panel_shortcuts_toggle_panels` | cmd-1, cmd-2 and cmd-3 each flip the database, files and results panels, and pressing again flips them back. |
 | `format_on_save_menu_toggles_check_mark` | Clicking Edit ▸ Format on Save flips the menu's check mark and the stored `format_on_save` setting. |
 
+### `editor`: the SQL editor
+
+No database needed. The editor cannot be read from outside the window, but the
+app copies every buffer change into the tab's `script` in `config.json` about
+half a second later, so the scenarios wait on that. Copy is checked through the
+clipboard and save through the file on disk. `App::launch_prepared` gives a
+scenario the scratch directory before launch, to seed a script file or a user
+snippet under `snippets/`. Typed text avoids quotes and brackets, which the
+editor may pair on its own.
+
+| Test | What it checks |
+|---|---|
+| `typing_updates_tab_script` | Typed text lands in the active tab. |
+| `undo_and_redo` | cmd-a and one typed character replace the buffer; cmd-z brings the old text back, cmd-shift-z the new. |
+| `toggle_comment_on_selected_lines` | cmd-a then cmd-/ puts `-- ` on every line (after the indent, blank lines left alone); again takes it off. |
+| `copy_and_paste` | cmd-a, cmd-c puts the buffer on the clipboard; cmd-a, cmd-v replaces it with the clipboard. |
+| `format_script_lowercases_and_lays_out` | cmd-shift-f formats through the embedded language server: keywords lower-cased, every name kept. The shortcut repeats until the server is up. |
+| `snippet_completion_inserts_user_snippet` | Typing the start of a user snippet's name opens the completion menu, and Enter inserts the snippet's SQL. |
+| `save_writes_file_with_format_on_save` | On a file tab, cmd-s formats and writes; the file holds the formatted text and the tab matches it. |
+| `save_writes_file_verbatim_without_format_on_save` | With format-on-save off, cmd-s writes exactly what was typed. |
+
 ### `files_panel`: scripts in the working folder
 
 | Test | What it checks |

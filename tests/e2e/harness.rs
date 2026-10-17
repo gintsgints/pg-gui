@@ -332,6 +332,17 @@ impl App {
         Self::start(screen, scratch_dir(), seed)
     }
 
+    /// Start the app on a scratch directory `prepare` gets first: it may
+    /// write files there (a script to open, user snippets under
+    /// `snippets/`) and edit `seed`, which starts as [`default_seed`].
+    pub fn launch_prepared(prepare: impl FnOnce(&Path, &mut Value)) -> Self {
+        let screen = SCREEN.lock().unwrap_or_else(PoisonError::into_inner);
+        let dir = scratch_dir();
+        let mut seed = default_seed();
+        prepare(&dir, &mut seed);
+        Self::start(screen, dir, &seed)
+    }
+
     /// Start the app with the files panel open on a fresh working folder
     /// holding `files` (paths relative to it, created empty — a path ending
     /// in `/` is a folder). The database panel is hidden and the files
@@ -435,7 +446,7 @@ impl App {
             osascript_result(&format!(
                 "tell application \"System Events\" to return name of every window of {process}"
             ))
-            .is_ok_and(|titles| list(&titles).iter().any(|title| title == "pg-gui"))
+            .is_ok_and(|titles| list(&titles).iter().any(|title| is_main_title(title)))
         });
         app.focus();
         app
@@ -520,7 +531,7 @@ impl App {
     pub fn window_frame(&self) -> (f64, f64, f64, f64) {
         let process = self.process();
         let frame = osascript(&format!(
-            "tell application \"System Events\" to tell window \"pg-gui\" of {process}\n\
+            "tell application \"System Events\" to tell (first window of {process} whose name starts with \"pg-gui\")\n\
              set {{x, y}} to position\n\
              set {{w, h}} to size\n\
              return (x as text) & \",\" & (y as text) & \",\" & (w as text) & \",\" & (h as text)\n\
@@ -894,6 +905,12 @@ fn row_y(row: u32) -> f64 {
 pub fn active_script(config: &Value) -> Option<&str> {
     let active = usize::try_from(config["active_tab"].as_u64()?).ok()?;
     config["tabs"][active]["script"].as_str()
+}
+
+/// Whether `title` is the main window's: `pg-gui`, or `pg-gui — <path>`
+/// while the active tab is backed by a file.
+fn is_main_title(title: &str) -> bool {
+    title == "pg-gui" || title.starts_with("pg-gui — ")
 }
 
 /// An item title without gpui's check-mark prefix.
