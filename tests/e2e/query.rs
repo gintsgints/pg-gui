@@ -66,3 +66,83 @@ fn run_script_from_files_panel_menu() {
 
     app.quit();
 }
+
+#[test]
+fn run_selected_scripts_in_tree_order() {
+    let Some(mut schema) = Schema::create("query::run_selected_scripts_in_tree_order") else {
+        return;
+    };
+    let name = schema.name().to_string();
+    let create = format!("create table {name}.runs (n int);\n");
+    let first = format!("insert into {name}.runs values (1);\n");
+    let skipped = format!("create table {name}.not_run (id int);\n");
+    let second = format!("insert into {name}.runs values (2);\n");
+    let mut app = App::launch_with_scripts(
+        &schema,
+        &[
+            ("a_create.sql", create.as_str()),
+            ("b_insert.sql", first.as_str()),
+            ("c_skip.sql", skipped.as_str()),
+            ("d_insert.sql", second.as_str()),
+        ],
+    );
+
+    // A plain click anchors on a_create, shift-click takes the range down to
+    // c_skip, cmd-click drops c_skip again and adds d_insert.
+    app.click_files_row(Button::Left, 0);
+    app.click_files_row_with(&[Mod::Shift], 2, false);
+    app.click_files_row_with(&[Mod::Cmd], 2, true);
+    app.click_files_row_with(&[Mod::Cmd], 3, true);
+    // The batch confirms first; Enter runs it.
+    app.click_menu("Connection", "Run Selected Scripts");
+    app.press(&[], Key::Return);
+
+    // The inserts need the table, so both landing means the batch ran in
+    // tree order, not selection order; c_skip would have run before
+    // d_insert had it still been selected.
+    app.wait_for("both inserts in the database", harness::DB_TIMEOUT, |_| {
+        schema.table_exists("runs") && schema.row_count("runs") == 2
+    });
+    assert!(
+        !schema.table_exists("not_run"),
+        "the deselected script does not run"
+    );
+
+    app.quit();
+}
+
+#[test]
+fn run_bar_runs_cmd_picked_scripts() {
+    let Some(mut schema) = Schema::create("query::run_bar_runs_cmd_picked_scripts") else {
+        return;
+    };
+    let name = schema.name().to_string();
+    let create = format!("create table {name}.runs (n int);\n");
+    let skipped = format!("create table {name}.not_run (id int);\n");
+    let insert = format!("insert into {name}.runs values (1);\n");
+    let mut app = App::launch_with_scripts(
+        &schema,
+        &[
+            ("a_create.sql", create.as_str()),
+            ("b_skip.sql", skipped.as_str()),
+            ("c_insert.sql", insert.as_str()),
+        ],
+    );
+
+    // A plain click picks a_create, cmd-click adds c_insert; with two
+    // picked, the panel's Run bar shows above the tree.
+    app.click_files_row(Button::Left, 0);
+    app.click_files_row_with(&[Mod::Cmd], 2, false);
+    app.click_files_run_bar();
+    app.press(&[], Key::Return);
+
+    app.wait_for("the insert in the database", harness::DB_TIMEOUT, |_| {
+        schema.table_exists("runs") && schema.row_count("runs") == 1
+    });
+    assert!(
+        !schema.table_exists("not_run"),
+        "the unpicked script does not run"
+    );
+
+    app.quit();
+}

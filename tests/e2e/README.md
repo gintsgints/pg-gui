@@ -146,6 +146,8 @@ lints, without spending a run on a failed connection attempt.
 |---|---|
 | `run_query_executes_against_database` | A tab holding `create table …`; cmd-enter runs it, and the table appears in the database. |
 | `run_script_from_files_panel_menu` | Two scripts in the working folder; filter to one, right-click ▸ Run Script, Enter confirms: its table is created and holds the three rows it inserts, and the other script's table does not exist. |
+| `run_selected_scripts_in_tree_order` | Four scripts; a click, a shift-click and two cmd-clicks pick the first, second and fourth. Connection ▸ Run Selected Scripts, Enter confirms: the fourth's insert lands after the first's `create table`, so the batch ran in tree order, and the dropped third script never ran. |
+| `run_bar_runs_cmd_picked_scripts` | A click and a cmd-click pick two of three scripts; the files panel's "Run N script(s)" bar runs them, and only them. |
 
 ### `db_viewer`: the database panel (needs a database)
 
@@ -355,6 +357,7 @@ Harness API:
 | `type_text(str)`, `press(&[Mod], Key)` | Types text into the focused element; presses a non-printing key (`Key::Return`, `Key::Up`). |
 | `click_at(Button, x, y)` | Left- or right-clicks at points from the window's top-left corner. |
 | `click_files_new_script()`, `filter_files(text)`, `click_files_row(Button, row)` | Files panel: the header "+", the filter box (text replaced), tree row `row` (0 = top). |
+| `click_files_row_with(&[Mod], row, picked)`, `click_files_run_bar()` | Files panel: a shift- or cmd-click on tree row `row`, and the "Run N script(s)" bar. The bar shows above the tree while two or more scripts are picked and pushes the rows down, so `picked` says whether it is up before the click. |
 | `wait_for_extra_window(what)` | Waits for a second window, such as a save panel. |
 | `click_menu(menu, item)` | Clicks a menu item. The item matches with or without its check mark. |
 | `click_submenu(menu, submenu, item)` | Clicks an item in a submenu, such as Connection ▸ Recent ▸ a saved connection. |

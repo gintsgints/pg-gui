@@ -74,6 +74,11 @@ const PANEL_HEADER_Y: f64 = 50.;
 const PANEL_FILTER_Y: f64 = 75.;
 const PANEL_FIRST_ROW_Y: f64 = 106.;
 const PANEL_ROW_HEIGHT: f64 = 34.;
+/// The files panel's "Run N script(s)" bar, shown while two or more scripts
+/// are picked: where its button's middle sits, and how far it pushes the
+/// tree's rows down. Measured from a capture at 100% zoom.
+const RUN_BAR_Y: f64 = 98.;
+const RUN_BAR_HEIGHT: f64 = 24.;
 /// How long one attempt of [`App::retry_until`] waits for its condition
 /// before trying again.
 const ATTEMPT_WAIT: Duration = Duration::from_millis(1500);
@@ -691,6 +696,29 @@ impl App {
     pub fn click_files_row(&mut self, button: Button, row: u32) {
         let (_, _, width, _) = self.window_frame();
         self.click_at(button, width - FILES_PANEL_WIDTH / 2., row_y(row));
+    }
+
+    /// Left-click the files panel's tree row `row` with `mods` held: shift
+    /// extends the selection from the last plain click, cmd toggles the row.
+    /// `picked` says whether two or more scripts are picked before the
+    /// click: the panel then shows its "Run N script(s)" bar above the tree,
+    /// which pushes every row down by [`RUN_BAR_HEIGHT`].
+    pub fn click_files_row_with(&mut self, mods: &[Mod], row: u32, picked: bool) {
+        let (_, _, width, _) = self.window_frame();
+        let bar = if picked { RUN_BAR_HEIGHT } else { 0. };
+        self.click_with(
+            Button::Left,
+            mods,
+            width - FILES_PANEL_WIDTH / 2.,
+            row_y(row) + bar,
+        );
+    }
+
+    /// Click the files panel's "Run N script(s)" bar, shown while two or
+    /// more scripts are picked.
+    pub fn click_files_run_bar(&mut self) {
+        let (_, _, width, _) = self.window_frame();
+        self.click_at(Button::Left, width - FILES_PANEL_WIDTH / 2., RUN_BAR_Y);
     }
 
     /// Click the database panel's tree row `row` (0 = top) with `button`.
