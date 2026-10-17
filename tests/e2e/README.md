@@ -153,11 +153,21 @@ because clearing the selection puts the table back in row mode, and in row mode
 Right moves a column selection. Nothing says when the rows have arrived, so each copy repeats its
 whole attempt until the clipboard matches (`copy_until`).
 
+The paging scenarios launch through `App::launch_for_results_with`, which seeds
+`page_size` 3 (and a small `fetch_size` for the cursor) on top of the same
+layout, and run a one-column `generate_series`. The pager under the grid has
+buttons but no shortcuts, so `App::click_pager` clicks Prev, Next or Fetch
+more at offsets measured from a capture: fixed from the left, and a fixed
+distance above the window's bottom edge. Which page is showing is read off
+its first cell; what the grid holds in all, off cmd-a and cmd-c.
+
 | Test | What it checks |
 |---|---|
 | `grid_copies_selected_cell` | A click on the first cell and cmd-c copies its value; the arrows walk to another cell; Left wraps to the last column; a NULL copies as the empty string. |
 | `grid_select_all_copies_every_row` | cmd-a in the grid selects every row and cmd-c copies them as tab-separated lines; Escape drops that selection, so the next cmd-c leaves the rows off the clipboard. |
 | `grid_shift_and_cmd_click_select_rows` | A click then a shift-click selects a range of rows; cmd-click toggles one row out and another in, and the copy keeps result-set order. |
+| `grid_pages_through_long_result` | Eight rows at three per page: Next and Prev move between pages, the last page holds only the two rows left over, Next on the last page stays put, and cmd-a still copies all eight rows. |
+| `grid_fetch_more_appends_rows` | Twelve rows fetched five at a time: Fetch more appends the next batch without leaving the current page, the fetched rows page like the first ones, and a second Fetch more drains the cursor. |
 | `log_shows_failed_run_and_copies` | No database needed: a run against the seeded dead connection fails, the panel switches to the log, and a mouse sweep plus cmd-c copies the `Connection refused` line. |
 | `log_shows_server_notices` | A `DO` block raising a notice and a warning returns no rows, so the panel shows the log by itself; both messages are there, in the order raised. |
 

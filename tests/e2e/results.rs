@@ -9,6 +9,11 @@
 //! against the seeded dead connection fails, and the failure is what lands
 //! in the log.
 //!
+//! The paging scenarios seed a `page_size` of [`PAGE_SIZE`] (and, for the
+//! cursor, a small `fetch_size`) so a short `generate_series` spans pages,
+//! and drive the pager under the grid by its buttons, which have no
+//! shortcut. Which page is showing is read off its first cell.
+//!
 //! Each launch goes through [`App::launch_for_results`], which pins the
 //! layout so the grid's rows and the log's lines sit at known offsets.
 //! Within the grid the scenarios click only cell (0, 0) — the first column
@@ -19,7 +24,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::harness::{self, App, Button, Key, Mod};
+use crate::harness::{self, App, Button, Key, Mod, Pager};
 
 /// What the clipboard is set to before each copy, so a copy that never
 /// happened cannot pass for one that did.
@@ -113,6 +118,51 @@ fn sweep_log(app: &mut App) {
         (harness::RESULTS_LEFT + 1., harness::log_line_y(0)),
         (width - harness::RESULTS_LEFT, harness::log_line_y(4)),
     );
+}
+
+/// Rows per page the paging scenarios seed.
+const PAGE_SIZE: u32 = 3;
+
+/// Launch on the database with a one-column `generate_series(1, rows)` in
+/// the tab and run it, `PAGE_SIZE` rows to a page and `fetch_size` rows
+/// fetched at a time, or `None` when the database scenarios are off.
+fn launch_paged(test: &str, rows: u32, fetch_size: u32) -> Option<App> {
+    let url = harness::require_database(test)?;
+    let script = format!("select i from generate_series(1, {rows}) as i;");
+    let mut app = App::launch_for_results_with(Some(&url), &script, |seed| {
+        seed["page_size"] = PAGE_SIZE.into();
+        seed["fetch_size"] = fetch_size.into();
+    });
+    app.press(&[Mod::Cmd], Key::Return);
+    Some(app)
+}
+
+/// The values `1..=last`, one per line, as the one-column grid copies them.
+fn series(last: u32) -> String {
+    (1..=last)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// [`copy_exact`] the first cell of the page on show: the page starting at
+/// row `first` (1-based) of the series.
+fn expect_page_from(app: &mut App, first: u32) {
+    copy_exact(
+        app,
+        &format!("the first cell of the page from row {first}"),
+        &first.to_string(),
+        select_first_cell,
+    );
+}
+
+/// [`copy_exact`] every row the grid holds, across pages: the series up to
+/// `last`.
+fn expect_rows_to(app: &mut App, last: u32) {
+    copy_exact(app, &format!("rows 1–{last}"), &series(last), |app| {
+        select_first_cell(app);
+        app.send_keys(&[Mod::Cmd], 'a');
+    });
 }
 
 /// Click cell (0, 0), which gives the grid the keyboard focus and puts the
@@ -245,6 +295,74 @@ fn log_shows_server_notices() {
         first.is_some() && first < second,
         "the notices in the order raised: {copied:?}"
     );
+
+    app.quit();
+}
+
+#[test]
+fn grid_pages_through_long_result() {
+    // Eight rows in one fetch: pages of three, the last one short.
+    let Some(mut app) = launch_paged("results::grid_pages_through_long_result", 8, 500) else {
+        return;
+    };
+
+    expect_page_from(&mut app, 1);
+
+    app.click_pager(Pager::Next);
+    expect_page_from(&mut app, 4);
+
+    app.click_pager(Pager::Next);
+    expect_page_from(&mut app, 7);
+    // The last page holds the two rows left over, and only those: one Down
+    // reaches the eighth, and a second wraps back to the page's first row
+    // rather than finding a third.
+    copy_exact(&mut app, "the last row", "8", |app| {
+        select_first_cell(app);
+        app.press(&[], Key::Down);
+    });
+    copy_exact(&mut app, "the wrap past the last row", "7", |app| {
+        select_first_cell(app);
+        app.press(&[], Key::Down);
+        app.press(&[], Key::Down);
+    });
+
+    // Next is disabled on the last page, so the page stays put.
+    app.click_pager(Pager::Next);
+    expect_page_from(&mut app, 7);
+
+    app.click_pager(Pager::Prev);
+    expect_page_from(&mut app, 4);
+
+    // Select-all takes the whole result set, not just the page on show.
+    expect_rows_to(&mut app, 8);
+
+    app.quit();
+}
+
+#[test]
+fn grid_fetch_more_appends_rows() {
+    // Twelve rows five at a time: the run leaves the cursor open after the
+    // first five, and it takes two Fetch Mores to drain it.
+    let Some(mut app) = launch_paged("results::grid_fetch_more_appends_rows", 12, 5) else {
+        return;
+    };
+
+    expect_rows_to(&mut app, 5);
+
+    // Fetching keeps the page the user is on.
+    app.click_pager(Pager::Next);
+    expect_page_from(&mut app, 4);
+    app.click_pager(Pager::FetchMore);
+    expect_rows_to(&mut app, 10);
+    expect_page_from(&mut app, 4);
+
+    // The fetched rows page like the first batch: the third page starts on
+    // one of them.
+    app.click_pager(Pager::Next);
+    expect_page_from(&mut app, 7);
+
+    app.click_pager(Pager::FetchMore);
+    expect_rows_to(&mut app, 12);
 
     app.quit();
 }

@@ -394,6 +394,17 @@ impl App {
     /// pinned to [`EDITOR_HEIGHT`], so the panel's rows sit where
     /// [`results_row_y`] and [`log_line_y`] expect them.
     pub fn launch_for_results(url: Option<&str>, script: &str) -> Self {
+        Self::launch_for_results_with(url, script, |_| {})
+    }
+
+    /// [`Self::launch_for_results`] with `configure` given the seed last, to
+    /// set what the scenario needs on top of the pinned layout (a small
+    /// `page_size` or `fetch_size`, say).
+    pub fn launch_for_results_with(
+        url: Option<&str>,
+        script: &str,
+        configure: impl FnOnce(&mut Value),
+    ) -> Self {
         let mut seed = url.map_or_else(
             || {
                 let mut seed = default_seed();
@@ -406,7 +417,16 @@ impl App {
         seed["files_panel_visible"] = Value::from(false);
         seed["results_panel_visible"] = Value::from(true);
         seed["editor_height"] = Value::from(EDITOR_HEIGHT);
+        configure(&mut seed);
         Self::launch_with(&seed)
+    }
+
+    /// Click `button` of the results pager, for a launch through
+    /// [`Self::launch_for_results`]. The pager sits on the results panel's
+    /// bottom row, so its height follows the window's.
+    pub fn click_pager(&mut self, button: Pager) {
+        let (_, _, _, height) = self.window_frame();
+        self.click_at(Button::Left, button.x(), height - PAGER_FROM_BOTTOM);
     }
 
     /// The working folder [`Self::launch_with_folder`] created.
@@ -869,6 +889,34 @@ pub fn results_row_y(row: u32) -> f64 {
 pub fn log_line_y(line: u32) -> f64 {
     results_top() + LOG_LINE_HEIGHT * (f64::from(line) + 0.5)
 }
+
+/// A button of the pager under the results grid, which only shows when the
+/// result spans more than one page or the cursor has more rows to fetch.
+#[derive(Clone, Copy)]
+pub enum Pager {
+    Prev,
+    Next,
+    FetchMore,
+}
+
+impl Pager {
+    /// Horizontal middle of the button, in window points. The pager starts
+    /// at the panel's left padding and its buttons keep their order and
+    /// width whatever the page, so each one sits at a fixed offset.
+    /// Measured from a capture at 100% zoom.
+    fn x(self) -> f64 {
+        match self {
+            Pager::Prev => 36.,
+            Pager::Next => 102.,
+            Pager::FetchMore => 185.,
+        }
+    }
+}
+
+/// How far above the window's bottom edge the pager's buttons are
+/// centred: the status bar, the results panel's bottom padding and half a
+/// small button. Measured from a capture at 100% zoom.
+const PAGER_FROM_BOTTOM: f64 = 52.;
 
 /// Left edge of the results panel's content, for a launch through
 /// [`App::launch_for_results`] (no database panel to its left).
