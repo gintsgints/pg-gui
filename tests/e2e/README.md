@@ -71,6 +71,25 @@ file, and a test's full name is `module::test`.
 | `format_on_save_menu_toggles_check_mark` | Clicking Edit ▸ Format on Save flips the menu's check mark and the stored `format_on_save` setting. |
 | `theme_menu_switches_theme` | View ▸ Theme ▸ Dark, Light and System each move the check mark to themselves alone and store `theme`; Dark paints the window dark and Light paints it light, read off a pixel of a window capture. |
 
+### `completion`: completions in the editor
+
+Database object names come from the embedded language server's schema cache,
+which loads in the background once the app is connected; snippets are matched
+against the words typed and come first in the menu. The menu cannot be read
+from outside the window, so each scenario replaces the buffer with a prefix,
+waits for the menu and takes its first item with Enter, then reads the buffer
+back. Without a menu the Enter is only a newline, so every attempt starts over
+and repeats (`retry_until`) until the completion shows. The object scenarios
+need a database and create a `zebra_orders` table with a `zebra_total` column,
+a prefix nothing else in the database shares, so it is the first item; the
+snippet one needs none.
+
+| Test | What it checks |
+|---|---|
+| `completes_table_name` | `select * from <schema>.zebra_o` completes to the table `zebra_orders`. |
+| `completes_column_name` | `select * from <schema>.zebra_orders where zebra_to` completes to the column `zebra_total`, offered from the FROM clause's table. |
+| `completes_builtin_snippet_from_its_name` | No database: typing `largest tables` offers the built-in "Size: largest tables" snippet, and Enter inserts its SQL. |
+
 ### `connections`: saved connections and switching
 
 No database needed: both connections point at `127.0.0.1:1`, where nothing
@@ -341,7 +360,7 @@ on with Session ▸ Toggle Autocommit, and the change is confirmed through
 
 ## Database-backed scenarios
 
-The `query`, `db_viewer`, `debugger`, `definitions`, `explain`, `export` and `transactions` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
+The `completion` (but its snippet one), `query`, `db_viewer`, `debugger`, `definitions`, `explain`, `export` and `transactions` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
 or provisions one; it uses a database that already exists. Choose it with
 `PG_GUI_E2E_DATABASE`:
 
