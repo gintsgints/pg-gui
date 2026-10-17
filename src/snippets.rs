@@ -254,7 +254,7 @@ pub struct Library {
 }
 
 fn dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("pg-gui").join("snippets"))
+    crate::config::dir().map(|dir| dir.join("snippets"))
 }
 
 /// Create the user snippets directory so it's discoverable. Best effort.

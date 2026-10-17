@@ -316,9 +316,20 @@ fn default_definition_file_mask() -> String {
 /// The app's config directory (`~/Library/Application Support/pg-gui` on
 /// macOS); `None` when the platform has no config directory. Also hosts
 /// the single-instance socket (see [`crate::instance`]).
+///
+/// `PG_GUI_CONFIG_DIR` replaces it outright. The end-to-end tests set it to a
+/// scratch directory, so a test run neither reads nor rewrites the user's
+/// config.json, and its instance socket does not find the user's own running
+/// pg-gui (which would otherwise be activated, and the test launch exit).
 pub fn dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os(CONFIG_DIR_VAR).filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
     dirs::config_dir().map(|dir| dir.join("pg-gui"))
 }
+
+/// Environment variable overriding [`dir`].
+pub const CONFIG_DIR_VAR: &str = "PG_GUI_CONFIG_DIR";
 
 /// Where the config file lives; `None` when the platform has no config
 /// directory.
