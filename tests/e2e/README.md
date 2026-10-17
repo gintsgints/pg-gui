@@ -256,6 +256,17 @@ which tells the two kinds apart: a plain plan never runs it, `ANALYZE` does.
 | `explain_analyze_runs_statement` | cmd-shift-e sends `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`, which runs the insert; with autocommit on, the row is committed. |
 | `explain_analyze_rolls_back_without_autocommit` | With autocommit off, the analyzed insert lands in the tab's open transaction, uncommitted, and Session ▸ Rollback undoes it. |
 
+### `export`: exporting a result set (needs a database)
+
+Connection ▸ Export as CSV… re-runs the statement under the cursor through
+`COPY … TO STDOUT WITH (FORMAT csv, HEADER)` and writes it to the file the
+platform's save panel names. The scenario seeds `last_dir` with its scratch
+directory, so the panel opens there, and checks the file on disk.
+
+| Test | What it checks |
+|---|---|
+| `export_csv_writes_result_set` | A four-row query with a comma, a double quote and a NULL among its values exports to exactly the header line plus one line per row, the comma and quote values quoted and the NULL left empty. |
+
 ### `transactions`: autocommit, Commit and Rollback (needs a database)
 
 Each scenario runs `insert into <schema>.t values (1);` from the editor and
@@ -275,7 +286,7 @@ on with Session ▸ Toggle Autocommit, and the change is confirmed through
 
 ## Database-backed scenarios
 
-The `query`, `db_viewer`, `debugger`, `explain` and `transactions` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
+The `query`, `db_viewer`, `debugger`, `explain`, `export` and `transactions` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
 or provisions one; it uses a database that already exists. Choose it with
 `PG_GUI_E2E_DATABASE`:
 

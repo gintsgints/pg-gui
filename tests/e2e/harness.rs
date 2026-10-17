@@ -1077,7 +1077,7 @@ impl Drop for App {
 
 /// The connection-string seed shared by the database launches: `url` saved
 /// under the name `e2e`, one tab holding `script`, the files panel hidden.
-fn database_seed(url: &str, script: &str) -> Value {
+pub fn database_seed(url: &str, script: &str) -> Value {
     let mut seed = default_seed();
     seed["connection_string"] = Value::from(url);
     seed["recent_connections"] = serde_json::json!([{ "name": "e2e", "url": url }]);
