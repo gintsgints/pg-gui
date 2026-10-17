@@ -104,9 +104,36 @@ shut folder, so it is safe to repeat. A click that lands on a loading
 placeholder or on a folder further down cannot move the rows above it, so the
 next attempt still finds them.
 
+### `results`: the results grid and the message log
+
+The grid and the log cannot be read from outside the window, so every scenario
+selects something, copies it with cmd-c and reads the clipboard (`pbpaste`).
+Before each copy the clipboard is set to a sentinel, so a copy that never
+happened cannot pass, and **the suite leaves your clipboard overwritten**.
+Each launch goes through `App::launch_for_results`, which hides both side
+panels and pins the editor to `EDITOR_HEIGHT`, so the grid's rows and the
+log's lines sit at fixed offsets (`results_row_y`, `log_line_y`).
+
+The grid scenarios run `GRID_QUERY`, five rows of `r<row>c<col>` over
+`generate_series` with a NULL in the third column of every even row, so they
+need a database (`PG_GUI_E2E_DATABASE`) but no objects. The only cell clicked is
+(0, 0), which is just right of the row-header gutter whatever the columns'
+widths; the arrows walk from there. Escape then Right does not work for this,
+because clearing the selection puts the table back in row mode, and in row mode
+Right moves a column selection. Nothing says when the rows have arrived, so each copy repeats its
+whole attempt until the clipboard matches (`copy_until`).
+
+| Test | What it checks |
+|---|---|
+| `grid_copies_selected_cell` | A click on the first cell and cmd-c copies its value; the arrows walk to another cell; Left wraps to the last column; a NULL copies as the empty string. |
+| `grid_select_all_copies_every_row` | cmd-a in the grid selects every row and cmd-c copies them as tab-separated lines; Escape drops that selection, so the next cmd-c leaves the rows off the clipboard. |
+| `grid_shift_and_cmd_click_select_rows` | A click then a shift-click selects a range of rows; cmd-click toggles one row out and another in, and the copy keeps result-set order. |
+| `log_shows_failed_run_and_copies` | No database needed: a run against the seeded dead connection fails, the panel switches to the log, and a mouse sweep plus cmd-c copies the `Connection refused` line. |
+| `log_shows_server_notices` | A `DO` block raising a notice and a warning returns no rows, so the panel shows the log by itself; both messages are there, in the order raised. |
+
 ## Database-backed scenarios
 
-The `query` and `db_viewer` scenarios need a running PostgreSQL. The harness never starts
+The `query` and `db_viewer` scenarios, and all of `results` but the failed-run log one, need a running PostgreSQL. The harness never starts
 or provisions one; it uses a database that already exists. Choose it with
 `PG_GUI_E2E_DATABASE`:
 

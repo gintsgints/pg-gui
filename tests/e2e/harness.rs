@@ -71,6 +71,19 @@ const PANEL_ROW_HEIGHT: f64 = 34.;
 /// How long one attempt of [`App::retry_until`] waits for its condition
 /// before trying again.
 const ATTEMPT_WAIT: Duration = Duration::from_millis(1500);
+/// Height the editor panel is pinned to by [`App::launch_for_results`], so
+/// the results panel below it starts at a known offset.
+pub const EDITOR_HEIGHT: f64 = 200.;
+/// The window's own title bar, which the editor panel sits under.
+const TITLE_BAR_HEIGHT: f64 = 34.;
+/// Padding around the results panel's views (the table, the log): `p_2`.
+const RESULTS_PADDING: f64 = 8.;
+/// Height of one results-grid row, the header row included: gpui-component's
+/// `table_row_height` at the default size.
+const TABLE_ROW_HEIGHT: f64 = 32.;
+/// Height of one Log view line: the theme's mono font size (13) at gpui's
+/// default line height.
+const LOG_LINE_HEIGHT: f64 = 20.;
 
 /// Names the pre-created database the database-backed scenarios run
 /// against: a connection string, or `docker` for the project's own
@@ -93,6 +106,18 @@ pub fn database_url() -> Option<String> {
         "docker" => Some(DOCKER_DATABASE_URL.to_string()),
         url => Some(url.to_string()),
     }
+}
+
+/// The connection string [`database_url`] names, or `None` after printing
+/// that `test` is skipped. For scenarios that need a server but no objects
+/// of their own (a query over `generate_series`); the rest use
+/// [`Schema::create`].
+pub fn require_database(test: &str) -> Option<String> {
+    let url = database_url();
+    if url.is_none() {
+        eprintln!("e2e: {test} skipped; set {DATABASE_ENV}=docker (or a URL) to run it");
+    }
+    url
 }
 
 /// A scratch schema a database scenario owns, on a connection of the
@@ -119,10 +144,7 @@ impl Schema {
     /// Connect and create the schema, or return `None` (after saying so)
     /// when [`DATABASE_ENV`] is unset, so the calling scenario can skip.
     pub fn create(test: &str) -> Option<Self> {
-        let Some(url) = database_url() else {
-            eprintln!("e2e: {test} skipped; set {DATABASE_ENV}=docker (or a URL) to run it");
-            return None;
-        };
+        let url = require_database(test)?;
         let database = DATABASE.lock().unwrap_or_else(PoisonError::into_inner);
         let client = postgres::Client::connect(&url, postgres::NoTls).unwrap_or_else(|err| {
             panic!(
@@ -223,12 +245,23 @@ fn scratch_dir() -> PathBuf {
 #[derive(Clone, Copy)]
 pub enum Mod {
     Cmd,
+    Shift,
 }
 
 impl Mod {
     fn applescript(self) -> &'static str {
         match self {
             Mod::Cmd => "command down",
+            Mod::Shift => "shift down",
+        }
+    }
+
+    /// The modifier's `CGEventFlags` bit, for a mouse event posted with it
+    /// held.
+    fn event_flag(self) -> u64 {
+        match self {
+            Mod::Cmd => 0x10_0000,
+            Mod::Shift => 0x2_0000,
         }
     }
 }
@@ -250,7 +283,10 @@ pub fn default_seed() -> Value {
 #[derive(Clone, Copy)]
 pub enum Key {
     Return,
+    Escape,
     Up,
+    Down,
+    Left,
     Right,
 }
 
@@ -258,7 +294,10 @@ impl Key {
     fn code(self) -> u8 {
         match self {
             Key::Return => 36,
+            Key::Escape => 53,
             Key::Up => 126,
+            Key::Down => 125,
+            Key::Left => 123,
             Key::Right => 124,
         }
     }
@@ -332,14 +371,30 @@ impl App {
     /// hidden, so the panel's rows sit where [`App::click_db_row`] expects
     /// them.
     pub fn launch_with_database(schema: &Schema, script: &str) -> Self {
-        let url = schema.url();
-        let mut seed = default_seed();
-        seed["connection_string"] = Value::from(url);
-        seed["recent_connections"] = serde_json::json!([{ "name": "e2e", "url": url }]);
-        seed["tabs"] = serde_json::json!([{ "script": script, "file": null }]);
+        let mut seed = database_seed(schema.url(), script);
         seed["db_panel_visible"] = Value::from(true);
         seed["db_panel_width"] = Value::from(DB_PANEL_WIDTH);
+        Self::launch_with(&seed)
+    }
+
+    /// Start the app on `url` (the dead seeded connection when `None`) with
+    /// one tab holding `script`, laid out for the results panel: both side
+    /// panels hidden, so the panel spans the window's width, and the editor
+    /// pinned to [`EDITOR_HEIGHT`], so the panel's rows sit where
+    /// [`results_row_y`] and [`log_line_y`] expect them.
+    pub fn launch_for_results(url: Option<&str>, script: &str) -> Self {
+        let mut seed = url.map_or_else(
+            || {
+                let mut seed = default_seed();
+                seed["tabs"] = serde_json::json!([{ "script": script, "file": null }]);
+                seed
+            },
+            |url| database_seed(url, script),
+        );
+        seed["db_panel_visible"] = Value::from(false);
         seed["files_panel_visible"] = Value::from(false);
+        seed["results_panel_visible"] = Value::from(true);
+        seed["editor_height"] = Value::from(EDITOR_HEIGHT);
         Self::launch_with(&seed)
     }
 
@@ -486,7 +541,15 @@ impl App {
     /// JXA. The pointer moves there first, so hover state (a row's hidden
     /// action, a tooltip) settles before the press.
     pub fn click_at(&mut self, button: Button, x: f64, y: f64) {
+        self.click_with(button, &[], x, y);
+    }
+
+    /// [`Self::click_at`] with `mods` held, the way a shift- or cmd-click
+    /// extends a selection. The flags go on the button events themselves:
+    /// gpui reads a click's modifiers from the event, not from the keyboard.
+    pub fn click_with(&mut self, button: Button, mods: &[Mod], x: f64, y: f64) {
         self.focus();
+        let flags: u64 = mods.iter().map(|m| m.event_flag()).sum();
         let (left, top, _, _) = self.window_frame();
         let (x, y) = (left + x, top + y);
         let (down, up, which) = match button {
@@ -504,13 +567,42 @@ impl App {
         jxa(&format!(
             "ObjC.import('CoreGraphics');\n\
              const at = $.CGPointMake({x}, {y});\n\
-             const post = (type, button) => $.CGEventPost($.kCGHIDEventTap,\n\
-                 $.CGEventCreateMouseEvent($(), type, at, button));\n\
-             post($.kCGEventMouseMoved, $.kCGMouseButtonLeft);\n\
+             const post = (type, button, flags) => {{\n\
+                 const event = $.CGEventCreateMouseEvent($(), type, at, button);\n\
+                 $.CGEventSetFlags(event, flags);\n\
+                 $.CGEventPost($.kCGHIDEventTap, event);\n\
+             }};\n\
+             post($.kCGEventMouseMoved, $.kCGMouseButtonLeft, 0);\n\
              delay(0.2);\n\
-             post($.{down}, $.{which});\n\
+             post($.{down}, $.{which}, {flags});\n\
              delay(0.05);\n\
-             post($.{up}, $.{which});"
+             post($.{up}, $.{which}, {flags});"
+        ));
+    }
+
+    /// Press the left button at `from` and release it at `to`, both in
+    /// points from the main window's top-left corner, moving through a few
+    /// drag events in between, the way a text selection is swept.
+    pub fn drag(&mut self, from: (f64, f64), to: (f64, f64)) {
+        self.focus();
+        let (left, top, _, _) = self.window_frame();
+        let (x0, y0) = (left + from.0, top + from.1);
+        let (x1, y1) = (left + to.0, top + to.1);
+        jxa(&format!(
+            "ObjC.import('CoreGraphics');\n\
+             const post = (type, x, y) => $.CGEventPost($.kCGHIDEventTap,\n\
+                 $.CGEventCreateMouseEvent($(), type, $.CGPointMake(x, y), $.kCGMouseButtonLeft));\n\
+             post($.kCGEventMouseMoved, {x0}, {y0});\n\
+             delay(0.2);\n\
+             post($.kCGEventLeftMouseDown, {x0}, {y0});\n\
+             const steps = 10;\n\
+             for (let i = 1; i <= steps; i++) {{\n\
+                 delay(0.03);\n\
+                 post($.kCGEventLeftMouseDragged,\n\
+                     {x0} + ({x1} - {x0}) * i / steps, {y0} + ({y1} - {y0}) * i / steps);\n\
+             }}\n\
+             delay(0.05);\n\
+             post($.kCGEventLeftMouseUp, {x1}, {y1});"
         ));
     }
 
@@ -737,6 +829,60 @@ impl Drop for App {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
+}
+
+/// The connection-string seed shared by the database launches: `url` saved
+/// under the name `e2e`, one tab holding `script`, the files panel hidden.
+fn database_seed(url: &str, script: &str) -> Value {
+    let mut seed = default_seed();
+    seed["connection_string"] = Value::from(url);
+    seed["recent_connections"] = serde_json::json!([{ "name": "e2e", "url": url }]);
+    seed["tabs"] = serde_json::json!([{ "script": script, "file": null }]);
+    seed["files_panel_visible"] = Value::from(false);
+    seed
+}
+
+/// Top edge of the results panel's content (inside its padding), in window
+/// points, for a launch through [`App::launch_for_results`].
+fn results_top() -> f64 {
+    TITLE_BAR_HEIGHT + EDITOR_HEIGHT + RESULTS_PADDING
+}
+
+/// Vertical middle of the results grid's data row `row` (0 = top).
+pub fn results_row_y(row: u32) -> f64 {
+    results_top() + TABLE_ROW_HEIGHT * (f64::from(row) + 1.5)
+}
+
+/// A point inside the Log view's line `line` (0 = top), as far left as
+/// the text starts.
+pub fn log_line_y(line: u32) -> f64 {
+    results_top() + LOG_LINE_HEIGHT * (f64::from(line) + 0.5)
+}
+
+/// Left edge of the results panel's content, for a launch through
+/// [`App::launch_for_results`] (no database panel to its left).
+pub const RESULTS_LEFT: f64 = RESULTS_PADDING;
+
+/// The clipboard's plain text, as `pbpaste` prints it.
+pub fn clipboard() -> String {
+    let out = Command::new("pbpaste").output().expect("run pbpaste");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Replace the clipboard's contents with `text`, so a test can tell a
+/// copy that happened from one that did not.
+pub fn set_clipboard(text: &str) {
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn pbcopy");
+    child
+        .stdin
+        .take()
+        .expect("pbcopy stdin")
+        .write_all(text.as_bytes())
+        .expect("write pbcopy");
+    child.wait().expect("run pbcopy");
 }
 
 /// Top edge offset of side-panel tree row `row`, in window points.
