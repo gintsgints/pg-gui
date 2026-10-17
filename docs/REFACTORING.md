@@ -98,9 +98,13 @@ Findings that change the plan below:
 | `src/ui/dialogs.rs` | Connection form, new-file prompt, run-scripts confirmation, quit prompt | ~200 |
 | `src/commands.rs` | All action handler impls (`run_query`, `toggle_autocommit`, `start_debug`, …) | ~400 |
 
+### Status
+
+- Step 1 done: `src/app/tab.rs`. New modules are *child* modules of `app` (`src/app/<name>.rs`, declared in `app.rs`) rather than crate-level siblings, so their `impl PgGuiApp` blocks keep reading `PgGuiApp`'s private fields; only the moved methods and the moved types' fields become `pub(super)`. Besides the items listed below it also took the run-progress clock (`start_progress*`, `PROGRESS_TICK`), the close/quit guards, and `tab_label`/`set_tab_path`/`mark_saved`.
+
 ### Suggested order
 
-1. **`tab.rs`** — move `EditorTab`, `TabResult`, `RunProgress`, `build_tab`, `activate_tab`, `close_tab_at`, `refresh_dirty`, `show_tab_result`, `add_tab`/`insert_tab_at`. Lowest coupling, highest clarity gain.
+1. ~~**`tab.rs`**~~ (done) — move `EditorTab`, `TabResult`, `RunProgress`, `build_tab`, `activate_tab`, `close_tab_at`, `refresh_dirty`, `show_tab_result`, `add_tab`/`insert_tab_at`. Lowest coupling, highest clarity gain.
 2. **One render panel at a time** — e.g. `render_files_panel` + helpers into `ui/panels.rs`. Keep `render` in `app.rs` until the end.
 3. **`queries.rs`** — `run_query`, `run_scripts`, `start_explain` and their `on_*` settle helpers.
 4. **`commands.rs`** — remaining action handlers.
