@@ -101,6 +101,16 @@ dhat = { version = "0.3.3", optional = true }
 
 [features]
 dhat-heap = ["dep:dhat"]
+# Builds the UI end-to-end tests (`tests/e2e/`). They take over the keyboard
+# focus and need macOS Accessibility permission, so a plain `cargo test` must
+# not run them: `cargo test --features e2e --test e2e`. The feature changes
+# nothing in the app itself.
+e2e = []
+
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
+required-features = ["e2e"]
 
 [profile.dev]
 opt-level = 1

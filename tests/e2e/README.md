@@ -5,11 +5,15 @@ They press shortcuts, click menu items and quit with cmd-q, then check what the
 app did. They run on macOS only and need no database.
 
 ```sh
-cargo test --test e2e -- --ignored
+cargo test --features e2e --test e2e
 ```
 
-Each test is `#[ignore]`d because it takes over the keyboard focus. A plain
-`cargo test` therefore lists them as `ignored` and skips them.
+The test target is built only with the `e2e` Cargo feature (`required-features`
+in `Cargo.toml`), because the tests take over the keyboard focus. Without the
+feature, `cargo test` skips the target completely: it is not built, not run and
+not listed. That includes `cargo test -- --ignored`, so these tests never run
+alongside the database-backed tests in `src/`. The feature changes nothing in
+the app itself.
 
 ## Before the first run
 
@@ -25,10 +29,10 @@ Each test is `#[ignore]`d because it takes over the keyboard focus. A plain
 ## Running
 
 ```sh
-cargo test --test e2e -- --ignored                        # all scenarios
-cargo test --test e2e -- --ignored new_tab_and_close_tab  # one scenario
-cargo test --test e2e -- --ignored --nocapture            # show harness output
-cargo test --test e2e -- --ignored --list                 # list scenarios
+cargo test --features e2e --test e2e                          # all scenarios
+cargo test --features e2e --test e2e new_tab_and_close_tab    # one scenario
+cargo test --features e2e --test e2e -- --nocapture           # show harness output
+cargo test --features e2e --test e2e -- --list                # list scenarios
 ```
 
 Cargo builds the binary before the tests run, so the tests always drive the
@@ -36,9 +40,8 @@ current code. The tests run one at a time even without `--test-threads=1`,
 because they share one screen and one menu bar. A mutex in the harness takes
 care of that.
 
-Do not run a bare `cargo test -- --ignored`. That also runs the
-database-backed tests in `src/`, which fail unless the docker database on port
-5433 is up.
+Leaving out `--test e2e` (`cargo test --features e2e`) also runs the unit
+tests, which is harmless but slower.
 
 ## Scenarios
 
@@ -104,7 +107,6 @@ Add a function to `main.rs`:
 
 ```rust
 #[test]
-#[ignore = "drives the real UI; run with `cargo test --test e2e -- --ignored`"]
 fn my_scenario() {
     let mut app = App::launch();               // or App::launch_with(&seed)
 
@@ -147,6 +149,9 @@ Guidelines:
   rejects a variant that nothing uses.
 - `#![cfg(target_os = "macos")]` in `main.rs` makes the target empty on other
   platforms.
+- **Lint with the feature on.** The project's clippy command does not see this
+  target unless the feature is enabled:
+  `cargo clippy --all-targets --features e2e -- -W clippy::pedantic -D warnings`.
 
 ## Troubleshooting
 

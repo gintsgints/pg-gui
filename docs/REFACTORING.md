@@ -22,7 +22,7 @@ pg-gui currently has **no UI end-to-end tests** — coverage is unit tests in `a
 
 ### Status (2026-10-17)
 
-First cut landed: `tests/e2e/harness.rs` + `tests/e2e/main.rs`, run with `cargo test --test e2e -- --ignored`. Four smoke scenarios pass: launch (window + menus), cmd-t / cmd-w tab open/close, cmd-1/2/3 panel toggles, Edit ▸ Format on Save check mark — each ending in a clean cmd-q.
+First cut landed: `tests/e2e/harness.rs` + `tests/e2e/main.rs`, run with `cargo test --features e2e --test e2e` (the target is gated by the `e2e` Cargo feature, so a plain `cargo test` never builds it). Four smoke scenarios pass: launch (window + menus), cmd-t / cmd-w tab open/close, cmd-1/2/3 panel toggles, Edit ▸ Format on Save check mark — each ending in a clean cmd-q.
 
 Findings that change the plan below:
 

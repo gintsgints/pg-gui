@@ -3,10 +3,11 @@
 //! observed from outside a GPUI window.
 //!
 //! These take over the keyboard focus and need Accessibility permission for
-//! the terminal, so they are `#[ignore]`d and run on request:
+//! the terminal, so the target is only built behind the `e2e` feature and
+//! runs on request:
 //!
 //! ```sh
-//! cargo test --test e2e -- --ignored
+//! cargo test --features e2e --test e2e
 //! ```
 //!
 //! None of them needs a database.
@@ -23,7 +24,6 @@ fn tab_count(config: &Value) -> usize {
 }
 
 #[test]
-#[ignore = "drives the real UI; run with `cargo test --test e2e -- --ignored`"]
 fn launches_with_main_window_and_menus() {
     let app = App::launch();
 
@@ -41,7 +41,6 @@ fn launches_with_main_window_and_menus() {
 }
 
 #[test]
-#[ignore = "drives the real UI; run with `cargo test --test e2e -- --ignored`"]
 fn new_tab_and_close_tab() {
     let mut app = App::launch();
     assert_eq!(tab_count(&app.config()), 1);
@@ -58,7 +57,6 @@ fn new_tab_and_close_tab() {
 }
 
 #[test]
-#[ignore = "drives the real UI; run with `cargo test --test e2e -- --ignored`"]
 fn panel_shortcuts_toggle_panels() {
     let mut app = App::launch();
 
@@ -82,7 +80,6 @@ fn panel_shortcuts_toggle_panels() {
 }
 
 #[test]
-#[ignore = "drives the real UI; run with `cargo test --test e2e -- --ignored`"]
 fn format_on_save_menu_toggles_check_mark() {
     let mut app = App::launch();
     assert!(app.menu_checked("Edit", "Format on Save"));
