@@ -12,7 +12,7 @@ cargo clippy --all-targets -- -W clippy::pedantic -D warnings
 cargo test
 ```
 
-Do **not** touch the related forks (gpui-kit `my_fixes3`, pgls `pg_gui_2`, pgdap). All items below can be done inside pg-gui alone. See `CLAUDE.md` ("Related crates are out of scope").
+Do **not** touch the related forks (gpui-kit `my_fixes4`, pgls `pg_gui_2`, pgdap). All items below can be done inside pg-gui alone. See `CLAUDE.md` ("Related crates are out of scope").
 
 ---
 

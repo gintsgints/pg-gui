@@ -29,10 +29,10 @@ futures = "0.3.34"
 # on) so a single gpui resolves for the whole graph;
 # tree-sitter still lands on 0.26, in lockstep with the pgls fork's
 # `pg_gui_2` branch.
-gpui = { package = "gpui-pre", version = "0.3.5" }
+gpui = { package = "gpui-pre", version = "0.3.9" }
 # gpui split the platform out into its own crate; `gpui_platform::application()`
 # replaces the old `Application::new()`. Features match gpui-kit's own.
-gpui_platform = { package = "gpui-pre-platform", version = "0.3.5", features = [
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.9", features = [
     "font-kit",
     "x11",
     "wayland",
@@ -42,7 +42,7 @@ gpui_platform = { package = "gpui-pre-platform", version = "0.3.5", features = [
 # on the input (the clickable breakpoint gutter, `line_number_offset` for
 # body-relative routine numbering, and the vertical-selection column fix) plus
 # the `FlameGraph` chart the query-plan view draws.
-gpui-component = { git = "https://github.com/gintsgints/gpui-kit", branch = "my_fixes3", features = [
+gpui-component = { git = "https://github.com/gintsgints/gpui-kit", branch = "my_fixes4", features = [
     "tree-sitter-languages",
 ] }
 # The component icon bundle (the ~100 SVGs `IconName` names), from the same
@@ -51,12 +51,12 @@ gpui-component = { git = "https://github.com/gintsgints/gpui-kit", branch = "my_
 # editor's code-folding chevron, which gpui-component builds as an
 # `IconName::ChevronRight`/`ChevronDown` button in `set_editor_style` and which
 # an app cannot re-style from outside.
-gpui-kit-assets = { git = "https://github.com/gintsgints/gpui-kit", branch = "my_fixes3" }
+gpui-kit-assets = { git = "https://github.com/gintsgints/gpui-kit", branch = "my_fixes4" }
 # The editing/text engine gpui-component is built on, from the same workspace
 # and revision. Needed directly for `SelectableText` (plain text that joins the
 # window-level drag-select/copy the `Root` layer drives), which gpui-component
 # does not re-export; the Log view renders with it.
-gpui-base = { git = "https://github.com/gintsgints/gpui-kit", branch = "my_fixes3" }
+gpui-base = { git = "https://github.com/gintsgints/gpui-kit", branch = "my_fixes4" }
 # Must stay in lockstep with the lsp-types version gpui-component uses,
 # so our provider impls and its editor traits share the same types.
 lsp-types = "0.97"
