@@ -203,6 +203,10 @@ Pick one idiom and standardize:
 
 Consistency matters more than the choice. Do not silence with broad `#[allow(...)]`; a targeted allow with a justification comment is acceptable only for a genuine pedantic false positive (per `CLAUDE.md`).
 
+### Status
+
+- Done, as Option B, written down as a rule in `CLAUDE.md`. Option A was not on the table: gpui-component's completion, hover, definition and semantic-token provider traits return `anyhow::Result`, so `lsp`/`definitions`/`highlight` cannot leave `anyhow`, and moving `db`/`app` onto it would not have removed the boundary. It would only have moved it, wrapping messages `describe` had already made user-ready. The premise that `?` crosses `String`→`anyhow` with `map_err(Error::msg)` turned out not to hold: no code converts a `String` error into `anyhow` (`definitions` drops a failed `find_object` to a cached miss and never propagates it). The crossing that does exist runs the other way: an `anyhow::Error` shown in the status bar or log. Four sites printed one with `{err}`, which shows only the outermost context: the language-server start failure (`app.rs`), Format and Format on Save (`editing.rs`, `file_ops.rs`), and the theme load warning (`main.rs`). They now use `{err:#}`, as the debugger's start failure already did. No other change.
+
 ---
 
 ## Priority 6: Debugger edge cases — `src/debug.rs`

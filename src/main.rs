@@ -110,7 +110,7 @@ fn load_catppuccin(cx: &mut App) {
     if let Err(err) = ThemeRegistry::global_mut(cx)
         .load_themes_from_str(include_str!("../themes/catppuccin.json"))
     {
-        tracing::warn!("failed to load Catppuccin themes: {err}");
+        tracing::warn!("failed to load Catppuccin themes: {err:#}");
         return;
     }
     let registry = ThemeRegistry::global(cx);

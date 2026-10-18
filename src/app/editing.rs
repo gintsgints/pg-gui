@@ -243,7 +243,7 @@ impl PgGuiApp {
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => this.set_status("Script already formatted", cx),
-                Err(err) => this.set_status(format!("Format failed: {err}"), cx),
+                Err(err) => this.set_status(format!("Format failed: {err:#}"), cx),
             })
             .ok();
         })

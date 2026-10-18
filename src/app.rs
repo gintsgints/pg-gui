@@ -1318,7 +1318,9 @@ impl PgGuiApp {
                 Ok((client, diagnostics, schema)) => {
                     this.attach_lsp(client, diagnostics, schema, cx);
                 }
-                Err(err) => this.set_status(format!("SQL language server unavailable: {err}"), cx),
+                Err(err) => {
+                    this.set_status(format!("SQL language server unavailable: {err:#}"), cx);
+                }
             })
             .ok();
         })

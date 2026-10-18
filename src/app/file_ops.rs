@@ -672,7 +672,7 @@ impl PgGuiApp {
                 };
                 this.write_script(close_after, window, cx);
                 if let Some(err) = format_error {
-                    this.set_status(format!("Format on save failed: {err}"), cx);
+                    this.set_status(format!("Format on save failed: {err:#}"), cx);
                 }
             })
             .ok();
