@@ -187,6 +187,7 @@ lints, without spending a run on a failed connection attempt.
 |---|---|
 | `new_script_from_header` | The files panel's header "+" opens the name dialog; the typed name (`.sql` forced on) is created in the working folder and opened in the active tab. |
 | `new_script_from_folder_row_menu` | Right-click a folder row ▸ New Script…, type a name: the script is created inside that folder and opened in the active tab. |
+| `saved_new_script_closes_without_prompt` | Create a script with the header "+", type into it, cmd-s: the file holds the text and the tab matches it; cmd-w then closes the tab with no unsaved-changes prompt. |
 | `filter_finds_nested_script` | Typing in the files filter reduces the tree to a script inside collapsed folders (plus its expanded parents); clicking its row opens it. |
 | `rename_from_context_menu` | Filter to one file, right-click ▸ Rename…, type a new name: the file is renamed on disk (`.sql` forced back on), neighbours untouched. |
 | `delete_from_context_menu` | Filter to one file, right-click ▸ Delete…, Enter confirms: only that file is removed. |

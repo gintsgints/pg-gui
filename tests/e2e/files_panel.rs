@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::harness::{self, App, Button, Key};
+use crate::harness::{self, App, Button, Key, Mod};
 
 /// The file the active tab is backed by, if any.
 fn active_file(config: &Value) -> Option<&str> {
@@ -35,6 +35,52 @@ fn new_script_from_header() {
     app.wait_for_config("the new script opened in the active tab", |c| {
         active_file(c).is_some_and(|file| same_file(file, &created))
     });
+
+    app.quit();
+}
+
+#[test]
+fn saved_new_script_closes_without_prompt() {
+    let mut app = App::launch_with_folder(&["existing.sql"]);
+    let created = app.work_dir().join("saved_by_e2e.sql");
+
+    app.click_files_new_script();
+    app.type_text("saved_by_e2e");
+    app.press(&[], Key::Return);
+    app.wait_for_config("the new script opened in the active tab", |c| {
+        active_file(c).is_some_and(|file| same_file(file, &created))
+    });
+
+    // The new tab has the editor focus. Escape closes any completion menu
+    // the typing opened.
+    app.type_text("select 2;");
+    app.press(&[], Key::Escape);
+    app.wait_for_config("the edit", |c| {
+        harness::active_script(c).is_some_and(|script| script.contains("select 2"))
+    });
+
+    // Format-on-save is on by default, so the file may differ from what
+    // was typed; the tab takes the saved text either way.
+    app.send_keys(&[Mod::Cmd], 's');
+    app.wait_for("the saved file", harness::DB_TIMEOUT, |_| {
+        std::fs::read_to_string(&created).is_ok_and(|text| text.contains("select 2"))
+    });
+    let on_disk = std::fs::read_to_string(&created).expect("read saved script");
+    app.wait_for_config("the tab to match the file", |c| {
+        harness::active_script(c) == Some(on_disk.as_str())
+    });
+
+    // Saved, so cmd-w closes at once. An unsaved-changes dialog would keep
+    // the tab — still on the file — open behind it.
+    app.send_keys(&[Mod::Cmd], 'w');
+    app.wait_for_config("the tab to close without a prompt", |c| {
+        c["tabs"].as_array().is_some_and(|tabs| {
+            !tabs
+                .iter()
+                .any(|tab| tab["file"].as_str().is_some_and(|f| same_file(f, &created)))
+        })
+    });
+    assert!(created.is_file(), "closing keeps the saved file");
 
     app.quit();
 }
