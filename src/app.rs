@@ -818,13 +818,18 @@ impl PgGuiApp {
     /// Track which directories the user has open in the files panel, so a
     /// tree rebuild after a re-scan can restore them.
     fn track_expanded_dirs(tree_state: &Entity<TreeState>, cx: &mut Context<Self>) -> Subscription {
-        cx.subscribe(tree_state, |this, _, event: &TreeEvent, _| match event {
-            TreeEvent::Expanded(id) => {
-                this.expanded_dirs.insert(id.clone());
+        cx.subscribe(tree_state, |this, _, event: &TreeEvent, cx| {
+            match event {
+                TreeEvent::Expanded(id) => {
+                    this.expanded_dirs.insert(id.clone());
+                }
+                TreeEvent::Collapsed(id) => {
+                    this.expanded_dirs.remove(id);
+                }
             }
-            TreeEvent::Collapsed(id) => {
-                this.expanded_dirs.remove(id);
-            }
+            // The files panel sizes the tree to its drawn rows (see
+            // `render_files_tree`), so a fold changes the panel's layout.
+            cx.notify();
         })
     }
 

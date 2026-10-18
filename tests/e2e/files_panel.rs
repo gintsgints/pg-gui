@@ -1,11 +1,11 @@
-//! The files panel: creating, finding, renaming and deleting scripts in the
-//! working folder.
+//! The files panel: creating, finding, renaming and deleting scripts and
+//! folders in the working folder.
 
 use std::path::Path;
 
 use serde_json::Value;
 
-use crate::harness::{self, App, Button, Key, Mod};
+use crate::harness::{self, App, Button, Key};
 
 /// The file the active tab is backed by, if any.
 fn active_file(config: &Value) -> Option<&str> {
@@ -23,19 +23,15 @@ fn new_script_from_header() {
     let mut app = App::launch_with_folder(&["existing.sql"]);
     let created = app.work_dir().join("created_by_e2e.sql");
 
-    // The "+" asks for the name with the platform's save panel, opened on
-    // the working folder; its name field starts focused.
+    // The "+" asks for the name in an in-app dialog, empty and focused; the
+    // `.sql` is forced on.
     app.click_files_new_script();
-    app.wait_for_extra_window("the new-script save panel");
-    app.send_keys(&[Mod::Cmd], 'a');
-    app.type_text("created_by_e2e.sql");
+    app.type_text("created_by_e2e");
     app.press(&[], Key::Return);
 
     app.wait_for("the script on disk", harness::REACT_TIMEOUT, |_| {
         created.is_file()
     });
-    // The save panel answers with the path as typed into it, which may be
-    // the un-canonical `/var/…` spelling of the temp folder.
     app.wait_for_config("the new script opened in the active tab", |c| {
         active_file(c).is_some_and(|file| same_file(file, &created))
     });
@@ -116,6 +112,80 @@ fn delete_from_context_menu() {
         work.join("a_keep.sql").is_file(),
         "only the filtered row goes"
     );
+
+    app.quit();
+}
+
+#[test]
+fn new_folder_from_empty_space() {
+    let mut app = App::launch_with_folder(&["only.sql"]);
+    let created = app.work_dir().join("made_by_e2e");
+
+    // Well below the one row: the empty space's menu is New Script…,
+    // New Folder…, and Up from no selection wraps to the last item.
+    app.click_files_row(Button::Right, 6);
+    app.press(&[], Key::Up);
+    app.press(&[], Key::Return);
+    // The name dialog starts empty and focused.
+    app.type_text("made_by_e2e");
+    app.press(&[], Key::Return);
+
+    app.wait_for("the folder on disk", harness::REACT_TIMEOUT, |_| {
+        created.is_dir()
+    });
+
+    app.quit();
+}
+
+#[test]
+fn new_folder_from_folder_row_menu() {
+    let mut app = App::launch_with_folder(&["reports/", "z_last.sql"]);
+    let created = app.work_dir().join("reports/nested");
+
+    // A folder's menu is New Script…, New Folder…, Rename…, Delete…; three
+    // Ups from no selection land on New Folder…, which creates inside the
+    // clicked folder rather than beside it.
+    app.click_files_row(Button::Right, 0);
+    for _ in 0..3 {
+        app.press(&[], Key::Up);
+    }
+    app.press(&[], Key::Return);
+    app.type_text("nested");
+    app.press(&[], Key::Return);
+
+    app.wait_for("the folder on disk", harness::REACT_TIMEOUT, |_| {
+        created.is_dir()
+    });
+    assert!(
+        !app.work_dir().join("nested").exists(),
+        "created inside the folder, not beside it"
+    );
+
+    app.quit();
+}
+
+#[test]
+fn new_script_from_folder_row_menu() {
+    let mut app = App::launch_with_folder(&["reports/", "z_last.sql"]);
+    let created = app.work_dir().join("reports/monthly.sql");
+
+    // A folder's menu is New Script…, New Folder…, Rename…, Delete…; four
+    // Ups from no selection land on New Script…, which creates inside the
+    // clicked folder.
+    app.click_files_row(Button::Right, 0);
+    for _ in 0..4 {
+        app.press(&[], Key::Up);
+    }
+    app.press(&[], Key::Return);
+    app.type_text("monthly");
+    app.press(&[], Key::Return);
+
+    app.wait_for("the script on disk", harness::REACT_TIMEOUT, |_| {
+        created.is_file()
+    });
+    app.wait_for_config("the new script opened in the active tab", |c| {
+        active_file(c).is_some_and(|file| same_file(file, &created))
+    });
 
     app.quit();
 }

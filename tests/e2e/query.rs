@@ -44,11 +44,11 @@ fn run_script_from_files_panel_menu() {
     // Unfiltered, a_other.sql would be the top row.
     app.filter_files("b_seed");
     // Right-click the one row left; a file's menu is Open, Run Script, then
-    // New Script…, Rename…, Delete…, and Up from no selection wraps to the
-    // last item, so four Ups land on Run Script. Enter on it opens the
-    // confirmation, and Enter runs.
+    // New Script…, New Folder…, Rename…, Delete…, and Up from no selection
+    // wraps to the last item, so five Ups land on Run Script. Enter on it
+    // opens the confirmation, and Enter runs.
     app.click_files_row(Button::Right, 0);
-    for _ in 0..4 {
+    for _ in 0..5 {
         app.press(&[], Key::Up);
     }
     app.press(&[], Key::Return);

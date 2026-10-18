@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{
-    App, AppContext as _, Context, EntityInputHandler as _, ParentElement as _, Styled as _,
-    Window, div, px,
+    App, AppContext as _, Context, EntityInputHandler as _, ParentElement as _, SharedString,
+    Styled as _, Window, div, px,
 };
 use gpui_component::{
     WindowExt as _,
@@ -190,46 +190,60 @@ impl PgGuiApp {
         self.set_status(format!("Opened {}", path.display()), cx);
     }
 
-    /// Create a new script under `dir` — the "+" on a folder row in the
-    /// files panel — and open it in a tab. The name comes from the
-    /// platform's save dialog (which can also land the file elsewhere);
-    /// anything it returns is forced to `.sql`, since the panel only opens
-    /// and runs those. An existing file is never clobbered.
+    /// Ask for a new script's name and create it inside `dir` — the files
+    /// panel's "+" buttons and New Script… items. An in-app name dialog,
+    /// like New Folder's: the panel only ever creates inside the folder it
+    /// was asked on, so the platform's save panel (which offers a location
+    /// too) asked for more than the action needs.
     pub(in crate::app) fn new_script_in(dir: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        let rx = cx.prompt_for_new_path(dir, Some("script.sql"));
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(path))) = rx.await else {
-                return;
-            };
-            let path = if file_tree::is_sql(&path) {
-                path
-            } else {
-                path.with_extension("sql")
-            };
-            // `create_new` rather than `write`: the dialog's own overwrite
-            // confirmation was for the name it returned, which the `.sql`
-            // above may have changed underneath it.
-            let created = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map(|_| ());
+        let dir = dir.to_path_buf();
+        Self::prompt_name(
+            "New Script",
+            String::new(),
+            window,
+            cx,
+            move |this, name, window, cx| this.create_script(&dir, name, window, cx),
+        );
+    }
 
-            this.update_in(cx, |this, window, cx| match created {
-                Ok(()) => {
-                    // The panel re-scans on a timer; show the file now.
-                    this.tree_signature = 0;
-                    this.load_tree(cx);
-                    this.open_path(&path, window, cx);
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    this.set_status(format!("{} already exists", path.display()), cx);
-                }
-                Err(err) => this.set_status(format!("Create failed: {err}"), cx),
-            })
-            .ok();
-        })
-        .detach();
+    /// Create a confirmed new script `name` inside `dir` and open it in a
+    /// tab. The name is forced to `.sql`, since the panel only opens and
+    /// runs those, and `dir` is expanded so the file shows at once. An
+    /// existing file is never clobbered.
+    fn create_script(
+        &mut self,
+        dir: &Path,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = Path::new(name);
+        if !Self::is_plain_name(name) {
+            self.set_status("Enter a name, not a path", cx);
+            return;
+        }
+        let mut path = dir.join(name);
+        if !file_tree::is_sql(&path) {
+            path.set_extension("sql");
+        }
+        // `create_new` rather than `write`, so an existing file is refused.
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        match created {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.set_status(format!("{} already exists", path.display()), cx);
+                return;
+            }
+            Err(err) => {
+                self.set_status(format!("Create failed: {err}"), cx);
+                return;
+            }
+        }
+        self.reveal_created(dir, cx);
+        self.open_path(&path, window, cx);
     }
 
     /// Rename the file or folder the files panel's context menu was opened
@@ -241,20 +255,57 @@ impl PgGuiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if window.has_active_dialog(cx) {
-            return;
-        }
         let Some(current) = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
         else {
             return;
         };
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
+        Self::prompt_name(
+            "Rename",
+            current,
+            window,
+            cx,
+            move |this, name, window, cx| {
+                this.rename_path(&path, name, window, cx);
+            },
+        );
+    }
+
+    /// Ask for a new folder's name and create it inside `dir` — the files
+    /// panel's New Folder… item. An in-app dialog like Rename's, since the
+    /// platform's save panel asks for a file.
+    pub(in crate::app) fn prompt_new_folder(
+        dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        Self::prompt_name(
+            "New Folder",
+            String::new(),
+            window,
+            cx,
+            move |this, name, _, cx| this.create_folder(&dir, name, cx),
+        );
+    }
+
+    /// The files panel's one-field name dialog: `title` names both the
+    /// dialog and its primary button, `initial` starts selected so typing
+    /// replaces it, and `apply` gets the trimmed, non-empty name.
+    fn prompt_name(
+        title: &'static str,
+        initial: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        apply: impl Fn(&mut Self, &str, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(initial));
         // Deferred, so it lands after `open_dialog` below: opening a dialog
         // focuses the dialog's own handle, which would take the focus
-        // straight back off the input. The name starts selected, so typing
-        // replaces it.
+        // straight back off the input.
         cx.defer_in(window, {
             let input = input.clone();
             move |_, window, cx| {
@@ -265,26 +316,26 @@ impl PgGuiApp {
             }
         });
         let app = cx.weak_entity();
+        let apply = Rc::new(apply);
         window.open_dialog(cx, move |dialog, _, _| {
             let input = input.clone();
-            // Shared by the Rename button and the dialog's own Enter
+            // Shared by the primary button and the dialog's own Enter
             // binding; reports whether the dialog may close.
             let confirm: DialogConfirm = {
-                let (app, input, path) = (app.clone(), input.clone(), path.clone());
+                let (app, input, apply) = (app.clone(), input.clone(), apply.clone());
                 Rc::new(move |window: &mut Window, cx: &mut App| {
                     let name = input.read(cx).value().trim().to_string();
                     if name.is_empty() {
                         return false;
                     }
-                    let path = path.clone();
-                    app.update(cx, |this, cx| this.rename_path(&path, &name, window, cx))
+                    app.update(cx, |this, cx| apply(this, &name, window, cx))
                         .ok();
                     true
                 })
             };
             let ok = confirm.clone();
             dialog
-                .title("Rename")
+                .title(title)
                 .w(px(420.))
                 .on_ok(move |_, window, cx| ok(window, cx))
                 .child(
@@ -297,7 +348,7 @@ impl PgGuiApp {
                                     window.close_dialog(cx);
                                 },
                             ))
-                            .child(Button::new("rename").primary().label("Rename").on_click(
+                            .child(Button::new("confirm").primary().label(title).on_click(
                                 move |_, window, cx| {
                                     if confirm(window, cx) {
                                         window.close_dialog(cx);
@@ -307,6 +358,50 @@ impl PgGuiApp {
                     ),
                 )
         });
+    }
+
+    /// Whether `name` is a single plain path component — what the name
+    /// dialogs accept, since a path would land the entry somewhere the
+    /// dialog never offered.
+    fn is_plain_name(name: &Path) -> bool {
+        let mut parts = name.components();
+        matches!(parts.next(), Some(std::path::Component::Normal(_))) && parts.next().is_none()
+    }
+
+    /// Create a confirmed new folder `name` inside `dir`, expanding `dir` so
+    /// the folder shows at once. An existing entry is never clobbered.
+    pub(in crate::app) fn create_folder(&mut self, dir: &Path, name: &str, cx: &mut Context<Self>) {
+        let name = Path::new(name);
+        if !Self::is_plain_name(name) {
+            self.set_status("Enter a name, not a path", cx);
+            return;
+        }
+        let path = dir.join(name);
+        // `create_dir` fails on an existing entry, so nothing is clobbered.
+        match std::fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.set_status(format!("{} already exists", path.display()), cx);
+                return;
+            }
+            Err(err) => {
+                self.set_status(format!("Create failed: {err}"), cx);
+                return;
+            }
+        }
+        self.reveal_created(dir, cx);
+        self.set_status(format!("Created {}", path.display()), cx);
+    }
+
+    /// Show an entry just created inside `dir`: expand `dir` and re-scan now
+    /// rather than on the panel's timer.
+    fn reveal_created(&mut self, dir: &Path, cx: &mut Context<Self>) {
+        // The tree's row ids are the paths themselves; the working folder
+        // has no row and is always open.
+        self.expanded_dirs
+            .insert(SharedString::from(dir.to_string_lossy().into_owned()));
+        self.tree_signature = 0;
+        self.load_tree(cx);
     }
 
     /// Apply a confirmed rename. The name is taken as a plain file name in
@@ -322,9 +417,7 @@ impl PgGuiApp {
         cx: &mut Context<Self>,
     ) {
         let name = Path::new(name);
-        let mut parts = name.components();
-        if !matches!(parts.next(), Some(std::path::Component::Normal(_))) || parts.next().is_some()
-        {
+        if !Self::is_plain_name(name) {
             self.set_status("Enter a name, not a path", cx);
             return;
         }

@@ -15,13 +15,13 @@ use gpui_component::{
     h_flex,
     input::Input,
     list::ListItem,
-    menu::{PopupMenu, PopupMenuItem},
-    tree::tree,
+    menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
+    tree::{Tree, tree},
     v_flex,
 };
 
 use crate::app::PgGuiApp;
-use crate::{OpenFolder, RunScripts};
+use crate::{OpenFolder, RunScripts, file_tree};
 
 impl PgGuiApp {
     /// The files panel before a working folder has been picked.
@@ -125,24 +125,38 @@ impl PgGuiApp {
             )
             .separator()
         };
-        let (new, rename, delete) = (view.clone(), view.clone(), view.clone());
+        let (rename, delete) = (view.clone(), view.clone());
         let (rename_path, delete_path) = (path.clone(), path);
+        Self::new_entry_items(view, dir, menu)
+            .item(
+                PopupMenuItem::new("Rename\u{2026}").on_click(move |_, window, cx| {
+                    let path = rename_path.clone();
+                    rename.update(cx, |_, cx| Self::prompt_rename_path(path, window, cx));
+                }),
+            )
+            .item(
+                PopupMenuItem::new("Delete\u{2026}").on_click(move |_, window, cx| {
+                    let path = delete_path.clone();
+                    delete.update(cx, |this, cx| this.prompt_delete_path(path, window, cx));
+                }),
+            )
+    }
+
+    /// The New Script…/New Folder… pair, creating inside `dir`; shared by
+    /// the row menu and the empty-space menu below the rows.
+    fn new_entry_items(view: &Entity<Self>, dir: PathBuf, menu: PopupMenu) -> PopupMenu {
+        let (script, folder) = (view.clone(), view.clone());
+        let script_dir = dir.clone();
         menu.item(
             PopupMenuItem::new("New Script\u{2026}").on_click(move |_, window, cx| {
+                let dir = script_dir.clone();
+                script.update(cx, |_, cx| Self::new_script_in(&dir, window, cx));
+            }),
+        )
+        .item(
+            PopupMenuItem::new("New Folder\u{2026}").on_click(move |_, window, cx| {
                 let dir = dir.clone();
-                new.update(cx, |_, cx| Self::new_script_in(&dir, window, cx));
-            }),
-        )
-        .item(
-            PopupMenuItem::new("Rename\u{2026}").on_click(move |_, window, cx| {
-                let path = rename_path.clone();
-                rename.update(cx, |_, cx| Self::prompt_rename_path(path, window, cx));
-            }),
-        )
-        .item(
-            PopupMenuItem::new("Delete\u{2026}").on_click(move |_, window, cx| {
-                let path = delete_path.clone();
-                delete.update(cx, |this, cx| this.prompt_delete_path(path, window, cx));
+                folder.update(cx, |_, cx| Self::prompt_new_folder(dir, window, cx));
             }),
         )
     }
@@ -223,9 +237,15 @@ impl PgGuiApp {
         );
         let picked = self.selected_scripts.len();
         let files_tree = self.render_files_tree(cx);
+        // Each drawn row is one `tree_row_height`; `tree_items` tracks the
+        // user's folding (see `rebuild_file_tree`).
+        let rows = file_tree::visible_ids(&self.tree_items).len();
+        #[allow(clippy::cast_precision_loss)] // a row count, far below 2^23
+        let rows_height = Self::tree_row_height(cx) * rows as f32;
+        let view = cx.entity();
         v_flex()
             .size_full()
-            .child(Self::render_files_header(root, folder_name, cx))
+            .child(Self::render_files_header(root.clone(), folder_name, cx))
             .child(
                 div()
                     .px_1()
@@ -238,13 +258,34 @@ impl PgGuiApp {
             .when(picked > 1, |this| {
                 this.child(Self::render_script_run_bar(picked, cx))
             })
-            .child(div().flex_1().min_h(px(0.)).px_1().child(files_tree))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .px_1()
+                    // The tree is only as tall as its rows (shrinking, and
+                    // scrolling, once they overflow), so the space below
+                    // them is a separate element with its own right-click
+                    // menu. Wrapping the tree in that menu instead would
+                    // open it on a row too: neither trigger stops the
+                    // right-click from reaching the other.
+                    .child(files_tree.h(rows_height).min_h(px(0.)))
+                    .child(
+                        div()
+                            .id("files-empty-space")
+                            .flex_1()
+                            .min_h(px(0.))
+                            .context_menu(move |menu, _, _| {
+                                Self::new_entry_items(&view, root.clone(), menu)
+                            }),
+                    ),
+            )
     }
 
     /// The files panel's tree widget: the row renderer plus the per-row
     /// right-click menu. Split out of [`Self::render_files_panel`] because
     /// both closures capture, and both are long.
-    fn render_files_tree(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_files_tree(&self, cx: &mut Context<Self>) -> Tree {
         let dirs = self.tree_dirs.clone();
         let selected: Rc<HashSet<SharedString>> = Rc::new(self.selected_scripts.clone());
         let view = cx.entity();
