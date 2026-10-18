@@ -158,6 +158,10 @@ No behavior change; faster object browser, especially on remote/slow servers.
 - Keep the cursor-paged path for lone SELECTs unchanged.
 - Mention the cap in the status bar/log so users aren't surprised by missing rows.
 
+### Status
+
+- Done. `max_result_rows` (config.json, default 100 000, `0` = no cap) reaches `Session::run` through `db::RowLimits { batch_size, max_rows }`, which replaced the bare `batch_size` argument (also in `run_files`). `collect_outcome` keeps the first `max_rows` rows of each set and skips converting the rest, records the server's full count in `ResultSet::truncated_from`, and adds `note: result truncated at N rows` to that statement's log line; the status bar then reads `showing N of M row(s)`. The cursor-paged lone SELECT, EXPLAIN, and the export path (`run_script`) are uncapped. One limit the plan did not foresee: the synchronous `postgres` client has no streaming simple query (`simple_query_raw` is `tokio-postgres`-only, and `postgres::Client` keeps its runtime private), so the driver has buffered a statement's whole answer before the cap sees it. The cap therefore bounds what a result set *retains* — which is what piles up, since every tab keeps its sets across runs and parked connections keep theirs — not a single statement's peak. Bounding the peak would mean driving `tokio-postgres` directly. Covered by two ignored docker tests (`a_result_set_past_the_cap_is_truncated_and_logged`, `a_paged_select_is_not_capped`).
+
 ---
 
 ## Priority 4: Add unit tests outside `app.rs`

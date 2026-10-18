@@ -76,7 +76,7 @@ impl PgGuiApp {
         let ix = self.active_tab;
         let tab_id = self.tabs[ix].id;
         let autocommit = self.tabs[ix].autocommit;
-        let batch_size = self.config.fetch_size.max(1);
+        let limits = self.row_limits();
         let epoch = self.db_epoch;
         // Move the tab's live session into the worker (opened lazily below on
         // the first Run). A single SELECT-style statement pages through a
@@ -129,7 +129,7 @@ impl PgGuiApp {
             // wait for the run itself to finish.
             let (tx, mut events) = futures::channel::mpsc::unbounded();
             let running = cx.background_spawn(async move {
-                let result = session.run(&sql, batch_size, autocommit, &tx);
+                let result = session.run(&sql, limits, autocommit, &tx);
                 (session, result)
             });
             while let Some(event) = events.next().await {
@@ -546,7 +546,7 @@ impl PgGuiApp {
         let ix = self.active_tab;
         let tab_id = self.tabs[ix].id;
         let autocommit = self.tabs[ix].autocommit;
-        let batch_size = self.config.fetch_size.max(1);
+        let limits = self.row_limits();
         let epoch = self.db_epoch;
         let session = self.tabs[ix].session.take();
         self.start_progress(ix, format!("{count} script(s)"), cx);
@@ -596,7 +596,7 @@ impl PgGuiApp {
 
             let (tx, mut events) = futures::channel::mpsc::unbounded();
             let running = cx.background_spawn(async move {
-                let result = run_files(&mut session, files, batch_size, autocommit, &tx);
+                let result = run_files(&mut session, files, limits, autocommit, &tx);
                 (session, result)
             });
             while let Some(event) = events.next().await {
@@ -742,6 +742,12 @@ impl PgGuiApp {
         self.tabs[ix].result.has_more = more;
         let result = &self.tabs[ix].result;
         let row_count = result.selected().map_or(0, |set| set.rows.len());
+        // A capped set says how far short of the server's count it stops, so
+        // missing rows are never a surprise.
+        let of_txt = result
+            .selected()
+            .and_then(|set| set.truncated_from)
+            .map_or(String::new(), |total| format!(" of {total}"));
         let sets = result.results.len();
         if ix == self.active_tab {
             cx.notify();
@@ -754,7 +760,7 @@ impl PgGuiApp {
         };
         self.set_status(
             format!(
-                "{scope}: {statements} statement(s) executed in {elapsed:.0?} — showing {row_count} row(s){sets_txt}{more_txt}"
+                "{scope}: {statements} statement(s) executed in {elapsed:.0?} — showing {row_count}{of_txt} row(s){sets_txt}{more_txt}"
             ),
             cx,
         );
@@ -845,6 +851,15 @@ impl PgGuiApp {
                     .child(message.clone()),
             )
         });
+    }
+
+    /// The row limits a Run takes from config: `fetch_size` per cursor batch
+    /// and `max_result_rows` for everything else (`0` means no cap).
+    fn row_limits(&self) -> db::RowLimits {
+        db::RowLimits {
+            batch_size: self.config.fetch_size.max(1),
+            max_rows: (self.config.max_result_rows > 0).then_some(self.config.max_result_rows),
+        }
     }
 
     /// Fetch More: pull the next batch from the active tab's open cursor and
@@ -1029,7 +1044,7 @@ impl PgGuiApp {
 fn run_files(
     session: &mut db::Session,
     files: Vec<(String, PathBuf)>,
-    batch_size: usize,
+    limits: db::RowLimits,
     autocommit: bool,
     progress: &db::Progress,
 ) -> Result<db::RunResult, String> {
@@ -1040,7 +1055,7 @@ fn run_files(
         let _ = progress.unbounded_send(db::RunEvent::File(label.clone()));
         let _ = progress.unbounded_send(db::RunEvent::Log(format!("▶ {label}")));
         let run = session
-            .run(&sql, batch_size, autocommit, progress)
+            .run(&sql, limits, autocommit, progress)
             .map_err(|err| format!("{label}: {err}"))?;
         statements += run.statements;
         more = run.more;

@@ -30,6 +30,16 @@ rows is transferred (`fetch_size` in `config.json`, default 500) and a **Fetch
 more** button under the table pulls the next batch on demand. Nothing is
 loaded that you did not ask to see.
 
+Anything else that returns rows — DML with `RETURNING`, a `SELECT` inside a
+multi-statement block, a `SELECT` the cursor rejects — arrives in one piece,
+so it is capped instead: at most `max_result_rows` rows are kept (in
+`config.json`, default 100000; `0` keeps every row). A capped set says so
+twice — its log line ends in `note: result truncated at N rows`, and the
+status bar reads `showing N of M row(s)` with the server's full count. The cap
+limits what a result set holds for as long as its tab shows it; the rows still
+cross the wire, so a huge statement is better narrowed (or run alone, through
+the cursor) than capped.
+
 ## Cancelling
 
 A long-running statement can be stopped with Connection ▸ Cancel Query, which

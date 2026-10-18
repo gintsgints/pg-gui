@@ -120,6 +120,9 @@ pub struct ResultSet {
     pub label: String,
     pub columns: Vec<String>,
     pub rows: Rows,
+    /// The statement's full row count when `rows` stops short of it because
+    /// the set hit the run's row cap; `None` when every row is here.
+    pub truncated_from: Option<u64>,
 }
 
 /// What a run reports as it goes: one `Statement` the moment a statement is
@@ -153,6 +156,8 @@ pub struct QueryOutcome {
     pub columns: Vec<String>,
     pub rows: Rows,
     pub messages: Vec<String>,
+    /// See [`ResultSet::truncated_from`].
+    pub truncated_from: Option<u64>,
 }
 
 fn parse_row(row: &SimpleQueryRow) -> Vec<Option<String>> {
@@ -163,33 +168,55 @@ fn parse_row(row: &SimpleQueryRow) -> Vec<Option<String>> {
 
 /// Build a [`QueryOutcome`] from simple-query messages, keeping the most
 /// recent result set that produced columns.
-fn collect_outcome(results: Vec<SimpleQueryMessage>) -> QueryOutcome {
+///
+/// `max_rows` caps how many rows of a set are kept (`None` keeps them all):
+/// the rest are skipped rather than converted, the outcome records the
+/// server's full count in `truncated_from`, and a note joins the messages.
+/// The synchronous driver has already buffered every message by the time
+/// this runs, so the cap bounds what a result set holds on to afterwards —
+/// for as long as its tab shows it — not the statement's peak.
+fn collect_outcome(results: Vec<SimpleQueryMessage>, max_rows: Option<usize>) -> QueryOutcome {
     let mut outcome = QueryOutcome {
         columns: Vec::new(),
         rows: Vec::new(),
         messages: Vec::new(),
+        truncated_from: None,
     };
+    let cap = max_rows.unwrap_or(usize::MAX);
     let mut current_cols: Vec<String> = Vec::new();
     let mut current_rows: Rows = Vec::new();
+    let mut seen: u64 = 0;
     for msg in results {
         match msg {
             SimpleQueryMessage::RowDescription(cols) => {
                 current_cols = cols.iter().map(|c| c.name().to_string()).collect();
                 current_rows.clear();
+                seen = 0;
             }
             SimpleQueryMessage::Row(row) => {
                 if current_cols.is_empty() {
                     current_cols = row.columns().iter().map(|c| c.name().to_string()).collect();
                 }
-                current_rows.push(parse_row(&row));
+                seen += 1;
+                if current_rows.len() < cap {
+                    current_rows.push(parse_row(&row));
+                }
             }
             SimpleQueryMessage::CommandComplete(n) => {
                 outcome.messages.push(format!("ok ({n} rows)"));
+                let truncated = current_rows.len() < usize::try_from(seen).unwrap_or(usize::MAX);
+                if truncated {
+                    outcome
+                        .messages
+                        .push(format!("note: result truncated at {cap} rows"));
+                }
                 // Keep the most recent result set that produced columns.
                 if !current_cols.is_empty() {
                     outcome.columns = std::mem::take(&mut current_cols);
                     outcome.rows = std::mem::take(&mut current_rows);
+                    outcome.truncated_from = truncated.then_some(seen);
                 }
+                seen = 0;
             }
             _ => {}
         }
@@ -217,6 +244,16 @@ pub struct Session {
     /// A cursor-only transaction (autocommit on) is open, committed when the
     /// cursor is closed.
     implicit_txn: bool,
+}
+
+/// How many rows a Run moves at a time and keeps in all.
+#[derive(Debug, Clone, Copy)]
+pub struct RowLimits {
+    /// Rows a cursor-paged SELECT fetches per batch (`fetch_size`).
+    pub batch_size: usize,
+    /// Most rows kept from a result set that is not paged (`max_result_rows`);
+    /// `None` keeps them all. See [`collect_outcome`].
+    pub max_rows: Option<usize>,
 }
 
 /// What a finished Run reports back: how many statements it ran and whether
@@ -350,8 +387,8 @@ impl Session {
     /// statement failed.
     ///
     /// A lone SELECT-style statement is paged through a server-side cursor
-    /// (first `batch_size` rows sent, `more` set when the cursor is left
-    /// open). With `autocommit` off, statements run inside a transaction
+    /// (first `limits.batch_size` rows sent, `more` set when the cursor is
+    /// left open); any other result set keeps at most `limits.max_rows`. With `autocommit` off, statements run inside a transaction
     /// started on the first Run and ended only by
     /// [`Self::commit`]/[`Self::rollback`]. Postgres wraps a multi-statement
     /// simple query in an implicit transaction; with autocommit on a block is
@@ -359,7 +396,7 @@ impl Session {
     pub fn run(
         &mut self,
         sql: &str,
-        batch_size: usize,
+        limits: RowLimits,
         autocommit: bool,
         progress: &Progress,
     ) -> Result<RunResult, String> {
@@ -382,7 +419,7 @@ impl Session {
         }
         let mut more = false;
         for (n, range) in ranges.iter().enumerate() {
-            let paged = single.then_some(batch_size);
+            let paged = single.then_some(limits.batch_size);
             send(
                 progress,
                 RunEvent::Statement {
@@ -390,7 +427,7 @@ impl Session {
                     total: ranges.len(),
                 },
             );
-            match self.run_statement(n + 1, &sql[range.clone()], paged, progress) {
+            match self.run_statement(n + 1, &sql[range.clone()], paged, limits.max_rows, progress) {
                 Ok(left_open) => more = left_open,
                 Err(error) => {
                     if wrap {
@@ -415,20 +452,22 @@ impl Session {
     /// returned rows — its result set to `progress`. `paged` carries the
     /// batch size for a lone statement, which may page its rows through a
     /// cursor; the returned flag says whether that cursor was left open.
+    /// Rows that do not come through the cursor are capped at `max_rows`.
     fn run_statement(
         &mut self,
         n: usize,
         statement: &str,
         paged: Option<usize>,
+        max_rows: Option<usize>,
         progress: &Progress,
     ) -> Result<bool, String> {
         let started = Instant::now();
         let run = match paged {
-            Some(batch_size) => self.run_paged(statement, batch_size),
+            Some(batch_size) => self.run_paged(statement, batch_size, max_rows),
             None => self
                 .client
                 .simple_query(statement)
-                .map(|results| (collect_outcome(results), false))
+                .map(|results| (collect_outcome(results, max_rows), false))
                 .map_err(|e| describe(&e)),
         };
         // Whatever the statement raised on its way through — including a
@@ -467,6 +506,7 @@ impl Session {
                     label: one_line(statement),
                     columns: outcome.columns,
                     rows: outcome.rows,
+                    truncated_from: outcome.truncated_from,
                 }),
             );
         }
@@ -475,11 +515,12 @@ impl Session {
 
     /// Run a lone statement, paging a plain SELECT through a cursor. Falls
     /// back to a direct execute for anything the cursor rejects (DML, DDL, a
-    /// data-modifying CTE).
+    /// data-modifying CTE), whose rows are capped at `max_rows`.
     fn run_paged(
         &mut self,
         statement: &str,
         batch_size: usize,
+        max_rows: Option<usize>,
     ) -> Result<(QueryOutcome, bool), String> {
         if let Ok(select) = export::copyable(statement)
             && let Some(page) = self.try_cursor(select, batch_size)?
@@ -490,7 +531,7 @@ impl Session {
             .client
             .simple_query(statement)
             .map_err(|e| describe(&e))?;
-        Ok((collect_outcome(results), false))
+        Ok((collect_outcome(results, max_rows), false))
     }
 
     /// Try to page `select` through a cursor. Returns `None` (the caller
@@ -549,6 +590,7 @@ impl Session {
                 columns,
                 rows,
                 messages: vec![format!("ok ({n} rows)")],
+                truncated_from: None,
             },
             more,
         )))
@@ -591,7 +633,7 @@ impl Session {
             .map_err(|e| describe(&e))?;
         // One column, one row — but a long plan is returned as several rows on
         // some server versions, so they are joined back together.
-        let json = collect_outcome(results)
+        let json = collect_outcome(results, None)
             .rows
             .iter()
             .filter_map(|row| row.first().cloned().flatten())
@@ -1356,7 +1398,7 @@ pub fn run_script(conn_str: &str, sql: &str) -> Result<QueryOutcome, String> {
         connect(conn_str).map_err(|e| format!("connection failed: {}", describe(&e)))?;
 
     let results = client.simple_query(sql).map_err(|e| describe(&e))?;
-    Ok(collect_outcome(results))
+    Ok(collect_outcome(results, None))
 }
 
 /// Re-run `sql` server-side wrapped in `COPY (…) TO STDOUT WITH (FORMAT
@@ -1399,7 +1441,7 @@ pub fn export_inserts(conn_str: &str, sql: &str, path: &Path) -> Result<usize, S
 #[cfg(test)]
 mod tests {
     use super::{
-        LOG_SQL_LEN, ResultSet, RunEvent, Session, export_csv, export_inserts, one_line,
+        LOG_SQL_LEN, ResultSet, RowLimits, RunEvent, Session, export_csv, export_inserts, one_line,
         search_path, statement_ranges,
     };
 
@@ -1441,8 +1483,21 @@ mod tests {
         sql: &str,
         batch_size: usize,
     ) -> Result<Run, (String, Vec<String>)> {
+        let limits = RowLimits {
+            batch_size,
+            max_rows: None,
+        };
+        run_limited(session, sql, limits)
+    }
+
+    /// [`run`] with a row cap as well as a batch size.
+    fn run_limited(
+        session: &mut Session,
+        sql: &str,
+        limits: RowLimits,
+    ) -> Result<Run, (String, Vec<String>)> {
         let (tx, rx) = futures::channel::mpsc::unbounded();
-        let result = session.run(sql, batch_size, true, &tx);
+        let result = session.run(sql, limits, true, &tx);
         drop(tx);
         let mut log = Vec::new();
         let mut notices = Vec::new();
@@ -1540,6 +1595,49 @@ mod tests {
         );
         // A run of one buffer says nothing about files.
         assert!(ran.files.is_empty(), "{:?}", ran.files);
+    }
+
+    #[test]
+    #[ignore = "requires the docker compose database on localhost:5433"]
+    fn a_result_set_past_the_cap_is_truncated_and_logged() {
+        let mut session = Session::connect(CONN).unwrap();
+        let limits = RowLimits {
+            batch_size: 50,
+            max_rows: Some(3),
+        };
+        // Inside a block nothing pages through the cursor, so the cap applies.
+        let ran = run_limited(
+            &mut session,
+            "SELECT 1; SELECT generate_series(1, 10);",
+            limits,
+        )
+        .unwrap();
+        let set = ran.sets.last().expect("a result set");
+        assert_eq!(set.rows.len(), 3);
+        assert_eq!(set.truncated_from, Some(10));
+        assert!(
+            ran.log[1].contains("ok (10 rows); note: result truncated at 3 rows"),
+            "{:?}",
+            ran.log
+        );
+        // A set under the cap is whole and says nothing.
+        assert_eq!(ran.sets[0].truncated_from, None);
+        assert!(!ran.log[0].contains("truncated"), "{:?}", ran.log);
+    }
+
+    #[test]
+    #[ignore = "requires the docker compose database on localhost:5433"]
+    fn a_paged_select_is_not_capped() {
+        let mut session = Session::connect(CONN).unwrap();
+        let limits = RowLimits {
+            batch_size: 50,
+            max_rows: Some(3),
+        };
+        let ran = run_limited(&mut session, "SELECT generate_series(1, 10);", limits).unwrap();
+        // The cursor already bounds what a lone SELECT pulls; Fetch More is how
+        // the user asks for the rest, so the cap stays out of its way.
+        assert_eq!(ran.rows().len(), 10);
+        assert_eq!(ran.sets[0].truncated_from, None);
     }
 
     #[test]

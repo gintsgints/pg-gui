@@ -147,6 +147,12 @@ pub struct Config {
     /// time; Fetch More pulls the next batch.
     #[serde(default = "default_fetch_size")]
     pub fetch_size: usize,
+    /// Most rows kept from a result set that is not paged through a cursor
+    /// (DML with `RETURNING`, a statement inside a block, a SELECT the cursor
+    /// rejects); the rest are dropped and the log says so. `0` keeps every
+    /// row.
+    #[serde(default = "default_max_result_rows")]
+    pub max_result_rows: usize,
     /// Anthropic API key for AI completion; when empty, the
     /// `ANTHROPIC_API_KEY` environment variable is used instead.
     #[serde(default)]
@@ -272,6 +278,7 @@ impl Default for Config {
             editor_height: None,
             page_size: default_page_size(),
             fetch_size: default_fetch_size(),
+            max_result_rows: default_max_result_rows(),
             ai_api_key: String::new(),
             ai_model: String::new(),
             ai_prompt: String::new(),
@@ -307,6 +314,10 @@ fn default_page_size() -> usize {
 
 fn default_fetch_size() -> usize {
     500
+}
+
+fn default_max_result_rows() -> usize {
+    100_000
 }
 
 fn default_definition_file_mask() -> String {
