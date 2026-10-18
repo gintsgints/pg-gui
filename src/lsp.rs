@@ -189,6 +189,9 @@ enum DocEvent {
         position: TextSize,
         reply: oneshot::Sender<HoverOutcome>,
     },
+    /// Drop the workspace's schema cache, so the next feature that needs it
+    /// reloads it from the database.
+    InvalidateSchema,
     /// Close the workspace document and stop the worker.
     Close,
 }
@@ -363,6 +366,15 @@ impl Client {
             .map_err(|_| anyhow!("formatting task was cancelled"))?
     }
 
+    /// Drop the schema cache, which the workspace otherwise keeps for the life
+    /// of the process, so objects created, altered or dropped since it loaded
+    /// show up in completions, hover and diagnostics. Returns immediately: the
+    /// worker reloads it on its own thread, reporting
+    /// [`SchemaStatus::Loading`] until it has.
+    pub fn invalidate_schema(&self) {
+        self.inner.doc_tx.send(DocEvent::InvalidateSchema).ok();
+    }
+
     /// Close the workspace document and stop the document worker. Returns
     /// immediately; the worker closes the document on its own thread.
     pub fn shutdown(&self) {
@@ -444,13 +456,8 @@ fn document_worker(worker: &Worker, events: &StdReceiver<DocEvent>) {
                 position,
                 reply,
             }) => {
-                trace!(
-                    position = u32::from(position),
-                    before = %cursor_context(&text, position),
-                    "completion request"
-                );
                 version += 1;
-                apply_change(workspace, path, version, text);
+                sync_for_request(workspace, path, version, text, position, "completion");
                 reply
                     .send(worker_completions(workspace, path, position))
                     .ok();
@@ -462,16 +469,23 @@ fn document_worker(worker: &Worker, events: &StdReceiver<DocEvent>) {
                 position,
                 reply,
             }) => {
-                trace!(
-                    position = u32::from(position),
-                    before = %cursor_context(&text, position),
-                    "hover request"
-                );
                 version += 1;
-                apply_change(workspace, path, version, text);
+                sync_for_request(workspace, path, version, text, position, "hover");
                 reply.send(worker_hover(workspace, path, position)).ok();
                 // The document moved, so diagnostics need a fresh run.
                 settle_at = Some(Instant::now() + DEBOUNCE);
+            }
+            Some(DocEvent::InvalidateSchema) => {
+                let Some(next) = invalidate_schema(worker, status) else {
+                    break;
+                };
+                if next != status {
+                    status = next;
+                    // Probe right away (the probe is what reloads the cache) and
+                    // re-run diagnostics that named the changed objects.
+                    probe_at = Some(Instant::now());
+                    settle_at = Some(Instant::now() + DEBOUNCE);
+                }
             }
             Some(DocEvent::Close) => break,
             // A deadline passed rather than an event arriving; both may be due.
@@ -488,7 +502,7 @@ fn document_worker(worker: &Worker, events: &StdReceiver<DocEvent>) {
                     };
                     status = probed;
                     // Once loaded it stays loaded: the workspace caches the
-                    // schema per connection for the life of the process.
+                    // schema per connection until `InvalidateSchema` drops it.
                     probe_at = (status != SchemaStatus::Loaded)
                         .then(|| Instant::now() + SCHEMA_PROBE_INTERVAL);
                 }
@@ -501,6 +515,21 @@ fn document_worker(worker: &Worker, events: &StdReceiver<DocEvent>) {
             .ok();
     })
     .ok();
+}
+
+/// Drop the workspace's schema cache and report it as loading again. Without
+/// a database there is no cache to drop, so `status` is returned unchanged.
+/// `None` once the receiver is gone.
+fn invalidate_schema(worker: &Worker, status: SchemaStatus) -> Option<SchemaStatus> {
+    if worker.connection_disabled {
+        return Some(status);
+    }
+    info!("schema cache invalidated");
+    if let Ok(Err(err)) = contain_panic(|| worker.workspace.invalidate_schema_cache(false)) {
+        warn!("schema invalidation failed: {err}");
+    }
+    worker.schema.unbounded_send(SchemaStatus::Loading).ok()?;
+    Some(SchemaStatus::Loading)
 }
 
 /// Run the settled diagnostics analysis and publish it. `false` once the
@@ -574,6 +603,24 @@ fn probe_schema(workspace: &Arc<dyn Workspace>, path: &PgLSPath) -> SchemaStatus
         }
     })
     .unwrap_or(SchemaStatus::Offline)
+}
+
+/// Bring the workspace document up to `text` before answering a `request`
+/// (completion or hover) at `position`, tracing what the request sees.
+fn sync_for_request(
+    workspace: &Arc<dyn Workspace>,
+    path: &PgLSPath,
+    version: i32,
+    text: String,
+    position: TextSize,
+    request: &str,
+) {
+    trace!(
+        position = u32::from(position),
+        before = %cursor_context(&text, position),
+        "{request} request"
+    );
+    apply_change(workspace, path, version, text);
 }
 
 /// Apply a full-text change to the workspace document, containing any panic.

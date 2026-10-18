@@ -596,20 +596,35 @@ impl PgGuiApp {
 
             let (tx, mut events) = futures::channel::mpsc::unbounded();
             let running = cx.background_spawn(async move {
-                let result = run_files(&mut session, files, limits, autocommit, &tx);
-                (session, result)
+                let mut schema_changed = false;
+                let result = run_files(
+                    &mut session,
+                    files,
+                    limits,
+                    autocommit,
+                    &tx,
+                    &mut schema_changed,
+                );
+                (session, result, schema_changed)
             });
             while let Some(event) = events.next().await {
                 this.update(cx, |this, cx| this.on_run_event(tab_id, epoch, event, cx))
                     .ok();
             }
-            let (session, result) = running.await;
+            let (session, result, schema_changed) = running.await;
             let elapsed = started.elapsed();
             let scope = format!("{count} script(s)");
 
-            this.update_in(cx, |this, window, cx| match result {
-                Ok(run) => this.on_query_ok(tab_id, epoch, session, &run, &scope, elapsed, cx),
-                Err(err) => this.on_query_error(tab_id, epoch, Some(session), &err, window, cx),
+            this.update_in(cx, |this, window, cx| {
+                // A batch that failed partway still committed the files before
+                // the failing one; their DDL counts even though the run errs.
+                if result.is_err() && schema_changed {
+                    this.invalidate_lsp_schema();
+                }
+                match result {
+                    Ok(run) => this.on_query_ok(tab_id, epoch, session, &run, &scope, elapsed, cx),
+                    Err(err) => this.on_query_error(tab_id, epoch, Some(session), &err, window, cx),
+                }
             })
             .ok();
         })
@@ -738,7 +753,14 @@ impl PgGuiApp {
         let Some(ix) = self.settle_session(tab_id, epoch, session) else {
             return;
         };
-        let db::RunResult { statements, more } = *run;
+        let db::RunResult {
+            statements,
+            more,
+            schema_changed,
+        } = *run;
+        if schema_changed {
+            self.invalidate_lsp_schema();
+        }
         self.tabs[ix].result.has_more = more;
         let result = &self.tabs[ix].result;
         let row_count = result.selected().map_or(0, |set| set.rows.len());
@@ -1013,17 +1035,21 @@ impl PgGuiApp {
         cx.spawn_in(window, async move |this, cx| {
             let (session, result) = cx
                 .background_spawn(async move {
+                    // Only a commit can publish DDL to other connections.
                     let result = if commit {
                         session.commit()
                     } else {
-                        session.rollback()
+                        session.rollback().map(|()| false)
                     };
                     (session, result)
                 })
                 .await;
 
             this.update_in(cx, |this, window, cx| match result {
-                Ok(()) => {
+                Ok(schema_changed) => {
+                    if schema_changed {
+                        this.invalidate_lsp_schema();
+                    }
                     if let Some(ix) = this.settle_session(tab_id, epoch, session) {
                         // Ending the transaction closed any cursor with it.
                         this.tabs[ix].result.has_more = false;
@@ -1041,12 +1067,17 @@ impl PgGuiApp {
     }
 }
 
+/// Run `files` in order on `session`, stopping at the first failure.
+/// `schema_changed` collects [`db::RunResult::schema_changed`] across the
+/// files that finished, so the caller learns of committed DDL even when a
+/// later file fails and the whole call returns `Err`.
 fn run_files(
     session: &mut db::Session,
     files: Vec<(String, PathBuf)>,
     limits: db::RowLimits,
     autocommit: bool,
     progress: &db::Progress,
+    schema_changed: &mut bool,
 ) -> Result<db::RunResult, String> {
     let mut statements = 0;
     let mut more = false;
@@ -1059,6 +1090,11 @@ fn run_files(
             .map_err(|err| format!("{label}: {err}"))?;
         statements += run.statements;
         more = run.more;
+        *schema_changed |= run.schema_changed;
     }
-    Ok(db::RunResult { statements, more })
+    Ok(db::RunResult {
+        statements,
+        more,
+        schema_changed: *schema_changed,
+    })
 }

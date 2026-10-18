@@ -38,6 +38,18 @@ doing:
 The check repeats until the schema loads, so starting the database after the
 app still flips the segment without a reconnect.
 
+Once loaded, the cache is kept until something says the schema moved, at
+which point it is reloaded and the segment shows `schema loading` again:
+
+- a run that commits a `CREATE`, `ALTER`, `DROP` or `COMMENT ON` statement —
+  with autocommit off, at the Commit, since the server's own connection cannot
+  see the change before then (a Rollback reloads nothing);
+- a script batch that committed such a statement, even if a later file failed;
+- refreshing the object browser, or any folder in it.
+
+DDL run inside a `DO` block or a function is not recognised; refresh the
+browser after it.
+
 ## Formatting
 
 Format-on-save is **on** by default (`format_on_save` in `config.json`) and

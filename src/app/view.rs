@@ -183,13 +183,15 @@ impl PgGuiApp {
     }
 
     /// Reload the object browser from scratch (collapse to the schema list
-    /// and refetch), picking up objects created since the last load.
+    /// and refetch), picking up objects created since the last load — and
+    /// have the language server reload its schema cache with it.
     pub(in crate::app) fn refresh_db_tree(
         &mut self,
         _: &RefreshDbTree,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.invalidate_lsp_schema();
         self.load_db_schemas(cx);
     }
 

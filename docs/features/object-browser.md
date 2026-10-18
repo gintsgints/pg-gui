@@ -30,4 +30,6 @@ path, so a cmd-click and a click in the browser behave identically.
 ## Refreshing
 
 Refreshing the browser re-reads the schemas and drops the cached definition
-lookups, as does reconnecting.
+lookups, as does reconnecting. Refreshing (the whole browser or one folder)
+also makes the [language server](language-server.md) reload its schema
+cache, so completions see the same objects the browser shows.

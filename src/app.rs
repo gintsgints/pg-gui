@@ -1152,6 +1152,9 @@ impl PgGuiApp {
         let Some(node) = db_tree::find(&self.db_nodes, &id) else {
             return;
         };
+        // A refresh means the schema moved under us; completions should see
+        // the same objects the browser is about to show.
+        self.invalidate_lsp_schema();
         if node.kind.is_lazy_folder() {
             // Force a reload: back to Unloaded so `load_db_children` re-fetches
             // (it skips nodes already Loaded/Loading).
@@ -1168,6 +1171,15 @@ impl PgGuiApp {
         }
         self.load_db_folders(reload, cx);
         self.rebuild_db_tree(cx);
+    }
+
+    /// Make the language server reload its schema cache, after something
+    /// changed the schema or the user asked for a refresh. A no-op while the
+    /// server is not running.
+    pub(in crate::app) fn invalidate_lsp_schema(&self) {
+        if let Some(client) = &self.lsp {
+            client.invalidate_schema();
+        }
     }
 
     /// The connection Go to Definition resolves symbols against.

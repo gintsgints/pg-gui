@@ -239,11 +239,20 @@ pub struct Session {
     notices: Notices,
     /// `_pg_gui_results` is declared and not yet closed.
     cursor_open: bool,
-    /// A user transaction (autocommit off) is open.
-    in_txn: bool,
+    /// The open user transaction (autocommit off), if any.
+    txn: Option<UserTxn>,
     /// A cursor-only transaction (autocommit on) is open, committed when the
     /// cursor is closed.
     implicit_txn: bool,
+}
+
+/// What a session remembers about its open user transaction.
+#[derive(Default)]
+struct UserTxn {
+    /// It has run a statement that changes the schema ([`changes_schema`]);
+    /// [`Session::commit`] reports it, since only then can another
+    /// connection — the language server's — see the change.
+    changed_schema: bool,
 }
 
 /// How many rows a Run moves at a time and keeps in all.
@@ -264,6 +273,10 @@ pub struct RowLimits {
 pub struct RunResult {
     pub statements: usize,
     pub more: bool,
+    /// The run committed a statement that changes the schema, so caches of it
+    /// (the language server's) are stale. `false` while that statement sits
+    /// in an open user transaction: [`Session::commit`] reports it instead.
+    pub schema_changed: bool,
 }
 
 /// How much of a statement a log line shows before it is elided.
@@ -306,6 +319,28 @@ fn send(progress: &Progress, event: RunEvent) {
     let _ = progress.unbounded_send(event);
 }
 
+/// Whether a statement changes what the schema holds — `CREATE`, `ALTER`,
+/// `DROP` or `COMMENT ON` (comments show in hover) — judged by its first
+/// keyword after any leading comments. A `DO` block or a function that runs
+/// DDL is not seen; the browser's refresh covers those.
+fn changes_schema(statement: &str) -> bool {
+    let mut rest = statement;
+    loop {
+        rest = rest.trim_start();
+        if let Some(line) = rest.strip_prefix("--") {
+            rest = line.split_once('\n').map_or("", |(_, after)| after);
+        } else if let Some(block) = rest.strip_prefix("/*") {
+            rest = block.split_once("*/").map_or("", |(_, after)| after);
+        } else {
+            break;
+        }
+    }
+    let keyword: String = rest.chars().take_while(char::is_ascii_alphabetic).collect();
+    ["create", "alter", "drop", "comment"]
+        .iter()
+        .any(|ddl| keyword.eq_ignore_ascii_case(ddl))
+}
+
 /// The statements of `sql`, dropping segments that hold nothing but stray
 /// semicolons and whitespace.
 fn statement_ranges(sql: &str) -> Vec<Range<usize>> {
@@ -328,7 +363,7 @@ impl Session {
             client: connect_collecting(conn_str, Some(&notices))?,
             notices,
             cursor_open: false,
-            in_txn: false,
+            txn: None,
             implicit_txn: false,
         })
     }
@@ -351,7 +386,7 @@ impl Session {
 
     /// Whether a user transaction (autocommit off) is currently open.
     pub fn in_txn(&self) -> bool {
-        self.in_txn
+        self.txn.is_some()
     }
 
     /// Whether the underlying connection has been closed (e.g. the server
@@ -401,17 +436,17 @@ impl Session {
         progress: &Progress,
     ) -> Result<RunResult, String> {
         self.end_cursor()?;
-        if !autocommit && !self.in_txn {
+        if !autocommit && self.txn.is_none() {
             self.client
                 .batch_execute("BEGIN")
                 .map_err(|e| describe(&e))?;
-            self.in_txn = true;
+            self.txn = Some(UserTxn::default());
         }
         let ranges = statement_ranges(sql);
         // Only a lone statement pages through a cursor: within a block the
         // cursor would have to stay open across the statements that follow.
         let single = ranges.len() == 1;
-        let wrap = ranges.len() > 1 && !self.in_txn;
+        let wrap = ranges.len() > 1 && self.txn.is_none();
         if wrap {
             self.client
                 .batch_execute("BEGIN")
@@ -442,9 +477,19 @@ impl Session {
                 .batch_execute("COMMIT")
                 .map_err(|e| describe(&e))?;
         }
+        let ddl = ranges
+            .iter()
+            .any(|range| changes_schema(&sql[range.clone()]));
+        let schema_changed = if let Some(txn) = self.txn.as_mut() {
+            txn.changed_schema |= ddl;
+            false
+        } else {
+            ddl
+        };
         Ok(RunResult {
             statements: ranges.len(),
             more,
+            schema_changed,
         })
     }
 
@@ -544,7 +589,7 @@ impl Session {
         select: &str,
         batch_size: usize,
     ) -> Result<Option<(QueryOutcome, bool)>, String> {
-        let implicit = !self.in_txn && !self.implicit_txn;
+        let implicit = self.txn.is_none() && !self.implicit_txn;
         if implicit {
             self.client
                 .batch_execute("BEGIN")
@@ -553,7 +598,7 @@ impl Session {
         }
         // Inside a user transaction a failed DECLARE would abort it; guard
         // with a savepoint so the fallback path can still run.
-        let savepoint = self.in_txn;
+        let savepoint = self.txn.is_some();
         if savepoint {
             self.client
                 .batch_execute("SAVEPOINT _pg_gui_sp")
@@ -612,11 +657,11 @@ impl Session {
         autocommit: bool,
     ) -> Result<String, String> {
         self.end_cursor()?;
-        if !autocommit && !self.in_txn {
+        if !autocommit && self.txn.is_none() {
             self.client
                 .batch_execute("BEGIN")
                 .map_err(|e| describe(&e))?;
-            self.in_txn = true;
+            self.txn = Some(UserTxn::default());
         }
         let options = if analyze {
             "ANALYZE, BUFFERS, FORMAT JSON"
@@ -683,24 +728,30 @@ impl Session {
         Ok((columns, rows))
     }
 
-    /// Commit the open transaction (and any cursor within it).
-    pub fn commit(&mut self) -> Result<(), String> {
-        self.finish_txn("COMMIT")
+    /// Commit the open transaction (and any cursor within it). Returns
+    /// whether the transaction changed the schema, as
+    /// [`RunResult::schema_changed`] does for a run outside one.
+    pub fn commit(&mut self) -> Result<bool, String> {
+        Ok(self
+            .finish_txn("COMMIT")?
+            .is_some_and(|txn| txn.changed_schema))
     }
 
     /// Roll the open transaction back (and any cursor within it).
     pub fn rollback(&mut self) -> Result<(), String> {
-        self.finish_txn("ROLLBACK")
+        self.finish_txn("ROLLBACK").map(|_| ())
     }
 
-    fn finish_txn(&mut self, sql: &str) -> Result<(), String> {
-        if self.in_txn || self.implicit_txn || self.cursor_open {
+    /// End every open transaction with `sql`, handing back the user
+    /// transaction that was open, if any.
+    fn finish_txn(&mut self, sql: &str) -> Result<Option<UserTxn>, String> {
+        if self.txn.is_some() || self.implicit_txn || self.cursor_open {
             self.client.batch_execute(sql).map_err(|e| describe(&e))?;
         }
-        self.in_txn = false;
+        let txn = self.txn.take();
         self.implicit_txn = false;
         self.cursor_open = false;
-        Ok(())
+        Ok(txn)
     }
 }
 
@@ -1443,9 +1494,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        LOG_SQL_LEN, ResultSet, RowLimits, RunEvent, Session, connect, describe, export_csv,
-        export_inserts, is_true, log_line, one_line, quote_ident, quote_literal, search_path,
-        statement_ranges, test_connection,
+        LOG_SQL_LEN, ResultSet, RowLimits, RunEvent, Session, changes_schema, connect, describe,
+        export_csv, export_inserts, is_true, log_line, one_line, quote_ident, quote_literal,
+        search_path, statement_ranges, test_connection,
     };
 
     const CONN: &str = "postgres://pgui:pgui@localhost:5433/pgui_test";
@@ -1470,6 +1521,7 @@ mod tests {
         /// happened.
         sequence: Vec<String>,
         more: bool,
+        schema_changed: bool,
     }
 
     impl Run {
@@ -1532,6 +1584,7 @@ mod tests {
                 files,
                 sequence,
                 more: run.more,
+                schema_changed: run.schema_changed,
             }),
             Err(error) => Err((error, log)),
         }
@@ -1626,6 +1679,36 @@ mod tests {
         // A set under the cap is whole and says nothing.
         assert_eq!(ran.sets[0].truncated_from, None);
         assert!(!ran.log[0].contains("truncated"), "{:?}", ran.log);
+    }
+
+    /// DDL outside a transaction is reported by the run; inside one, only by
+    /// the commit that publishes it, and never by a rollback.
+    #[test]
+    #[ignore = "requires the docker compose database on localhost:5433"]
+    fn schema_changes_are_reported_once_committed() {
+        let mut session = Session::connect(CONN).unwrap();
+        let ran = run(&mut session, "CREATE TEMP TABLE _sc_a (id int);", 50).unwrap();
+        assert!(ran.schema_changed);
+        let ran = run(&mut session, "SELECT 1;", 50).unwrap();
+        assert!(!ran.schema_changed);
+
+        let limits = RowLimits {
+            batch_size: 50,
+            max_rows: None,
+        };
+        let (tx, _rx) = futures::channel::mpsc::unbounded();
+        let held = session
+            .run("CREATE TEMP TABLE _sc_b (id int);", limits, false, &tx)
+            .unwrap();
+        assert!(!held.schema_changed, "not visible to others before commit");
+        assert!(session.commit().unwrap());
+
+        session
+            .run("CREATE TEMP TABLE _sc_c (id int);", limits, false, &tx)
+            .unwrap();
+        session.rollback().unwrap();
+        session.run("SELECT 1;", limits, false, &tx).unwrap();
+        assert!(!session.commit().unwrap(), "a rollback forgets the DDL");
     }
 
     #[test]
@@ -1755,6 +1838,29 @@ mod tests {
     fn test_connection_reports_unreachable_and_unparseable_servers() {
         assert!(test_connection(UNREACHABLE).is_err());
         assert!(test_connection("not a connection string").is_err());
+    }
+
+    #[test]
+    fn schema_changes_are_recognised_by_their_first_keyword() {
+        for ddl in [
+            "CREATE TABLE t (id int)",
+            "  create index on t (id)",
+            "-- note\nALTER TABLE t ADD c int",
+            "/* why */ drop view v",
+            "Comment on table t is 'x'",
+        ] {
+            assert!(changes_schema(ddl), "{ddl}");
+        }
+        for other in [
+            "SELECT 1",
+            "insert into t values (1)",
+            "-- create table t\nselect 1",
+            "/* drop */ update t set id = 2",
+            "createx",
+            "",
+        ] {
+            assert!(!changes_schema(other), "{other}");
+        }
     }
 
     #[test]
