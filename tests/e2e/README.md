@@ -82,6 +82,7 @@ back. Without a menu the Enter is only a newline, so every attempt starts over
 and repeats (`retry_until`) until the completion shows. The object scenarios
 need a database and create a `zebra_orders` table with a `zebra_total` column,
 a prefix nothing else in the database shares, so it is the first item; the
+view one needs a database too, to run what the template built; the built-in
 snippet one needs none.
 
 | Test | What it checks |
@@ -89,6 +90,7 @@ snippet one needs none.
 | `completes_table_name` | `select * from <schema>.zebra_o` completes to the table `zebra_orders`. |
 | `completes_column_name` | `select * from <schema>.zebra_orders where zebra_to` completes to the column `zebra_total`, offered from the FROM clause's table. |
 | `completes_builtin_snippet_from_its_name` | No database: typing `largest tables` offers the built-in "Size: largest tables" snippet, and Enter inserts its SQL. |
+| `completes_view_snippet_and_creates_view` | Typing `create view` offers the built-in "New: view" template first (its `OR REPLACE` may be left out); Enter inserts it with its first stop (the view name) selected, typing and Tab fill the name and source table in the scratch schema (keeping `*`), and cmd-enter creates the view. |
 
 ### `connections`: saved connections and switching
 
@@ -146,7 +148,7 @@ shortcut and format-on-save are covered in `editor`.
 
 ### `snippets`: the snippet picker
 
-No database needed. Edit ▸ Snippets (cmd-p) opens a searchable picker over the
+No database needed, except by the last scenario. Edit ▸ Snippets (cmd-p) opens a searchable picker over the
 built-in snippets and the user's own `.sql` files under `snippets/` in the
 config directory; `App::pick_snippet(filter)` opens it, types the filter and
 inserts the first match with Enter. User snippets are written into the scratch
@@ -158,6 +160,7 @@ config directory before launch, and the buffer is read back through the tab's
 | `picker_inserts_user_snippet_as_own_statement` | A user snippet picked with the cursor at the start of `select 1;` lands there on a line of its own. |
 | `filter_snippet_leaves_caret_between_percents` | A built-in whose filter defaults to `ILIKE '%%'` leaves the caret between the two `%`, so typed text narrows the filter. |
 | `tab_stops_take_typed_values_in_order` | A user snippet with `${1:columns}` and `${2:source}`: the first marker turns into its selected placeholder and typing replaces it, the second stays a marker until Tab reaches it, and the result reads `select id from orders;`. |
+| `view_snippet_creates_view` | Needs a database. The built-in "New: view" snippet, its stops filled with a view name and a source table in the scratch schema (Tab keeps the `*` select list), runs with cmd-enter and the view exists in the schema afterwards. |
 
 ### `editor_syntax`: SQL syntax checking
 
@@ -404,7 +407,7 @@ on with Session ▸ Toggle Autocommit, and the change is confirmed through
 
 ## Database-backed scenarios
 
-The `completion` (but its snippet one), `query`, `db_viewer`, `debugger`, `definitions`, `explain`, `export`, `hover` and `transactions` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` one need a running PostgreSQL. The harness never starts
+The `completion` (but its snippet one), `query`, `db_viewer`, `debugger`, `definitions`, `explain`, `export`, `hover` and `transactions` scenarios, all of `results` but the failed-run log one, and the last `editor_syntax` and `snippets` ones need a running PostgreSQL. The harness never starts
 or provisions one; it uses a database that already exists. Choose it with
 `PG_GUI_E2E_DATABASE`:
 
@@ -538,7 +541,7 @@ Harness API:
 | Call | Purpose |
 |---|---|
 | `App::launch()` / `App::launch_with(&Value)` | Starts the app on a scratch config seeded with `default_seed()` or your own JSON, and waits for the window. |
-| `Schema::create(test)` | Creates the scenario's scratch schema, or returns `None` (the scenario returns early) when `PG_GUI_E2E_DATABASE` is unset. `name()`, `execute(sql)` (`{schema}` is replaced by the name), `table_exists(table)`, `row_count(table)`, `sequence_calls(sequence)`, `open_transactions()`, `backends()`. Before dropping, it ends any other backend whose query names the schema (a debug target left trapped). Dropped with `CASCADE` on drop. |
+| `Schema::create(test)` | Creates the scenario's scratch schema, or returns `None` (the scenario returns early) when `PG_GUI_E2E_DATABASE` is unset. `name()`, `execute(sql)` (`{schema}` is replaced by the name), `table_exists(table)`, `view_exists(view)`, `row_count(table)`, `sequence_calls(sequence)`, `open_transactions()`, `backends()`. Before dropping, it ends any other backend whose query names the schema (a debug target left trapped). Dropped with `CASCADE` on drop. |
 | `App::launch_with_database(&Schema, script)` | Starts the app connected to the schema's database, the database panel showing, with one tab holding `script`. |
 | `click_db_row(Button, row)`, `expand_db_row(row)` | Database panel: click tree row `row` (0 = top); make sure folder row `row` is expanded (safe to repeat). |
 | `retry_until(what, timeout, attempt, pred)` | Repeats `attempt` until `config.json` satisfies `pred`, for steps nothing outside the window reports on. Each attempt must be safe to repeat. |

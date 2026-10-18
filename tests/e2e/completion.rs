@@ -1,7 +1,7 @@
 //! Completions in the SQL editor: database object names from the embedded
 //! language server's schema cache, and snippets matched by the words typed.
-//! The object scenarios need `PG_GUI_E2E_DATABASE`; the snippet one does
-//! not.
+//! The object scenarios and the view one need `PG_GUI_E2E_DATABASE`; the
+//! built-in snippet one does not.
 //!
 //! The completion menu cannot be read from outside the window, so each
 //! scenario types a prefix, waits for the menu, and takes its first item
@@ -96,6 +96,53 @@ fn completes_builtin_snippet_from_its_name() {
         "largest tables",
         |script| script.contains("ORDER BY pg_total_relation_size(c.oid) DESC"),
     );
+
+    app.quit();
+}
+
+#[test]
+fn completes_view_snippet_and_creates_view() {
+    let Some(mut schema) = Schema::create("completion::completes_view_snippet_and_creates_view")
+    else {
+        return;
+    };
+    let name = schema.name().to_string();
+    schema.execute("create table {schema}.orders (id int, total numeric)");
+    let mut app = App::launch_with_database(&schema, "");
+
+    // "create view" are the view template's leading SQL words once its
+    // `OR REPLACE` is skipped, a two-word match that ranks first and
+    // replaces both words. A landed template jumps to its first stop at
+    // once, leaving the view's name selected and the later markers intact.
+    complete_until(
+        &mut app,
+        "the view snippet inserted",
+        "create view",
+        |script| {
+            script == "CREATE OR REPLACE VIEW view_name AS\nSELECT ${2:*}\nFROM ${3:table_name};"
+        },
+    );
+
+    // Typing replaces the selected name; Tab walks the remaining stops: the
+    // select list (kept as `*`) and the source table.
+    app.type_text(&format!("{name}.order_totals"));
+    app.press(&[], Key::Tab);
+    app.press(&[], Key::Tab);
+    app.type_text(&format!("{name}.orders"));
+    // Close a completion menu the typing may have opened.
+    app.press(&[], Key::Escape);
+    let expected =
+        format!("CREATE OR REPLACE VIEW {name}.order_totals AS\nSELECT *\nFROM {name}.orders;");
+    app.wait_for_config("every stop filled", |config| {
+        harness::active_script(config).is_some_and(|script| script.trim_end() == expected)
+    });
+
+    // The cursor is still inside the statement, so cmd-enter runs it; a
+    // new tab autocommits.
+    app.press(&[Mod::Cmd], Key::Return);
+    app.wait_for("the view created by the run", harness::DB_TIMEOUT, |_| {
+        schema.view_exists("order_totals")
+    });
 
     app.quit();
 }

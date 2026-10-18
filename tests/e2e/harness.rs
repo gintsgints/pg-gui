@@ -252,6 +252,18 @@ impl Schema {
             .unwrap_or_else(|err| panic!("e2e database: {err}"))
     }
 
+    /// Whether a view named `view` exists in the schema.
+    pub fn view_exists(&mut self, view: &str) -> bool {
+        self.client
+            .query_one(
+                "select exists (select 1 from pg_views \
+                 where schemaname = $1 and viewname = $2)",
+                &[&self.name, &view],
+            )
+            .and_then(|row| row.try_get(0))
+            .unwrap_or_else(|err| panic!("e2e database: {err}"))
+    }
+
     /// Number of rows in the schema's table `table`.
     pub fn row_count(&mut self, table: &str) -> i64 {
         let sql = format!("select count(*) from {}.{table}", self.name);
@@ -1104,12 +1116,22 @@ impl App {
     /// search box starts focused, `filter` narrows the list, and Enter
     /// inserts the first match at the cursor.
     pub fn pick_snippet(&mut self, filter: &str) {
+        self.pick_snippet_nth(filter, 0);
+    }
+
+    /// [`Self::pick_snippet`], but insert the match `skip` rows below the
+    /// first (matches are listed by name), for a snippet whose every word
+    /// another one's name also has.
+    pub fn pick_snippet_nth(&mut self, filter: &str, skip: u32) {
         self.send_keys(&[Mod::Cmd], 'p');
         // As in `fill_connection_dialog`: nothing outside the window says
         // when the picker has drawn, nor when the filter has applied.
         std::thread::sleep(DIALOG_SETTLE);
         self.type_text(filter);
         std::thread::sleep(DIALOG_SETTLE);
+        for _ in 0..skip {
+            self.press(&[], Key::Down);
+        }
         self.press(&[], Key::Return);
     }
 
