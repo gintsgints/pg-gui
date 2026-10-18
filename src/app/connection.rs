@@ -2,7 +2,8 @@
 //! and switching — which parks one connection's untitled tabs and output and
 //! brings back the next one's.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::fmt::Write as _;
 use std::rc::Rc;
 
 use gpui::Subscription;
@@ -92,24 +93,41 @@ impl Render for ConnectionTest {
 
 /// The individual pieces of a `PostgreSQL` connection, edited as separate
 /// fields in the New Connection dialog and recombined into a URL.
-#[derive(Default)]
+#[derive(Default, Debug, PartialEq)]
 struct ConnectionParts {
     host: String,
     port: String,
     database: String,
     user: String,
     password: String,
+    /// The session's `search_path`, comma-separated (`app,public`); empty
+    /// leaves the server's default. Carried in the URL as the libpq
+    /// `options=-c search_path=…` parameter, so every connection opened
+    /// from the string — query sessions, the browser, the language server's
+    /// search-path probe, the debugger — starts on it.
+    schema: String,
+    /// The `options` tokens other than the `search_path` setting, kept so an
+    /// edit through the fields does not drop them.
+    options: Vec<String>,
+    /// The URL's other query parameters (`sslmode=require`, …), still
+    /// percent-encoded, kept verbatim for the same reason.
+    params: Vec<String>,
 }
 
-/// The five text inputs of the New Connection dialog, grouped so their
+/// The six text inputs of the New Connection dialog, grouped so their
 /// current values can be read back into [`ConnectionParts`] in one place.
+/// The `options` and other query parameters have no field: they ride along
+/// in `extra`, taken from the URL the form was last seeded from or that was
+/// last typed into the connection string.
 #[derive(Clone)]
 struct ConnectionFields {
     host: Entity<InputState>,
     port: Entity<InputState>,
     database: Entity<InputState>,
+    schema: Entity<InputState>,
     user: Entity<InputState>,
     password: Entity<InputState>,
+    extra: Rc<RefCell<(Vec<String>, Vec<String>)>>,
 }
 
 /// Everything the New / Edit Connection dialog is built over: the name box,
@@ -126,11 +144,12 @@ struct ConnectionForm {
 }
 
 impl ConnectionFields {
-    fn as_array(&self) -> [Entity<InputState>; 5] {
+    fn as_array(&self) -> [Entity<InputState>; 6] {
         [
             self.host.clone(),
             self.port.clone(),
             self.database.clone(),
+            self.schema.clone(),
             self.user.clone(),
             self.password.clone(),
         ]
@@ -139,12 +158,16 @@ impl ConnectionFields {
     /// Snapshot the fields; everything but the password is trimmed (a
     /// password may legitimately contain leading/trailing spaces).
     fn read(&self, cx: &App) -> ConnectionParts {
+        let (options, params) = self.extra.borrow().clone();
         ConnectionParts {
             host: self.host.read(cx).value().trim().to_string(),
             port: self.port.read(cx).value().trim().to_string(),
             database: self.database.read(cx).value().trim().to_string(),
             user: self.user.read(cx).value().trim().to_string(),
             password: self.password.read(cx).value().to_string(),
+            schema: self.schema.read(cx).value().trim().to_string(),
+            options,
+            params,
         }
     }
 
@@ -157,10 +180,13 @@ impl ConnectionFields {
             .update(cx, |s, cx| s.set_value(parts.port.clone(), window, cx));
         self.database
             .update(cx, |s, cx| s.set_value(parts.database.clone(), window, cx));
+        self.schema
+            .update(cx, |s, cx| s.set_value(parts.schema.clone(), window, cx));
         self.user
             .update(cx, |s, cx| s.set_value(parts.user.clone(), window, cx));
         self.password
             .update(cx, |s, cx| s.set_value(parts.password.clone(), window, cx));
+        *self.extra.borrow_mut() = (parts.options.clone(), parts.params.clone());
     }
 }
 
@@ -172,15 +198,23 @@ impl ConnectionParts {
         let Some((_, rest)) = conn.split_once("://") else {
             return Self::default();
         };
+        let rest = rest.split('#').next().unwrap_or_default();
+        let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i + 1..]),
             None => (rest, ""),
         };
 
         let mut parts = Self {
-            database: percent_decode(path.split(['?', '#']).next().unwrap_or("")),
+            database: percent_decode(path),
             ..Self::default()
         };
+        for param in query.split('&').filter(|param| !param.is_empty()) {
+            match param.split_once('=') {
+                Some(("options", value)) => parts.parse_options(&percent_decode(value)),
+                _ => parts.params.push(param.to_string()),
+            }
+        }
 
         let (userinfo, hostport) = match authority.rfind('@') {
             Some(i) => (Some(&authority[..i]), &authority[i + 1..]),
@@ -207,8 +241,40 @@ impl ConnectionParts {
         parts
     }
 
+    /// Split a libpq `options` value into its tokens, lifting a
+    /// `search_path` setting (`-c search_path=…`, `-csearch_path=…` or
+    /// `--search_path=…`) into [`Self::schema`] and keeping the rest.
+    fn parse_options(&mut self, options: &str) {
+        let mut tokens = options.split_whitespace();
+        while let Some(token) = tokens.next() {
+            let setting = match token {
+                "-c" => {
+                    let Some(next) = tokens.next() else {
+                        self.options.push(token.to_string());
+                        continue;
+                    };
+                    next
+                }
+                _ => token
+                    .strip_prefix("--")
+                    .or_else(|| token.strip_prefix("-c"))
+                    .unwrap_or(token),
+            };
+            match setting.strip_prefix("search_path=") {
+                Some(path) => self.schema = path.to_string(),
+                None if token == "-c" => {
+                    self.options.push(token.to_string());
+                    self.options.push(setting.to_string());
+                }
+                None => self.options.push(token.to_string()),
+            }
+        }
+    }
+
     /// Recombine the fields into a `postgres://` URL, percent-encoding the
-    /// credential and database segments.
+    /// credential and database segments. The schema goes back into `options`
+    /// with the whitespace dropped, since a space would split the setting
+    /// into two server arguments (`app, public` becomes `app,public`).
     fn to_url(&self) -> String {
         let mut url = String::from("postgres://");
         if !self.user.is_empty() {
@@ -226,8 +292,55 @@ impl ConnectionParts {
         }
         url.push('/');
         url.push_str(&percent_encode(&self.database));
+
+        let mut options = self.options.clone();
+        let schema: String = self.schema.split_whitespace().collect();
+        if !schema.is_empty() {
+            options.push("-c".to_string());
+            options.push(format!("search_path={schema}"));
+        }
+        let mut params = Vec::new();
+        if !options.is_empty() {
+            params.push(format!(
+                "options={}",
+                encode_query_value(&options.join(" "))
+            ));
+        }
+        params.extend(self.params.iter().cloned());
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
+        }
         url
     }
+}
+
+/// Percent-encode a URL query value: everything but the unreserved
+/// characters (and `,`, which a search path is full of and a query value
+/// may hold as-is).
+fn encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b',') {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+/// A connection-dialog input under its muted label.
+fn labeled_input(label: &str, input: &Entity<InputState>, cx: &App) -> impl IntoElement {
+    v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(label.to_string()),
+        )
+        .child(Input::new(input))
 }
 
 impl PgGuiApp {
@@ -368,12 +481,14 @@ impl PgGuiApp {
             host: field(parts.host, "localhost", cx),
             port: field(parts.port, "5432", cx),
             database: field(parts.database, "postgres", cx),
+            schema: field(parts.schema, "server default", cx),
             user: field(parts.user, "postgres", cx),
             password: cx.new(|cx| {
                 InputState::new(window, cx)
                     .masked(true)
                     .default_value(parts.password)
             }),
+            extra: Rc::new(RefCell::new((parts.options, parts.params))),
         };
         let preview = cx.new(|cx| InputState::new(window, cx).default_value(seed_url.to_string()));
         let test_status = cx.new(|_| ConnectionTest::Idle);
@@ -530,18 +645,7 @@ impl PgGuiApp {
                         .ok();
                 }
             };
-            let labeled = |label: &str, input: &Entity<InputState>, cx: &mut App| {
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(label.to_string()),
-                    )
-                    .child(Input::new(input))
-            };
-
+            let labeled = labeled_input;
             dialog.title(title).w(px(520.)).child(
                 v_flex()
                     .gap_4()
@@ -553,20 +657,23 @@ impl PgGuiApp {
                             .child(div().flex_1().child(labeled("Host", &fields.host, cx)))
                             .child(div().w(px(120.)).child(labeled("Port", &fields.port, cx))),
                     )
-                    .child(labeled("Database", &fields.database, cx))
-                    .child(labeled("Username", &fields.user, cx))
-                    .child(labeled("Password", &fields.password, cx))
                     .child(
-                        v_flex()
-                            .gap_1()
+                        h_flex()
+                            .gap_3()
                             .child(
                                 div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Connection string"),
+                                    .flex_1()
+                                    .child(labeled("Database", &fields.database, cx)),
                             )
-                            .child(Input::new(&preview)),
+                            .child(div().flex_1().child(labeled(
+                                "Schema (search_path)",
+                                &fields.schema,
+                                cx,
+                            ))),
                     )
+                    .child(labeled("Username", &fields.user, cx))
+                    .child(labeled("Password", &fields.password, cx))
+                    .child(labeled("Connection string", &preview, cx))
                     .child(test_status)
                     .child(
                         h_flex()
@@ -813,5 +920,78 @@ impl PgGuiApp {
             name.to_string()
         };
         self.set_status(format!("Connecting to {label}"), cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectionParts;
+
+    #[test]
+    fn schema_round_trips_through_options() {
+        let parts = ConnectionParts::parse(
+            "postgres://u:p@h:5433/db?options=-c%20search_path%3Dapp,public",
+        );
+        assert_eq!(parts.schema, "app,public");
+        assert!(parts.options.is_empty());
+        assert_eq!(
+            parts.to_url(),
+            "postgres://u:p@h:5433/db?options=-c%20search_path%3Dapp,public"
+        );
+    }
+
+    #[test]
+    fn schema_whitespace_is_dropped() {
+        let parts = ConnectionParts {
+            host: "h".into(),
+            database: "db".into(),
+            schema: " app, public ".into(),
+            ..ConnectionParts::default()
+        };
+        assert_eq!(
+            parts.to_url(),
+            "postgres://h/db?options=-c%20search_path%3Dapp,public"
+        );
+    }
+
+    #[test]
+    fn no_schema_adds_no_query() {
+        let url = "postgres://u@h:5432/db";
+        assert_eq!(ConnectionParts::parse(url).to_url(), url);
+    }
+
+    /// Other options and query parameters survive an edit of the schema.
+    #[test]
+    fn other_options_and_params_are_kept() {
+        let mut parts = ConnectionParts::parse(
+            "postgres://h/db?sslmode=require&options=--search_path%3Dold%20-c%20work_mem%3D64MB",
+        );
+        assert_eq!(parts.schema, "old");
+        assert_eq!(parts.options, ["-c", "work_mem=64MB"]);
+        assert_eq!(parts.params, ["sslmode=require"]);
+
+        parts.schema = "new".into();
+        assert_eq!(
+            parts.to_url(),
+            "postgres://h/db?options=-c%20work_mem%3D64MB%20-c%20search_path%3Dnew&sslmode=require"
+        );
+        parts.schema.clear();
+        assert_eq!(
+            parts.to_url(),
+            "postgres://h/db?options=-c%20work_mem%3D64MB&sslmode=require"
+        );
+    }
+
+    /// The driver reads the options back as the server setting.
+    #[test]
+    fn driver_sees_search_path_option() {
+        let parts = ConnectionParts {
+            host: "h".into(),
+            database: "db".into(),
+            schema: "app".into(),
+            ..ConnectionParts::default()
+        };
+        let config: postgres::Config = parts.to_url().parse().expect("valid url");
+        assert_eq!(config.get_options(), Some("-c search_path=app"));
     }
 }

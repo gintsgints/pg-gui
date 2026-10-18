@@ -140,3 +140,29 @@ fn new_connection_dialog_creates_and_switches() {
 
     app.quit();
 }
+
+/// The schema travels in the URL's `options`: a connection string typed in
+/// the `--search_path` form is parsed into the dialog's Schema field and
+/// saved back from the fields in the `-c search_path=` form, next to the
+/// query parameters the dialog has no field for.
+#[test]
+fn new_connection_dialog_keeps_schema() {
+    const TYPED: &str =
+        "postgres://e2e@127.0.0.1:1/third?sslmode=disable&options=--search_path%3Dapp";
+    const SAVED: &str =
+        "postgres://e2e@127.0.0.1:1/third?options=-c%20search_path%3Dapp&sslmode=disable";
+    let mut app = App::launch_prepared(|_, seed| {
+        seed["connection_string"] = Value::from(FIRST_URL);
+        seed["recent_connections"] = serde_json::json!([{ "name": "first", "url": FIRST_URL }]);
+    });
+
+    app.click_menu("Connection", "New Connection…");
+    app.fill_connection_dialog("third", TYPED);
+
+    let config = app.wait_for_config("the schema connection selected", |c| {
+        recent_names(c) == ["third", "first"]
+    });
+    assert_eq!(config["connection_string"], SAVED);
+
+    app.quit();
+}
