@@ -41,6 +41,38 @@ fn new_tab_and_close_tab() {
     app.quit();
 }
 
+/// A window too narrow for every tab clips some off the strip; the "» N"
+/// button lists those, and picking one activates it.
+#[test]
+fn hidden_tabs_menu_activates_a_clipped_tab() {
+    let mut app = App::launch_for_results_with(None, "", |seed| {
+        seed["tabs"] = (0..10)
+            .map(|n| serde_json::json!({ "script": format!("select {n};"), "file": null }))
+            .collect();
+        seed["active_tab"] = Value::from(9);
+    });
+    app.set_window_size(700., 600.);
+
+    // The strip reveals the active last tab, so the first tabs are the
+    // clipped ones and the menu's top item is the first tab.
+    app.retry_until(
+        "the hidden-tabs menu to activate the first tab",
+        harness::REACT_TIMEOUT,
+        |app| app.pick_hidden_tab(0),
+        |c| c["active_tab"] == 0,
+    );
+
+    // Now the strip sits at its start, so the menu lists tabs from its end.
+    app.retry_until(
+        "the hidden-tabs menu to activate a tab at the end",
+        harness::REACT_TIMEOUT,
+        |app| app.pick_hidden_tab(0),
+        |c| c["active_tab"].as_u64().is_some_and(|ix| ix > 0),
+    );
+
+    app.quit();
+}
+
 #[test]
 fn panel_shortcuts_toggle_panels() {
     let mut app = App::launch();

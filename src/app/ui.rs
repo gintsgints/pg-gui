@@ -1,7 +1,7 @@
 //! Rendering, split by panel. Pieces several panels share live here.
 
 mod bottom;
-mod chrome;
+pub(in crate::app) mod chrome;
 mod db_browser;
 mod debugger;
 mod files;

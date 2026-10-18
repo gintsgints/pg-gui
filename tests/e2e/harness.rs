@@ -863,6 +863,32 @@ impl App {
         }
     }
 
+    /// Resize the main window to `width` × `height` points, keeping its
+    /// position.
+    pub fn set_window_size(&mut self, width: f64, height: f64) {
+        let process = self.process();
+        osascript(&format!(
+            "tell application \"System Events\" to tell (first window of {process} whose name starts with \"pg-gui\") to set size to {{{width}, {height}}}"
+        ));
+    }
+
+    /// Open the tab bar's "» N" menu of clipped tabs and pick its `item`
+    /// (0 = top), for a launch with both side panels hidden, so the tab bar
+    /// ends at the window's right edge. Escape first closes a menu a previous
+    /// attempt left open, so a retry never toggles it shut.
+    pub fn pick_hidden_tab(&mut self, item: u32) {
+        let (_, _, width, _) = self.window_frame();
+        let button_x = width - HIDDEN_TABS_FROM_RIGHT;
+        self.press(&[], Key::Escape);
+        self.click_at(Button::Left, button_x, TAB_BAR_Y);
+        std::thread::sleep(DIALOG_SETTLE);
+        self.click_at(
+            Button::Left,
+            button_x - HIDDEN_TABS_MENU_INSET,
+            HIDDEN_TABS_FIRST_ITEM_Y + HIDDEN_TABS_ITEM_HEIGHT * f64::from(item),
+        );
+    }
+
     /// Titles of the app's windows.
     pub fn window_titles(&self) -> Vec<String> {
         let process = self.process();
@@ -1268,6 +1294,16 @@ pub fn database_seed(url: &str, script: &str) -> Value {
 /// reads: the status bar (a small line with its padding) and nothing above
 /// it. Measured from a capture at 100% zoom.
 const STATUS_BAR_HEIGHT: f64 = 28.;
+/// The tab bar's "» N" button of clipped tabs: its vertical middle, and how
+/// far left of the window's right edge its middle sits when the tab bar
+/// spans the window (the session toolbar takes the rest). Its menu hangs
+/// from the button's right edge; the inset reaches into an item's label
+/// from the button's middle. Measured from a capture at 100% zoom.
+const TAB_BAR_Y: f64 = 46.;
+const HIDDEN_TABS_FROM_RIGHT: f64 = 215.;
+const HIDDEN_TABS_MENU_INSET: f64 = 40.;
+const HIDDEN_TABS_FIRST_ITEM_Y: f64 = 79.;
+const HIDDEN_TABS_ITEM_HEIGHT: f64 = 27.;
 /// How long [`App::fill_connection_dialog`] waits for the dialog to draw.
 const DIALOG_SETTLE: Duration = Duration::from_millis(500);
 

@@ -1,22 +1,40 @@
 //! Window chrome: title bar, tab bar, session toolbar and status bar.
 
+use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
+use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, div, px,
+    Anchor, AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _,
+    ScrollHandle, StatefulInteractiveElement as _, Styled as _, canvas, div,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Sizable as _, TitleBar,
     button::{Button, ButtonVariants as _},
     combobox::Combobox,
     h_flex,
+    menu::{DropdownMenu as _, PopupMenuItem},
     spinner::Spinner,
     tab::{Tab, TabBar},
     tooltip::Tooltip,
 };
 
 use crate::app::{PgGuiApp, format_elapsed};
+
+/// Scroll and overflow state of the tab bar's strip of script tabs.
+#[derive(Default)]
+pub(in crate::app) struct TabStrip {
+    /// Its child bounds are what tell which tabs a narrow window clipped.
+    scroll: ScrollHandle,
+    /// Indices of the tabs clipped on the last frame, listed by the overflow
+    /// button. Written after layout, read by the next render.
+    hidden: Rc<RefCell<Vec<usize>>>,
+    /// The tab last scrolled into view, so a tab that becomes active by any
+    /// route (click, menu, keyboard, a new file) is revealed once, without
+    /// pinning the strip against the user's own scrolling.
+    revealed: Cell<Option<usize>>,
+}
 use crate::{CancelQuery, Commit, NewFile, Rollback, ToggleAutocommit, ToggleFormatOnSave, ai};
 
 impl PgGuiApp {
@@ -161,26 +179,45 @@ impl PgGuiApp {
     /// trailing "+" that opens a fresh one. A tab with unsaved edits is
     /// marked with a leading "•", or "⟳" when its file also changed on disk
     /// (diverged). These are text glyphs rather than `IconName` SVGs.
+    ///
+    /// The strip scrolls rather than wraps, so a narrow window clips tabs off
+    /// either end; a "» N" button then lists the clipped ones. Which tabs are
+    /// clipped is only known after layout, so a zero-size canvas in the
+    /// suffix (prepainted after the strip) measures them into `TabStrip::hidden`
+    /// and re-renders when that set changes.
     pub(in crate::app) fn render_tab_bar(
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        if self.tab_strip.revealed.get() != Some(self.active_tab) {
+            self.tab_strip.scroll.scroll_to_item(self.active_tab);
+            self.tab_strip.revealed.set(Some(self.active_tab));
+        }
+        let hidden: Vec<usize> = self
+            .tab_strip
+            .hidden
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|&ix| ix < self.tabs.len())
+            .collect();
         TabBar::new("script-tabs")
             .small()
+            .track_scroll(&self.tab_strip.scroll)
             .selected_index(self.active_tab)
             .on_click(cx.listener(|this, ix: &usize, window, cx| {
                 this.activate_tab(*ix, window, cx);
             }))
-            .suffix(self.render_session_toolbar(cx))
-            .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
-                let label = if tab.diverged {
-                    format!("⟳ {}", self.tab_label(ix))
-                } else if tab.dirty {
-                    format!("• {}", self.tab_label(ix))
-                } else {
-                    self.tab_label(ix)
-                };
-                Tab::new().label(label).suffix(
+            .suffix(
+                h_flex()
+                    .child(self.render_tab_overflow_probe(cx))
+                    .when(!hidden.is_empty(), |this| {
+                        this.child(self.render_hidden_tabs_button(&hidden, cx))
+                    })
+                    .child(self.render_session_toolbar(cx)),
+            )
+            .children(self.tabs.iter().enumerate().map(|(ix, _)| {
+                Tab::new().label(self.tab_title(ix)).suffix(
                     Button::new(("close-tab", ix))
                         .ghost()
                         .xsmall()
@@ -191,6 +228,78 @@ impl PgGuiApp {
                         })),
                 )
             }))
+    }
+
+    /// A tab's label with its unsaved ("•") or diverged ("⟳") marker.
+    fn tab_title(&self, ix: usize) -> String {
+        let tab = &self.tabs[ix];
+        if tab.diverged {
+            format!("⟳ {}", self.tab_label(ix))
+        } else if tab.dirty {
+            format!("• {}", self.tab_label(ix))
+        } else {
+            self.tab_label(ix)
+        }
+    }
+
+    /// Measures, after the strip is laid out and scrolled, which tabs it
+    /// clipped, and schedules a re-render when that differs from what the
+    /// last render drew the overflow button for. The notify waits for the
+    /// next frame because a view cannot be invalidated mid-draw.
+    fn render_tab_overflow_probe(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let scroll = self.tab_strip.scroll.clone();
+        let hidden = self.tab_strip.hidden.clone();
+        let count = self.tabs.len();
+        let app = cx.weak_entity();
+        canvas(
+            move |_, window, _| {
+                let clipped = clipped_tabs(&scroll, count);
+                if *hidden.borrow() != clipped {
+                    *hidden.borrow_mut() = clipped;
+                    window.on_next_frame(move |_, cx| {
+                        app.update(cx, |_, cx| cx.notify()).ok();
+                    });
+                }
+            },
+            |_, (), _, _| {},
+        )
+        .size_0()
+    }
+
+    /// The "» N" button listing the tabs the strip clipped; picking one
+    /// activates it, which also scrolls it into view.
+    fn render_hidden_tabs_button(
+        &self,
+        hidden: &[usize],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let items: Vec<(usize, String)> =
+            hidden.iter().map(|&ix| (ix, self.tab_title(ix))).collect();
+        let count = items.len();
+        let app = cx.weak_entity();
+        Button::new("hidden-tabs")
+            .ghost()
+            .small()
+            .label(format!("» {count}"))
+            .tooltip(if count == 1 {
+                "1 tab out of view".to_string()
+            } else {
+                format!("{count} tabs out of view")
+            })
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+                menu = menu.scrollable(true);
+                for (ix, title) in &items {
+                    let ix = *ix;
+                    let app = app.clone();
+                    menu = menu.item(PopupMenuItem::new(title.clone()).on_click(
+                        move |_, window, cx| {
+                            app.update(cx, |this, cx| this.activate_tab(ix, window, cx))
+                                .ok();
+                        },
+                    ));
+                }
+                menu
+            })
     }
 
     /// Session controls sitting after the tabs, next to "+": an autocommit
@@ -278,4 +387,22 @@ impl PgGuiApp {
             .child(cancel_btn)
             .child(new_tab_btn)
     }
+}
+
+/// Indices of the tabs the strip's viewport does not fully show. Child
+/// bounds are recorded before the scroll offset is applied, so the offset is
+/// added back; a child the strip has not laid out yet counts as visible.
+fn clipped_tabs(scroll: &ScrollHandle, count: usize) -> Vec<usize> {
+    let viewport = scroll.bounds();
+    let offset = scroll.offset().x;
+    // Sub-pixel rounding must not flag a tab that sits flush with an edge.
+    let slack = px(1.);
+    (0..count)
+        .filter(|&ix| {
+            scroll.bounds_for_item(ix).is_some_and(|bounds| {
+                bounds.left() + offset < viewport.left() - slack
+                    || bounds.right() + offset > viewport.right() + slack
+            })
+        })
+        .collect()
 }

@@ -370,6 +370,8 @@ enum DbSchemaLoad {
 pub struct PgGuiApp {
     tabs: Vec<EditorTab>,
     active_tab: usize,
+    /// Scroll and overflow state of the tab bar's strip.
+    tab_strip: ui::chrome::TabStrip,
     /// The active debug session, if any. Drives the debug panel.
     debug: Option<DebugState>,
     results: Entity<TableState<ResultsDelegate>>,
@@ -594,7 +596,6 @@ impl PgGuiApp {
         apply_theme_selection(config.theme, window, cx);
 
         let (tabs, next_tab_id) = Self::build_initial_tabs(&config, window, cx);
-        let active_tab = config.active_tab;
 
         let results = Self::build_results(config.page_size, window, cx);
         let resizable_state = cx.new(|_| ResizableState::default());
@@ -606,7 +607,7 @@ impl PgGuiApp {
 
         let (connections, connections_sub) = Self::build_connection_combo(&config, window, cx);
 
-        tabs[active_tab]
+        tabs[config.active_tab]
             .editor
             .update(cx, |state, cx| state.focus(window, cx));
 
@@ -651,7 +652,8 @@ impl PgGuiApp {
 
         let mut this = Self {
             tabs,
-            active_tab,
+            active_tab: config.active_tab,
+            tab_strip: ui::chrome::TabStrip::default(),
             debug: None,
             results,
             bottom_view: BottomView::Data,
