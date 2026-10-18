@@ -674,16 +674,12 @@ pub fn cancel(token: &postgres::CancelToken) -> Result<(), String> {
 /// schemas that actually exist. `None` when the server is unreachable or
 /// the path could not be read.
 pub fn search_path(conn_str: &str) -> Option<Vec<String>> {
-    let mut client = connect(conn_str).ok()?;
-    let results = client
-        .simple_query("SELECT unnest(current_schemas(false))")
-        .ok()?;
-    let schemas: Vec<String> = results
-        .into_iter()
-        .filter_map(|msg| match msg {
-            SimpleQueryMessage::Row(row) => row.get(0).map(ToString::to_string),
-            _ => None,
-        })
+    let schemas: Vec<String> = Catalog::connect(conn_str)
+        .ok()?
+        .rows("SELECT unnest(current_schemas(false))")
+        .ok()?
+        .iter()
+        .filter_map(|row| row.get(0).map(ToString::to_string))
         .collect();
     (!schemas.is_empty()).then_some(schemas)
 }
@@ -697,10 +693,11 @@ pub fn test_connection(conn_str: &str) -> Result<(), String> {
 
 // --- Catalog introspection for the database object browser ---------------
 //
-// Each function opens a fresh connection (the browser loads objects lazily,
-// one level per node expansion — see [`crate::db_tree`]), runs one
-// `pg_catalog` query through the simple query protocol (every value comes
-// back as text), and maps the rows to a small `Send` result type. Object
+// Each query is a [`Catalog`] method, so one connection serves a whole
+// browse operation (the browser loads objects lazily, one level per node
+// expansion — see [`crate::db_tree`]). A method runs its `pg_catalog`
+// queries through the simple query protocol (every value comes back as
+// text) and maps the rows to a small `Send` result type. Object
 // names are always fetched from the catalog, but are still quoted defensively
 // with [`quote_literal`] before being spliced into the SQL.
 
@@ -748,76 +745,13 @@ fn is_true(value: Option<&str>) -> bool {
     value == Some("t")
 }
 
-/// Run a query and return the first column of the first row, `None` when the
-/// query yields no rows or that value is NULL.
-fn catalog_scalar(conn_str: &str, sql: &str) -> Result<Option<String>, String> {
-    Ok(catalog_rows(conn_str, sql)?
-        .first()
-        .and_then(|row| row.get(0).map(ToString::to_string)))
-}
-
-/// Run a simple query and keep only the data rows.
-fn catalog_rows(conn_str: &str, sql: &str) -> Result<Vec<SimpleQueryRow>, String> {
-    let mut client = connect(conn_str).map_err(|e| describe(&e))?;
-    let messages = client.simple_query(sql).map_err(|e| describe(&e))?;
-    Ok(messages
-        .into_iter()
-        .filter_map(|msg| match msg {
-            SimpleQueryMessage::Row(row) => Some(row),
-            _ => None,
-        })
-        .collect())
-}
-
-/// Schema names, ordered. System schemas (`pg_*`, `information_schema`) are
-/// excluded unless `show_system`.
-pub fn list_schemas(conn_str: &str, show_system: bool) -> Result<Vec<String>, String> {
-    let filter = if show_system {
-        String::new()
-    } else {
-        " WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema'".to_string()
-    };
-    let sql = format!("SELECT nspname FROM pg_catalog.pg_namespace{filter} ORDER BY nspname");
-    Ok(catalog_rows(conn_str, &sql)?
-        .iter()
-        .filter_map(|row| row.get(0).map(ToString::to_string))
-        .collect())
-}
-
-/// Relation names in `schema` of a given `pg_class.relkind` (`r` tables,
-/// `v` views, `m` materialized views, `S` sequences), ordered.
-pub fn list_relations(conn_str: &str, schema: &str, relkind: char) -> Result<Vec<String>, String> {
-    let sql = format!(
-        "SELECT c.relname \
-         FROM pg_catalog.pg_class c \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = {schema} AND c.relkind = {kind} \
-         ORDER BY c.relname",
-        schema = quote_literal(schema),
-        kind = quote_literal(&relkind.to_string()),
-    );
-    Ok(catalog_rows(conn_str, &sql)?
-        .iter()
-        .filter_map(|row| row.get(0).map(ToString::to_string))
-        .collect())
-}
-
-/// Function/procedure signatures in `schema`, ordered. Each entry is
-/// `name(identity arguments)` so overloads stay distinct.
-pub fn list_functions(conn_str: &str, schema: &str) -> Result<Vec<String>, String> {
-    let sql = format!(
-        "SELECT p.proname \
-             || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' \
-         FROM pg_catalog.pg_proc p \
-         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-         WHERE n.nspname = {schema} \
-         ORDER BY p.proname, 1",
-        schema = quote_literal(schema),
-    );
-    Ok(catalog_rows(conn_str, &sql)?
-        .iter()
-        .filter_map(|row| row.get(0).map(ToString::to_string))
-        .collect())
+/// One connection held for a batch of catalog queries, so a browse that
+/// needs several (a refresh reloading every expanded folder, a table's
+/// reconstructed DDL) pays for one handshake instead of one per query.
+/// Short-lived: open it on the background executor for one operation and
+/// drop it there; nothing keeps it across operations.
+pub struct Catalog {
+    client: Client,
 }
 
 /// One object a bare name in the editor could refer to: its kind (as the
@@ -830,513 +764,589 @@ pub struct ObjectRef {
     pub object: String,
 }
 
-/// Resolve an identifier written in a script to the routine or relation it
-/// names, for Go to Definition. `schema` is the qualifier the identifier
-/// carried, if any; without one, `search_path` visibility decides between
-/// same-named objects (`pg_*_is_visible`), so a call resolves the way the
-/// server would resolve it.
-///
-/// Routines win over relations of the same name, matching what a click on a
-/// call site means. An unquoted identifier is folded to lower case by the
-/// server, so both the text as written and its lowercased form are tried.
-pub fn find_object(
-    conn_str: &str,
-    schema: Option<&str>,
-    name: &str,
-) -> Result<Option<ObjectRef>, String> {
-    let names = format!(
-        "({}, {})",
-        quote_literal(name),
-        quote_literal(&name.to_lowercase())
-    );
-    let schema_filter = schema.map_or(String::new(), |schema| {
-        format!(
-            " AND n.nspname IN ({}, {})",
-            quote_literal(schema),
-            quote_literal(&schema.to_lowercase())
-        )
-    });
-    let sql = format!(
-        "SELECT kind, schema, object FROM ( \
-           SELECT 'function' AS kind, n.nspname AS schema, \
-                  p.proname || '(' \
-                    || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' AS object, \
-                  pg_catalog.pg_function_is_visible(p.oid) AS visible, 0 AS rank \
-           FROM pg_catalog.pg_proc p \
-           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-           WHERE p.proname IN {names} \
-             AND n.nspname NOT IN ('pg_catalog', 'information_schema'){schema_filter} \
-           UNION ALL \
-           SELECT CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'matview' ELSE 'table' END, \
-                  n.nspname, c.relname, \
-                  pg_catalog.pg_table_is_visible(c.oid), 1 \
-           FROM pg_catalog.pg_class c \
-           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-           WHERE c.relname IN {names} \
-             AND c.relkind IN ('r', 'p', 'v', 'm') \
-             AND n.nspname NOT IN ('pg_catalog', 'information_schema'){schema_filter} \
-         ) candidates \
-         ORDER BY visible DESC, rank, schema, object \
-         LIMIT 1"
-    );
-    Ok(catalog_rows(conn_str, &sql)?.first().and_then(|row| {
-        Some(ObjectRef {
-            kind: row.get(0)?.to_string(),
-            schema: row.get(1)?.to_string(),
-            object: row.get(2)?.to_string(),
-        })
-    }))
-}
-
-/// User-defined type names in `schema` (composite, enum, domain, base),
-/// ordered. Array and implicit relation row types are excluded, matching
-/// psql's `\dT`.
-pub fn list_types(conn_str: &str, schema: &str) -> Result<Vec<String>, String> {
-    let sql = format!(
-        "SELECT t.typname \
-         FROM pg_catalog.pg_type t \
-         JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
-         WHERE n.nspname = {schema} \
-           AND (t.typrelid = 0 \
-                OR (SELECT c.relkind FROM pg_catalog.pg_class c WHERE c.oid = t.typrelid) = 'c') \
-           AND NOT EXISTS ( \
-                SELECT 1 FROM pg_catalog.pg_type el \
-                WHERE el.oid = t.typelem AND el.typarray = t.oid) \
-         ORDER BY t.typname",
-        schema = quote_literal(schema),
-    );
-    Ok(catalog_rows(conn_str, &sql)?
-        .iter()
-        .filter_map(|row| row.get(0).map(ToString::to_string))
-        .collect())
-}
-
-/// Columns of `schema.relation`, in attribute order. Dropped and system
-/// columns are excluded. `primary` marks membership of the primary key, so a
-/// composite key marks each of its columns.
-pub fn list_columns(
-    conn_str: &str,
-    schema: &str,
-    relation: &str,
-) -> Result<Vec<ColumnInfo>, String> {
-    let sql = format!(
-        "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull, \
-                EXISTS (SELECT 1 FROM pg_catalog.pg_index i \
-                        WHERE i.indrelid = c.oid AND i.indisprimary \
-                          AND a.attnum = ANY (i.indkey)), \
-                pg_catalog.pg_get_expr(d.adbin, d.adrelid) \
-         FROM pg_catalog.pg_attribute a \
-         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
-         WHERE n.nspname = {schema} AND c.relname = {relation} \
-           AND a.attnum > 0 AND NOT a.attisdropped \
-         ORDER BY a.attnum",
-        schema = quote_literal(schema),
-        relation = quote_literal(relation),
-    );
-    Ok(catalog_rows(conn_str, &sql)?
-        .iter()
-        .map(|row| ColumnInfo {
-            name: row.get(0).unwrap_or_default().to_string(),
-            data_type: row.get(1).unwrap_or_default().to_string(),
-            not_null: is_true(row.get(2)),
-            primary: is_true(row.get(3)),
-            default: row.get(4).map(ToString::to_string),
-        })
-        .collect())
-}
-
-/// Indexes on `schema.relation`, ordered by name.
-pub fn list_indexes(
-    conn_str: &str,
-    schema: &str,
-    relation: &str,
-) -> Result<Vec<IndexInfo>, String> {
-    let sql = format!(
-        "SELECT ic.relname, ix.indisunique, ix.indisprimary \
-         FROM pg_catalog.pg_index ix \
-         JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
-         JOIN pg_catalog.pg_class tc ON tc.oid = ix.indrelid \
-         JOIN pg_catalog.pg_namespace n ON n.oid = tc.relnamespace \
-         WHERE n.nspname = {schema} AND tc.relname = {relation} \
-         ORDER BY ic.relname",
-        schema = quote_literal(schema),
-        relation = quote_literal(relation),
-    );
-    Ok(catalog_rows(conn_str, &sql)?
-        .iter()
-        .map(|row| IndexInfo {
-            name: row.get(0).unwrap_or_default().to_string(),
-            unique: is_true(row.get(1)),
-            primary: is_true(row.get(2)),
-        })
-        .collect())
-}
-
-/// Constraints on `schema.relation`, ordered by name.
-pub fn list_constraints(
-    conn_str: &str,
-    schema: &str,
-    relation: &str,
-) -> Result<Vec<ConstraintInfo>, String> {
-    let sql = format!(
-        "SELECT con.conname, con.contype \
-         FROM pg_catalog.pg_constraint con \
-         JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = {schema} AND c.relname = {relation} \
-         ORDER BY con.conname",
-        schema = quote_literal(schema),
-        relation = quote_literal(relation),
-    );
-    Ok(catalog_rows(conn_str, &sql)?
-        .iter()
-        .map(|row| ConstraintInfo {
-            name: row.get(0).unwrap_or_default().to_string(),
-            kind: row.get(1).and_then(|s| s.chars().next()).unwrap_or('?'),
-        })
-        .collect())
-}
-
-/// Triggers on `schema.relation`, ordered by name. Internal triggers (the
-/// ones backing foreign-key constraints) are excluded, matching psql's `\d`.
-pub fn list_triggers(
-    conn_str: &str,
-    schema: &str,
-    relation: &str,
-) -> Result<Vec<TriggerInfo>, String> {
-    let sql = format!(
-        "SELECT t.tgname \
-         FROM pg_catalog.pg_trigger t \
-         JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = {schema} AND c.relname = {relation} AND NOT t.tgisinternal \
-         ORDER BY t.tgname",
-        schema = quote_literal(schema),
-        relation = quote_literal(relation),
-    );
-    Ok(catalog_rows(conn_str, &sql)?
-        .iter()
-        .map(|row| TriggerInfo {
-            name: row.get(0).unwrap_or_default().to_string(),
-        })
-        .collect())
-}
-
-/// `CREATE TRIGGER` text from `pg_get_triggerdef`.
-pub fn trigger_definition(
-    conn_str: &str,
-    schema: &str,
-    relation: &str,
-    name: &str,
-) -> Result<String, String> {
-    let sql = format!(
-        "SELECT pg_catalog.pg_get_triggerdef(t.oid, true) \
-         FROM pg_catalog.pg_trigger t \
-         JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = {schema} AND c.relname = {relation} AND t.tgname = {name}",
-        schema = quote_literal(schema),
-        relation = quote_literal(relation),
-        name = quote_literal(name),
-    );
-    let def = catalog_scalar(conn_str, &sql)?
-        .ok_or_else(|| format!("trigger {name} on {schema}.{relation} not found"))?;
-    Ok(format!("{def};"))
-}
-
-/// Runnable `CREATE` statement reconstructing a view or materialized view.
-/// The body comes from `pg_get_viewdef`; the header is generated so the whole
-/// thing re-creates the object.
-pub fn view_definition(
-    conn_str: &str,
-    schema: &str,
-    name: &str,
-    materialized: bool,
-) -> Result<String, String> {
-    let sql = format!(
-        "SELECT pg_catalog.pg_get_viewdef(c.oid, true) \
-         FROM pg_catalog.pg_class c \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = {schema} AND c.relname = {name}",
-        schema = quote_literal(schema),
-        name = quote_literal(name),
-    );
-    let body =
-        catalog_scalar(conn_str, &sql)?.ok_or_else(|| format!("view {schema}.{name} not found"))?;
-    let keyword = if materialized {
-        "CREATE MATERIALIZED VIEW"
-    } else {
-        "CREATE OR REPLACE VIEW"
-    };
-    Ok(format!(
-        "{keyword} {}.{} AS\n{body}",
-        quote_ident(schema),
-        quote_ident(name),
-    ))
-}
-
-/// Full `CREATE OR REPLACE FUNCTION`/`PROCEDURE` text from
-/// `pg_get_functiondef`. `signature` is the `name(identity arguments)` form
-/// carried by the browser leaf, so overloads resolve to the right routine.
-pub fn function_definition(
-    conn_str: &str,
-    schema: &str,
-    signature: &str,
-) -> Result<String, String> {
-    // Match the `name(identity arguments)` string the browser leaf was built
-    // from (see `list_functions`) rather than casting to `regprocedure`: the
-    // identity-argument text does not always parse back as a `regprocedure`
-    // (argument modes, `VARIADIC`, quoting), which raises a hard error.
-    let sql = format!(
-        "SELECT pg_catalog.pg_get_functiondef(p.oid) \
-         FROM pg_catalog.pg_proc p \
-         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-         WHERE n.nspname = {schema} \
-           AND p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' \
-               = {signature}",
-        schema = quote_literal(schema),
-        signature = quote_literal(signature),
-    );
-    catalog_scalar(conn_str, &sql)?
-        .ok_or_else(|| format!("function {schema}.{signature} not found"))
-}
-
-/// Best-effort `CREATE SEQUENCE` reconstructed from `information_schema`.
-pub fn sequence_definition(conn_str: &str, schema: &str, name: &str) -> Result<String, String> {
-    let sql = format!(
-        "SELECT data_type, start_value, increment, minimum_value, maximum_value, cycle_option \
-         FROM information_schema.sequences \
-         WHERE sequence_schema = {schema} AND sequence_name = {name}",
-        schema = quote_literal(schema),
-        name = quote_literal(name),
-    );
-    let row = catalog_rows(conn_str, &sql)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("sequence {schema}.{name} not found"))?;
-    let col = |i: usize| row.get(i).unwrap_or_default().to_string();
-    let cycle = if row.get(5) == Some("YES") {
-        "CYCLE"
-    } else {
-        "NO CYCLE"
-    };
-    Ok(format!(
-        "CREATE SEQUENCE {}.{}\n    AS {}\n    START WITH {}\n    INCREMENT BY {}\n    MINVALUE {}\n    MAXVALUE {}\n    {cycle};",
-        quote_ident(schema),
-        quote_ident(name),
-        col(0),
-        col(1),
-        col(2),
-        col(3),
-        col(4),
-    ))
-}
-
-/// Best-effort DDL for a user-defined type. Composite, enum and domain types
-/// are reconstructed fully; other kinds (base, range, …) return a comment
-/// noting the kind is not supported.
-pub fn type_definition(conn_str: &str, schema: &str, name: &str) -> Result<String, String> {
-    let sql = format!(
-        "SELECT t.typtype, t.oid, t.typrelid, \
-                pg_catalog.format_type(t.typbasetype, t.typtypmod), \
-                t.typnotnull, t.typdefault \
-         FROM pg_catalog.pg_type t \
-         JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
-         WHERE n.nspname = {schema} AND t.typname = {name}",
-        schema = quote_literal(schema),
-        name = quote_literal(name),
-    );
-    let row = catalog_rows(conn_str, &sql)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("type {schema}.{name} not found"))?;
-    let typtype = row.get(0).and_then(|s| s.chars().next()).unwrap_or('?');
-    let oid = row.get(1).unwrap_or_default().to_string();
-    let typrelid = row.get(2).unwrap_or_default().to_string();
-    let qualified = format!("{}.{}", quote_ident(schema), quote_ident(name));
-
-    match typtype {
-        // Composite type: reconstruct from its columns.
-        'c' => {
-            let cols_sql = format!(
-                "SELECT string_agg(quote_ident(a.attname) || ' ' \
-                            || pg_catalog.format_type(a.atttypid, a.atttypmod), ', ' \
-                            ORDER BY a.attnum) \
-                 FROM pg_catalog.pg_attribute a \
-                 WHERE a.attrelid = {typrelid} AND a.attnum > 0 AND NOT a.attisdropped"
-            );
-            let cols = catalog_scalar(conn_str, &cols_sql)?.unwrap_or_default();
-            Ok(format!("CREATE TYPE {qualified} AS ({cols});"))
-        }
-        // Enum: reconstruct from its labels.
-        'e' => {
-            let labels_sql = format!(
-                "SELECT string_agg(quote_literal(e.enumlabel), ', ' ORDER BY e.enumsortorder) \
-                 FROM pg_catalog.pg_enum e WHERE e.enumtypid = {oid}"
-            );
-            let labels = catalog_scalar(conn_str, &labels_sql)?.unwrap_or_default();
-            Ok(format!("CREATE TYPE {qualified} AS ENUM ({labels});"))
-        }
-        // Domain: base type plus NOT NULL / DEFAULT / CHECK modifiers.
-        'd' => {
-            let base = row.get(3).unwrap_or_default().to_string();
-            let mut out = format!("CREATE DOMAIN {qualified} AS {base}");
-            if is_true(row.get(4)) {
-                out.push_str(" NOT NULL");
-            }
-            if let Some(default) = row.get(5) {
-                let _ = write!(out, " DEFAULT {default}");
-            }
-            let checks_sql = format!(
-                "SELECT string_agg(pg_catalog.pg_get_constraintdef(con.oid), ' ') \
-                 FROM pg_catalog.pg_constraint con WHERE con.contypid = {oid}"
-            );
-            if let Some(checks) = catalog_scalar(conn_str, &checks_sql)? {
-                let _ = write!(out, " {checks}");
-            }
-            out.push(';');
-            Ok(out)
-        }
-        other => Ok(format!(
-            "-- Definition of type {schema}.{name} (typtype '{other}') is not supported."
-        )),
+impl Catalog {
+    /// Connect with [`CONNECT_TIMEOUT`] applied, discarding server notices.
+    pub fn connect(conn_str: &str) -> Result<Self, String> {
+        let client = connect(conn_str).map_err(|e| describe(&e))?;
+        Ok(Self { client })
     }
-}
 
-/// `CREATE INDEX` text from `pg_get_indexdef`.
-pub fn index_definition(conn_str: &str, schema: &str, name: &str) -> Result<String, String> {
-    let sql = format!(
-        "SELECT pg_catalog.pg_get_indexdef(c.oid) \
-         FROM pg_catalog.pg_class c \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = {schema} AND c.relname = {name} AND c.relkind IN ('i', 'I')",
-        schema = quote_literal(schema),
-        name = quote_literal(name),
-    );
-    let def = catalog_scalar(conn_str, &sql)?
-        .ok_or_else(|| format!("index {schema}.{name} not found"))?;
-    Ok(format!("{def};"))
-}
+    /// Run a simple query and keep only the data rows.
+    pub fn rows(&mut self, sql: &str) -> Result<Vec<SimpleQueryRow>, String> {
+        let messages = self.client.simple_query(sql).map_err(|e| describe(&e))?;
+        Ok(messages
+            .into_iter()
+            .filter_map(|msg| match msg {
+                SimpleQueryMessage::Row(row) => Some(row),
+                _ => None,
+            })
+            .collect())
+    }
 
-/// `ALTER TABLE … ADD CONSTRAINT` text from `pg_get_constraintdef`.
-pub fn constraint_definition(
-    conn_str: &str,
-    schema: &str,
-    relation: &str,
-    name: &str,
-) -> Result<String, String> {
-    let sql = format!(
-        "SELECT pg_catalog.pg_get_constraintdef(con.oid) \
-         FROM pg_catalog.pg_constraint con \
-         JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = {schema} AND c.relname = {relation} AND con.conname = {name}",
-        schema = quote_literal(schema),
-        relation = quote_literal(relation),
-        name = quote_literal(name),
-    );
-    let def = catalog_scalar(conn_str, &sql)?
-        .ok_or_else(|| format!("constraint {name} on {schema}.{relation} not found"))?;
-    Ok(format!(
-        "ALTER TABLE {}.{} ADD CONSTRAINT {} {def};",
-        quote_ident(schema),
-        quote_ident(relation),
-        quote_ident(name),
-    ))
-}
+    /// Run a query and return the first column of the first row, `None` when
+    /// the query yields no rows or that value is NULL.
+    pub fn scalar(&mut self, sql: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .rows(sql)?
+            .first()
+            .and_then(|row| row.get(0).map(ToString::to_string)))
+    }
 
-/// Best-effort `CREATE TABLE` DDL: columns (type, NOT NULL, DEFAULT), then
-/// table constraints (`pg_get_constraintdef`), then any indexes that do not
-/// back a constraint (`pg_get_indexdef`). Postgres has no single "get table
-/// definition" function, so this is reconstructed from the catalog.
-pub fn table_definition(conn_str: &str, schema: &str, name: &str) -> Result<String, String> {
-    let oid = catalog_scalar(
-        conn_str,
-        &format!(
-            "SELECT c.oid FROM pg_catalog.pg_class c \
+    /// Schema names, ordered. System schemas (`pg_*`, `information_schema`) are
+    /// excluded unless `show_system`.
+    pub fn list_schemas(&mut self, show_system: bool) -> Result<Vec<String>, String> {
+        let filter = if show_system {
+            String::new()
+        } else {
+            " WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema'".to_string()
+        };
+        let sql = format!("SELECT nspname FROM pg_catalog.pg_namespace{filter} ORDER BY nspname");
+        Ok(self
+            .rows(&sql)?
+            .iter()
+            .filter_map(|row| row.get(0).map(ToString::to_string))
+            .collect())
+    }
+
+    /// Relation names in `schema` of a given `pg_class.relkind` (`r` tables,
+    /// `v` views, `m` materialized views, `S` sequences), ordered.
+    pub fn list_relations(&mut self, schema: &str, relkind: char) -> Result<Vec<String>, String> {
+        let sql = format!(
+            "SELECT c.relname \
+             FROM pg_catalog.pg_class c \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = {schema} AND c.relname = {name} AND c.relkind IN ('r', 'p')",
+             WHERE n.nspname = {schema} AND c.relkind = {kind} \
+             ORDER BY c.relname",
+            schema = quote_literal(schema),
+            kind = quote_literal(&relkind.to_string()),
+        );
+        Ok(self
+            .rows(&sql)?
+            .iter()
+            .filter_map(|row| row.get(0).map(ToString::to_string))
+            .collect())
+    }
+
+    /// Function/procedure signatures in `schema`, ordered. Each entry is
+    /// `name(identity arguments)` so overloads stay distinct.
+    pub fn list_functions(&mut self, schema: &str) -> Result<Vec<String>, String> {
+        let sql = format!(
+            "SELECT p.proname \
+                 || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' \
+             FROM pg_catalog.pg_proc p \
+             JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = {schema} \
+             ORDER BY p.proname, 1",
+            schema = quote_literal(schema),
+        );
+        Ok(self
+            .rows(&sql)?
+            .iter()
+            .filter_map(|row| row.get(0).map(ToString::to_string))
+            .collect())
+    }
+
+    /// Resolve an identifier written in a script to the routine or relation it
+    /// names, for Go to Definition. `schema` is the qualifier the identifier
+    /// carried, if any; without one, `search_path` visibility decides between
+    /// same-named objects (`pg_*_is_visible`), so a call resolves the way the
+    /// server would resolve it.
+    ///
+    /// Routines win over relations of the same name, matching what a click on a
+    /// call site means. An unquoted identifier is folded to lower case by the
+    /// server, so both the text as written and its lowercased form are tried.
+    pub fn find_object(
+        &mut self,
+        schema: Option<&str>,
+        name: &str,
+    ) -> Result<Option<ObjectRef>, String> {
+        let names = format!(
+            "({}, {})",
+            quote_literal(name),
+            quote_literal(&name.to_lowercase())
+        );
+        let schema_filter = schema.map_or(String::new(), |schema| {
+            format!(
+                " AND n.nspname IN ({}, {})",
+                quote_literal(schema),
+                quote_literal(&schema.to_lowercase())
+            )
+        });
+        let sql = format!(
+            "SELECT kind, schema, object FROM ( \
+               SELECT 'function' AS kind, n.nspname AS schema, \
+                      p.proname || '(' \
+                        || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' AS object, \
+                      pg_catalog.pg_function_is_visible(p.oid) AS visible, 0 AS rank \
+               FROM pg_catalog.pg_proc p \
+               JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+               WHERE p.proname IN {names} \
+                 AND n.nspname NOT IN ('pg_catalog', 'information_schema'){schema_filter} \
+               UNION ALL \
+               SELECT CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'matview' ELSE 'table' END, \
+                      n.nspname, c.relname, \
+                      pg_catalog.pg_table_is_visible(c.oid), 1 \
+               FROM pg_catalog.pg_class c \
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+               WHERE c.relname IN {names} \
+                 AND c.relkind IN ('r', 'p', 'v', 'm') \
+                 AND n.nspname NOT IN ('pg_catalog', 'information_schema'){schema_filter} \
+             ) candidates \
+             ORDER BY visible DESC, rank, schema, object \
+             LIMIT 1"
+        );
+        Ok(self.rows(&sql)?.first().and_then(|row| {
+            Some(ObjectRef {
+                kind: row.get(0)?.to_string(),
+                schema: row.get(1)?.to_string(),
+                object: row.get(2)?.to_string(),
+            })
+        }))
+    }
+
+    /// User-defined type names in `schema` (composite, enum, domain, base),
+    /// ordered. Array and implicit relation row types are excluded, matching
+    /// psql's `\dT`.
+    pub fn list_types(&mut self, schema: &str) -> Result<Vec<String>, String> {
+        let sql = format!(
+            "SELECT t.typname \
+             FROM pg_catalog.pg_type t \
+             JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+             WHERE n.nspname = {schema} \
+               AND (t.typrelid = 0 \
+                    OR (SELECT c.relkind FROM pg_catalog.pg_class c WHERE c.oid = t.typrelid) = 'c') \
+               AND NOT EXISTS ( \
+                    SELECT 1 FROM pg_catalog.pg_type el \
+                    WHERE el.oid = t.typelem AND el.typarray = t.oid) \
+             ORDER BY t.typname",
+            schema = quote_literal(schema),
+        );
+        Ok(self
+            .rows(&sql)?
+            .iter()
+            .filter_map(|row| row.get(0).map(ToString::to_string))
+            .collect())
+    }
+
+    /// Columns of `schema.relation`, in attribute order. Dropped and system
+    /// columns are excluded. `primary` marks membership of the primary key, so a
+    /// composite key marks each of its columns.
+    pub fn list_columns(
+        &mut self,
+        schema: &str,
+        relation: &str,
+    ) -> Result<Vec<ColumnInfo>, String> {
+        let sql = format!(
+            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), a.attnotnull, \
+                    EXISTS (SELECT 1 FROM pg_catalog.pg_index i \
+                            WHERE i.indrelid = c.oid AND i.indisprimary \
+                              AND a.attnum = ANY (i.indkey)), \
+                    pg_catalog.pg_get_expr(d.adbin, d.adrelid) \
+             FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+             WHERE n.nspname = {schema} AND c.relname = {relation} \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum",
+            schema = quote_literal(schema),
+            relation = quote_literal(relation),
+        );
+        Ok(self
+            .rows(&sql)?
+            .iter()
+            .map(|row| ColumnInfo {
+                name: row.get(0).unwrap_or_default().to_string(),
+                data_type: row.get(1).unwrap_or_default().to_string(),
+                not_null: is_true(row.get(2)),
+                primary: is_true(row.get(3)),
+                default: row.get(4).map(ToString::to_string),
+            })
+            .collect())
+    }
+
+    /// Indexes on `schema.relation`, ordered by name.
+    pub fn list_indexes(&mut self, schema: &str, relation: &str) -> Result<Vec<IndexInfo>, String> {
+        let sql = format!(
+            "SELECT ic.relname, ix.indisunique, ix.indisprimary \
+             FROM pg_catalog.pg_index ix \
+             JOIN pg_catalog.pg_class ic ON ic.oid = ix.indexrelid \
+             JOIN pg_catalog.pg_class tc ON tc.oid = ix.indrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = tc.relnamespace \
+             WHERE n.nspname = {schema} AND tc.relname = {relation} \
+             ORDER BY ic.relname",
+            schema = quote_literal(schema),
+            relation = quote_literal(relation),
+        );
+        Ok(self
+            .rows(&sql)?
+            .iter()
+            .map(|row| IndexInfo {
+                name: row.get(0).unwrap_or_default().to_string(),
+                unique: is_true(row.get(1)),
+                primary: is_true(row.get(2)),
+            })
+            .collect())
+    }
+
+    /// Constraints on `schema.relation`, ordered by name.
+    pub fn list_constraints(
+        &mut self,
+        schema: &str,
+        relation: &str,
+    ) -> Result<Vec<ConstraintInfo>, String> {
+        let sql = format!(
+            "SELECT con.conname, con.contype \
+             FROM pg_catalog.pg_constraint con \
+             JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = {schema} AND c.relname = {relation} \
+             ORDER BY con.conname",
+            schema = quote_literal(schema),
+            relation = quote_literal(relation),
+        );
+        Ok(self
+            .rows(&sql)?
+            .iter()
+            .map(|row| ConstraintInfo {
+                name: row.get(0).unwrap_or_default().to_string(),
+                kind: row.get(1).and_then(|s| s.chars().next()).unwrap_or('?'),
+            })
+            .collect())
+    }
+
+    /// Triggers on `schema.relation`, ordered by name. Internal triggers (the
+    /// ones backing foreign-key constraints) are excluded, matching psql's `\d`.
+    pub fn list_triggers(
+        &mut self,
+        schema: &str,
+        relation: &str,
+    ) -> Result<Vec<TriggerInfo>, String> {
+        let sql = format!(
+            "SELECT t.tgname \
+             FROM pg_catalog.pg_trigger t \
+             JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = {schema} AND c.relname = {relation} AND NOT t.tgisinternal \
+             ORDER BY t.tgname",
+            schema = quote_literal(schema),
+            relation = quote_literal(relation),
+        );
+        Ok(self
+            .rows(&sql)?
+            .iter()
+            .map(|row| TriggerInfo {
+                name: row.get(0).unwrap_or_default().to_string(),
+            })
+            .collect())
+    }
+
+    /// `CREATE TRIGGER` text from `pg_get_triggerdef`.
+    pub fn trigger_definition(
+        &mut self,
+        schema: &str,
+        relation: &str,
+        name: &str,
+    ) -> Result<String, String> {
+        let sql = format!(
+            "SELECT pg_catalog.pg_get_triggerdef(t.oid, true) \
+             FROM pg_catalog.pg_trigger t \
+             JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = {schema} AND c.relname = {relation} AND t.tgname = {name}",
+            schema = quote_literal(schema),
+            relation = quote_literal(relation),
+            name = quote_literal(name),
+        );
+        let def = self
+            .scalar(&sql)?
+            .ok_or_else(|| format!("trigger {name} on {schema}.{relation} not found"))?;
+        Ok(format!("{def};"))
+    }
+
+    /// Runnable `CREATE` statement reconstructing a view or materialized view.
+    /// The body comes from `pg_get_viewdef`; the header is generated so the whole
+    /// thing re-creates the object.
+    pub fn view_definition(
+        &mut self,
+        schema: &str,
+        name: &str,
+        materialized: bool,
+    ) -> Result<String, String> {
+        let sql = format!(
+            "SELECT pg_catalog.pg_get_viewdef(c.oid, true) \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = {schema} AND c.relname = {name}",
             schema = quote_literal(schema),
             name = quote_literal(name),
-        ),
-    )?
-    .ok_or_else(|| format!("table {schema}.{name} not found"))?;
-
-    // Columns, in attribute order.
-    let column_rows = catalog_rows(
-        conn_str,
-        &format!(
-            "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
-                    a.attnotnull, pg_catalog.pg_get_expr(d.adbin, d.adrelid) \
-             FROM pg_catalog.pg_attribute a \
-             LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
-             WHERE a.attrelid = {oid} AND a.attnum > 0 AND NOT a.attisdropped \
-             ORDER BY a.attnum"
-        ),
-    )?;
-    let mut items: Vec<String> = column_rows
-        .iter()
-        .map(|row| {
-            let mut line = format!(
-                "{} {}",
-                quote_ident(row.get(0).unwrap_or_default()),
-                row.get(1).unwrap_or_default(),
-            );
-            if is_true(row.get(2)) {
-                line.push_str(" NOT NULL");
-            }
-            if let Some(default) = row.get(3) {
-                let _ = write!(line, " DEFAULT {default}");
-            }
-            line
-        })
-        .collect();
-
-    // Table constraints (primary key first, then the rest by name).
-    let constraint_rows = catalog_rows(
-        conn_str,
-        &format!(
-            "SELECT con.conname, pg_catalog.pg_get_constraintdef(con.oid) \
-             FROM pg_catalog.pg_constraint con \
-             WHERE con.conrelid = {oid} \
-             ORDER BY con.contype = 'p' DESC, con.conname"
-        ),
-    )?;
-    for row in &constraint_rows {
-        items.push(format!(
-            "CONSTRAINT {} {}",
-            quote_ident(row.get(0).unwrap_or_default()),
-            row.get(1).unwrap_or_default(),
-        ));
+        );
+        let body = self
+            .scalar(&sql)?
+            .ok_or_else(|| format!("view {schema}.{name} not found"))?;
+        let keyword = if materialized {
+            "CREATE MATERIALIZED VIEW"
+        } else {
+            "CREATE OR REPLACE VIEW"
+        };
+        Ok(format!(
+            "{keyword} {}.{} AS\n{body}",
+            quote_ident(schema),
+            quote_ident(name),
+        ))
     }
 
-    let mut out = format!(
-        "CREATE TABLE {}.{} (\n    {}\n);",
-        quote_ident(schema),
-        quote_ident(name),
-        items.join(",\n    "),
-    );
+    /// Full `CREATE OR REPLACE FUNCTION`/`PROCEDURE` text from
+    /// `pg_get_functiondef`. `signature` is the `name(identity arguments)` form
+    /// carried by the browser leaf, so overloads resolve to the right routine.
+    pub fn function_definition(&mut self, schema: &str, signature: &str) -> Result<String, String> {
+        // Match the `name(identity arguments)` string the browser leaf was built
+        // from (see `list_functions`) rather than casting to `regprocedure`: the
+        // identity-argument text does not always parse back as a `regprocedure`
+        // (argument modes, `VARIADIC`, quoting), which raises a hard error.
+        let sql = format!(
+            "SELECT pg_catalog.pg_get_functiondef(p.oid) \
+             FROM pg_catalog.pg_proc p \
+             JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = {schema} \
+               AND p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' \
+                   = {signature}",
+            schema = quote_literal(schema),
+            signature = quote_literal(signature),
+        );
+        self.scalar(&sql)?
+            .ok_or_else(|| format!("function {schema}.{signature} not found"))
+    }
 
-    // Indexes that are not the implementation of a constraint.
-    let index_rows = catalog_rows(
-        conn_str,
-        &format!(
-            "SELECT pg_catalog.pg_get_indexdef(ix.indexrelid) \
-             FROM pg_catalog.pg_index ix \
-             WHERE ix.indrelid = {oid} \
-               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint con \
-                               WHERE con.conindid = ix.indexrelid) \
-             ORDER BY 1"
-        ),
-    )?;
-    for row in &index_rows {
-        if let Some(def) = row.get(0) {
-            let _ = write!(out, "\n{def};");
+    /// Best-effort `CREATE SEQUENCE` reconstructed from `information_schema`.
+    pub fn sequence_definition(&mut self, schema: &str, name: &str) -> Result<String, String> {
+        let sql = format!(
+            "SELECT data_type, start_value, increment, minimum_value, maximum_value, cycle_option \
+             FROM information_schema.sequences \
+             WHERE sequence_schema = {schema} AND sequence_name = {name}",
+            schema = quote_literal(schema),
+            name = quote_literal(name),
+        );
+        let row = self
+            .rows(&sql)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("sequence {schema}.{name} not found"))?;
+        let col = |i: usize| row.get(i).unwrap_or_default().to_string();
+        let cycle = if row.get(5) == Some("YES") {
+            "CYCLE"
+        } else {
+            "NO CYCLE"
+        };
+        Ok(format!(
+            "CREATE SEQUENCE {}.{}\n    AS {}\n    START WITH {}\n    INCREMENT BY {}\n    MINVALUE {}\n    MAXVALUE {}\n    {cycle};",
+            quote_ident(schema),
+            quote_ident(name),
+            col(0),
+            col(1),
+            col(2),
+            col(3),
+            col(4),
+        ))
+    }
+
+    /// Best-effort DDL for a user-defined type. Composite, enum and domain types
+    /// are reconstructed fully; other kinds (base, range, …) return a comment
+    /// noting the kind is not supported.
+    pub fn type_definition(&mut self, schema: &str, name: &str) -> Result<String, String> {
+        let sql = format!(
+            "SELECT t.typtype, t.oid, t.typrelid, \
+                    pg_catalog.format_type(t.typbasetype, t.typtypmod), \
+                    t.typnotnull, t.typdefault \
+             FROM pg_catalog.pg_type t \
+             JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+             WHERE n.nspname = {schema} AND t.typname = {name}",
+            schema = quote_literal(schema),
+            name = quote_literal(name),
+        );
+        let row = self
+            .rows(&sql)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("type {schema}.{name} not found"))?;
+        let typtype = row.get(0).and_then(|s| s.chars().next()).unwrap_or('?');
+        let oid = row.get(1).unwrap_or_default().to_string();
+        let typrelid = row.get(2).unwrap_or_default().to_string();
+        let qualified = format!("{}.{}", quote_ident(schema), quote_ident(name));
+
+        match typtype {
+            // Composite type: reconstruct from its columns.
+            'c' => {
+                let cols_sql = format!(
+                    "SELECT string_agg(quote_ident(a.attname) || ' ' \
+                                || pg_catalog.format_type(a.atttypid, a.atttypmod), ', ' \
+                                ORDER BY a.attnum) \
+                     FROM pg_catalog.pg_attribute a \
+                     WHERE a.attrelid = {typrelid} AND a.attnum > 0 AND NOT a.attisdropped"
+                );
+                let cols = self.scalar(&cols_sql)?.unwrap_or_default();
+                Ok(format!("CREATE TYPE {qualified} AS ({cols});"))
+            }
+            // Enum: reconstruct from its labels.
+            'e' => {
+                let labels_sql = format!(
+                    "SELECT string_agg(quote_literal(e.enumlabel), ', ' ORDER BY e.enumsortorder) \
+                     FROM pg_catalog.pg_enum e WHERE e.enumtypid = {oid}"
+                );
+                let labels = self.scalar(&labels_sql)?.unwrap_or_default();
+                Ok(format!("CREATE TYPE {qualified} AS ENUM ({labels});"))
+            }
+            // Domain: base type plus NOT NULL / DEFAULT / CHECK modifiers.
+            'd' => {
+                let base = row.get(3).unwrap_or_default().to_string();
+                let mut out = format!("CREATE DOMAIN {qualified} AS {base}");
+                if is_true(row.get(4)) {
+                    out.push_str(" NOT NULL");
+                }
+                if let Some(default) = row.get(5) {
+                    let _ = write!(out, " DEFAULT {default}");
+                }
+                let checks_sql = format!(
+                    "SELECT string_agg(pg_catalog.pg_get_constraintdef(con.oid), ' ') \
+                     FROM pg_catalog.pg_constraint con WHERE con.contypid = {oid}"
+                );
+                if let Some(checks) = self.scalar(&checks_sql)? {
+                    let _ = write!(out, " {checks}");
+                }
+                out.push(';');
+                Ok(out)
+            }
+            other => Ok(format!(
+                "-- Definition of type {schema}.{name} (typtype '{other}') is not supported."
+            )),
         }
     }
-    Ok(out)
+
+    /// `CREATE INDEX` text from `pg_get_indexdef`.
+    pub fn index_definition(&mut self, schema: &str, name: &str) -> Result<String, String> {
+        let sql = format!(
+            "SELECT pg_catalog.pg_get_indexdef(c.oid) \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = {schema} AND c.relname = {name} AND c.relkind IN ('i', 'I')",
+            schema = quote_literal(schema),
+            name = quote_literal(name),
+        );
+        let def = self
+            .scalar(&sql)?
+            .ok_or_else(|| format!("index {schema}.{name} not found"))?;
+        Ok(format!("{def};"))
+    }
+
+    /// `ALTER TABLE … ADD CONSTRAINT` text from `pg_get_constraintdef`.
+    pub fn constraint_definition(
+        &mut self,
+        schema: &str,
+        relation: &str,
+        name: &str,
+    ) -> Result<String, String> {
+        let sql = format!(
+            "SELECT pg_catalog.pg_get_constraintdef(con.oid) \
+             FROM pg_catalog.pg_constraint con \
+             JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = {schema} AND c.relname = {relation} AND con.conname = {name}",
+            schema = quote_literal(schema),
+            relation = quote_literal(relation),
+            name = quote_literal(name),
+        );
+        let def = self
+            .scalar(&sql)?
+            .ok_or_else(|| format!("constraint {name} on {schema}.{relation} not found"))?;
+        Ok(format!(
+            "ALTER TABLE {}.{} ADD CONSTRAINT {} {def};",
+            quote_ident(schema),
+            quote_ident(relation),
+            quote_ident(name),
+        ))
+    }
+
+    /// Best-effort `CREATE TABLE` DDL: columns (type, NOT NULL, DEFAULT), then
+    /// table constraints (`pg_get_constraintdef`), then any indexes that do not
+    /// back a constraint (`pg_get_indexdef`). Postgres has no single "get table
+    /// definition" function, so this is reconstructed from the catalog.
+    pub fn table_definition(&mut self, schema: &str, name: &str) -> Result<String, String> {
+        let oid = self
+            .scalar(&format!(
+                "SELECT c.oid FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = {schema} AND c.relname = {name} AND c.relkind IN ('r', 'p')",
+                schema = quote_literal(schema),
+                name = quote_literal(name),
+            ))?
+            .ok_or_else(|| format!("table {schema}.{name} not found"))?;
+
+        // Columns, in attribute order.
+        let column_rows = self.rows(&format!(
+                "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                        a.attnotnull, pg_catalog.pg_get_expr(d.adbin, d.adrelid) \
+                 FROM pg_catalog.pg_attribute a \
+                 LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+                 WHERE a.attrelid = {oid} AND a.attnum > 0 AND NOT a.attisdropped \
+                 ORDER BY a.attnum"
+            ),
+        )?;
+        let mut items: Vec<String> = column_rows
+            .iter()
+            .map(|row| {
+                let mut line = format!(
+                    "{} {}",
+                    quote_ident(row.get(0).unwrap_or_default()),
+                    row.get(1).unwrap_or_default(),
+                );
+                if is_true(row.get(2)) {
+                    line.push_str(" NOT NULL");
+                }
+                if let Some(default) = row.get(3) {
+                    let _ = write!(line, " DEFAULT {default}");
+                }
+                line
+            })
+            .collect();
+
+        // Table constraints (primary key first, then the rest by name).
+        let constraint_rows = self.rows(&format!(
+            "SELECT con.conname, pg_catalog.pg_get_constraintdef(con.oid) \
+                 FROM pg_catalog.pg_constraint con \
+                 WHERE con.conrelid = {oid} \
+                 ORDER BY con.contype = 'p' DESC, con.conname"
+        ))?;
+        for row in &constraint_rows {
+            items.push(format!(
+                "CONSTRAINT {} {}",
+                quote_ident(row.get(0).unwrap_or_default()),
+                row.get(1).unwrap_or_default(),
+            ));
+        }
+
+        let mut out = format!(
+            "CREATE TABLE {}.{} (\n    {}\n);",
+            quote_ident(schema),
+            quote_ident(name),
+            items.join(",\n    "),
+        );
+
+        // Indexes that are not the implementation of a constraint.
+        let index_rows = self.rows(&format!(
+            "SELECT pg_catalog.pg_get_indexdef(ix.indexrelid) \
+                 FROM pg_catalog.pg_index ix \
+                 WHERE ix.indrelid = {oid} \
+                   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint con \
+                                   WHERE con.conindid = ix.indexrelid) \
+                 ORDER BY 1"
+        ))?;
+        for row in &index_rows {
+            if let Some(def) = row.get(0) {
+                let _ = write!(out, "\n{def};");
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Execute a SQL script (one or more statements) using the simple query protocol,

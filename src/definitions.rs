@@ -4,7 +4,7 @@
 //! The language server has nothing to offer here — `pgls` has no definition
 //! feature, and its hover returns rendered markdown rather than object
 //! identity — so the symbol under the cursor is resolved against the catalog
-//! ([`db::find_object`]) instead. That also means this keeps working while the
+//! ([`db::Catalog::find_object`]) instead. That also means this keeps working while the
 //! language server is down.
 //!
 //! The editor's [`DefinitionProvider`] can only move the cursor inside the
@@ -273,9 +273,9 @@ impl DefinitionProvider for Provider {
         let (query_conn, schema, name) = (conn.clone(), symbol.schema.clone(), symbol.name.clone());
         cx.spawn(async move |cx| {
             let found = cx
-                .background_spawn(
-                    async move { db::find_object(&query_conn, schema.as_deref(), &name) },
-                )
+                .background_spawn(async move {
+                    db::Catalog::connect(&query_conn)?.find_object(schema.as_deref(), &name)
+                })
                 .await;
             // A failed lookup caches as a miss: the editor asks again on the
             // very next mouse move, and retrying a dead connection there would
@@ -401,7 +401,8 @@ mod tests {
     #[ignore = "requires the local docker database"]
     fn resolves_a_routine_against_the_database() {
         let conn = "postgres://pgui:pgui@localhost:5433/pgui_test";
-        let found = db::find_object(conn, None, "place_order")
+        let found = db::Catalog::connect(conn)
+            .and_then(|mut catalog| catalog.find_object(None, "place_order"))
             .expect("the lookup to run")
             .expect("place_order to exist");
         let target = Target::from_ref(found).expect("a supported kind");

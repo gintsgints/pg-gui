@@ -141,6 +141,10 @@ Refactor the `list_*` functions to take `&mut Catalog` (or add `Catalog::schemas
 
 No behavior change; faster object browser, especially on remote/slow servers.
 
+### Status
+
+- Done. `db::Catalog` wraps one `Client` (`connect`/`rows`/`scalar`), and every catalog query — `list_*`, `find_object`, the `*_definition` builders — is a `Catalog` method; the per-query `catalog_rows`/`catalog_scalar` free functions are gone. No one-shot wrappers were kept: the callers that make one query write `Catalog::connect(conn)?.method(..)` instead, which is no longer than a wrapper call; `search_path` goes through `Catalog` the same way, and `test_connection` still only connects. The plan's premise was partly off: expanding one folder was already one query. The connections actually saved are in two places. `table_definition` used 4 connections and `type_definition` 2–3; each now uses one. A schema/table refresh reloaded each expanded folder with its own connection; `PgGuiApp::load_db_folders` now loads them all in one background task over one `Catalog` (a failed connect fails each folder with the same error, as before). `db_tree::load_schemas`/`load_children` take `&mut Catalog`.
+
 ---
 
 ## Priority 3: Cap non-paged result-set memory — `src/db.rs`, `src/results.rs`

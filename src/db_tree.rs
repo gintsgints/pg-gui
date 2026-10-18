@@ -3,7 +3,8 @@
 //! The tree is schema → object-type folder (Tables, Views, …) → objects, with
 //! tables expanding one level further to their Columns, Indexes, Constraints
 //! and Triggers folders.
-//! Every folder loads lazily, one catalog query per folder expansion.
+//! Every folder loads lazily, one catalog query per folder expansion, over a
+//! [`Catalog`] connection the caller opens (one per browse operation).
 //! gpui-component's `tree` has no lazy API — a node with zero
 //! children can't be expanded, and only a full `set_items` rebuild exists — so
 //! this module keeps its own `Vec<DbNode>` as the source of truth and projects
@@ -18,7 +19,7 @@ use std::collections::HashSet;
 use gpui::SharedString;
 use gpui_component::tree::TreeItem;
 
-use crate::db;
+use crate::db::{self, Catalog};
 
 /// Separator woven into node ids to keep them unique across the hierarchy.
 /// A control character can't occur in a rendered label, so ids never collide
@@ -233,8 +234,9 @@ impl DbNode {
 }
 
 /// Fetch the schema list and build the top level of the tree.
-pub fn load_schemas(conn_str: &str, show_system: bool) -> Result<Vec<DbNode>, String> {
-    Ok(db::list_schemas(conn_str, show_system)?
+pub fn load_schemas(catalog: &mut Catalog, show_system: bool) -> Result<Vec<DbNode>, String> {
+    Ok(catalog
+        .list_schemas(show_system)?
         .iter()
         .map(|name| DbNode::schema(name))
         .collect())
@@ -244,7 +246,7 @@ pub fn load_schemas(conn_str: &str, show_system: bool) -> Result<Vec<DbNode>, St
 /// empty vector for a node kind that is not a folder (which should never be
 /// reached, since only folders are left `Unloaded`).
 pub fn load_children(
-    conn_str: &str,
+    catalog: &mut Catalog,
     kind: NodeKind,
     parent_id: &str,
     schema: &str,
@@ -265,34 +267,36 @@ pub fn load_children(
             })
             .collect()
     };
-    let relation_leaves = |relkind: char, node_kind: NodeKind| -> Result<Vec<DbNode>, String> {
-        Ok(leaves(
-            db::list_relations(conn_str, schema, relkind)?,
-            node_kind,
-        ))
+    // Takes the catalog as an argument rather than capturing it, so the other
+    // match arms can still borrow it.
+    let relation_leaves = |catalog: &mut Catalog,
+                           relkind: char,
+                           node_kind: NodeKind|
+     -> Result<Vec<DbNode>, String> {
+        Ok(leaves(catalog.list_relations(schema, relkind)?, node_kind))
     };
 
     match kind {
-        NodeKind::TablesFolder => Ok(db::list_relations(conn_str, schema, 'r')?
+        NodeKind::TablesFolder => Ok(catalog
+            .list_relations(schema, 'r')?
             .iter()
             .map(|name| DbNode::table(parent_id, schema, name))
             .collect()),
-        NodeKind::ViewsFolder => relation_leaves('v', NodeKind::View),
-        NodeKind::MatViewsFolder => relation_leaves('m', NodeKind::MatView),
-        NodeKind::SequencesFolder => relation_leaves('S', NodeKind::Sequence),
-        NodeKind::FunctionsFolder => Ok(leaves(
-            db::list_functions(conn_str, schema)?,
-            NodeKind::Function,
-        )),
-        NodeKind::TypesFolder => Ok(leaves(db::list_types(conn_str, schema)?, NodeKind::Type)),
-        _ => load_table_children(conn_str, kind, parent_id, schema, relation),
+        NodeKind::ViewsFolder => relation_leaves(catalog, 'v', NodeKind::View),
+        NodeKind::MatViewsFolder => relation_leaves(catalog, 'm', NodeKind::MatView),
+        NodeKind::SequencesFolder => relation_leaves(catalog, 'S', NodeKind::Sequence),
+        NodeKind::FunctionsFolder => {
+            Ok(leaves(catalog.list_functions(schema)?, NodeKind::Function))
+        }
+        NodeKind::TypesFolder => Ok(leaves(catalog.list_types(schema)?, NodeKind::Type)),
+        _ => load_table_children(catalog, kind, parent_id, schema, relation),
     }
 }
 
 /// The lazy folders under a table row: its columns, indexes, constraints and
 /// triggers. Split out of [`load_children`] so neither half grows unwieldy.
 fn load_table_children(
-    conn_str: &str,
+    catalog: &mut Catalog,
     kind: NodeKind,
     parent_id: &str,
     schema: &str,
@@ -312,11 +316,13 @@ fn load_table_children(
     };
 
     match kind {
-        NodeKind::ColumnsFolder => Ok(db::list_columns(conn_str, schema, relation)?
+        NodeKind::ColumnsFolder => Ok(catalog
+            .list_columns(schema, relation)?
             .iter()
             .map(|col| leaf(&col.name, column_label(col), NodeKind::Column))
             .collect()),
-        NodeKind::IndexesFolder => Ok(db::list_indexes(conn_str, schema, relation)?
+        NodeKind::IndexesFolder => Ok(catalog
+            .list_indexes(schema, relation)?
             .iter()
             .map(|idx| {
                 let mut label = idx.name.clone();
@@ -328,7 +334,8 @@ fn load_table_children(
                 leaf(&idx.name, label, NodeKind::Index)
             })
             .collect()),
-        NodeKind::ConstraintsFolder => Ok(db::list_constraints(conn_str, schema, relation)?
+        NodeKind::ConstraintsFolder => Ok(catalog
+            .list_constraints(schema, relation)?
             .iter()
             .map(|con| {
                 let kind_label = match con.kind {
@@ -346,7 +353,8 @@ fn load_table_children(
                 )
             })
             .collect()),
-        NodeKind::TriggersFolder => Ok(db::list_triggers(conn_str, schema, relation)?
+        NodeKind::TriggersFolder => Ok(catalog
+            .list_triggers(schema, relation)?
             .iter()
             .map(|trg| leaf(&trg.name, trg.name.clone(), NodeKind::Trigger))
             .collect()),

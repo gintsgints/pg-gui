@@ -27,7 +27,7 @@ use gpui_component::{
 use gpui_component::menu::AppMenuBar;
 
 use crate::results::ResultsDelegate;
-use crate::{config, db_tree, debug, definitions, file_tree, lsp, snippets, statement};
+use crate::{config, db, db_tree, debug, definitions, file_tree, lsp, snippets, statement};
 
 mod connection;
 mod debugger;
@@ -1050,7 +1050,9 @@ impl PgGuiApp {
         let show_system = self.show_system_schemas;
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { db_tree::load_schemas(&conn, show_system) })
+                .background_spawn(async move {
+                    db_tree::load_schemas(&mut db::Catalog::connect(&conn)?, show_system)
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.db_schema_load = match result {
@@ -1070,37 +1072,69 @@ impl PgGuiApp {
     /// Fetch the children of a just-expanded folder node. Ignores nodes that
     /// are already loaded/loading (re-expanding a failed node retries).
     fn load_db_children(&mut self, id: SharedString, cx: &mut Context<Self>) {
-        let Some(node) = db_tree::find(&self.db_nodes, &id) else {
-            return;
-        };
-        if !matches!(
-            node.load,
-            db_tree::Load::Unloaded | db_tree::Load::Failed(_)
-        ) {
-            return;
-        }
-        let (kind, schema, relation) = (node.kind, node.schema.clone(), node.relation.clone());
-        let conn = self.config.connection_string.clone();
-        if let Some(node) = db_tree::find_mut(&mut self.db_nodes, &id) {
+        self.load_db_folders(vec![id], cx);
+    }
+
+    /// Fetch the children of several folder nodes in one background task,
+    /// over one catalog connection — a refresh of a schema or table reloads
+    /// every expanded folder under it, and each would otherwise pay its own
+    /// handshake. Skips nodes already loaded/loading, like
+    /// [`Self::load_db_children`]. A failed connection fails every folder.
+    fn load_db_folders(&mut self, ids: Vec<SharedString>, cx: &mut Context<Self>) {
+        let mut jobs = Vec::new();
+        for id in ids {
+            let Some(node) = db_tree::find_mut(&mut self.db_nodes, &id) else {
+                continue;
+            };
+            if !matches!(
+                node.load,
+                db_tree::Load::Unloaded | db_tree::Load::Failed(_)
+            ) {
+                continue;
+            }
             node.load = db_tree::Load::Loading;
+            jobs.push((id, node.kind, node.schema.clone(), node.relation.clone()));
         }
+        if jobs.is_empty() {
+            return;
+        }
+        let conn = self.config.connection_string.clone();
         self.rebuild_db_tree(cx);
 
-        let parent_id = id.clone();
         cx.spawn(async move |this, cx| {
-            let result = cx
+            let results = cx
                 .background_spawn(async move {
-                    db_tree::load_children(&conn, kind, &parent_id, &schema, &relation)
+                    match db::Catalog::connect(&conn) {
+                        Ok(mut catalog) => jobs
+                            .into_iter()
+                            .map(|(id, kind, schema, relation)| {
+                                let result = db_tree::load_children(
+                                    &mut catalog,
+                                    kind,
+                                    &id,
+                                    &schema,
+                                    &relation,
+                                );
+                                (id, result)
+                            })
+                            .collect::<Vec<_>>(),
+                        Err(err) => jobs
+                            .into_iter()
+                            .map(|(id, ..)| (id, Err(err.clone())))
+                            .collect(),
+                    }
                 })
                 .await;
             this.update(cx, |this, cx| {
-                if let Some(node) = db_tree::find_mut(&mut this.db_nodes, &id) {
-                    match result {
-                        Ok(children) => {
-                            node.children = children;
-                            node.load = db_tree::Load::Loaded;
+                for (id, result) in results {
+                    if let Some(node) = db_tree::find_mut(&mut this.db_nodes, &id) {
+                        match result {
+                            Ok(children) => {
+                                node.children = children;
+                                node.load = db_tree::Load::Loaded;
+                            }
+                            Err(err) => node.load = db_tree::Load::Failed(err),
                         }
-                        Err(err) => node.load = db_tree::Load::Failed(err),
                     }
                 }
                 this.rebuild_db_tree(cx);
@@ -1132,9 +1166,7 @@ impl PgGuiApp {
         if let Some(node) = db_tree::find_mut(&mut self.db_nodes, &id) {
             db_tree::reset_lazy_descendants(node, &expanded, &mut reload);
         }
-        for child_id in reload {
-            self.load_db_children(child_id, cx);
-        }
+        self.load_db_folders(reload, cx);
         self.rebuild_db_tree(cx);
     }
 

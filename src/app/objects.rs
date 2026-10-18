@@ -31,7 +31,8 @@ fn object_kind_has_definition(kind: db_tree::NodeKind) -> bool {
 }
 
 /// Fetch the SQL definition of a database object, dispatching to the right
-/// catalog query per kind. Runs on the background executor.
+/// catalog query per kind, all on one [`db::Catalog`] connection. Runs on the
+/// background executor.
 fn object_definition(
     conn: &str,
     kind: db_tree::NodeKind,
@@ -42,16 +43,17 @@ fn object_definition(
     use db_tree::NodeKind::{
         Constraint, Function, Index, MatView, Sequence, TableDefinition, Trigger, Type, View,
     };
+    let mut catalog = db::Catalog::connect(conn)?;
     match kind {
-        View => db::view_definition(conn, schema, object, false),
-        MatView => db::view_definition(conn, schema, object, true),
-        Function => db::function_definition(conn, schema, object),
-        Sequence => db::sequence_definition(conn, schema, object),
-        Type => db::type_definition(conn, schema, object),
-        Index => db::index_definition(conn, schema, object),
-        Constraint => db::constraint_definition(conn, schema, relation, object),
-        Trigger => db::trigger_definition(conn, schema, relation, object),
-        TableDefinition => db::table_definition(conn, schema, object),
+        View => catalog.view_definition(schema, object, false),
+        MatView => catalog.view_definition(schema, object, true),
+        Function => catalog.function_definition(schema, object),
+        Sequence => catalog.sequence_definition(schema, object),
+        Type => catalog.type_definition(schema, object),
+        Index => catalog.index_definition(schema, object),
+        Constraint => catalog.constraint_definition(schema, relation, object),
+        Trigger => catalog.trigger_definition(schema, relation, object),
+        TableDefinition => catalog.table_definition(schema, object),
         _ => Err("no definition for this object".to_string()),
     }
 }
