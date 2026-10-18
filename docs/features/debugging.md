@@ -6,7 +6,7 @@ server's [pldebugger](https://github.com/EnterpriseDB/pldebugger) extension.
 ## Requirements
 
 - The `pldbgapi` extension installed in the database
-  (`sql/extensions/R.0.01.02.1__pldbgapi.sql`).
+  (`sql/public/extensions/R.0.01.02.1__pldbgapi.sql`).
 - `plugin_debugger` in the server's `shared_preload_libraries`.
 - The routine must be `LANGUAGE plpgsql`.
 

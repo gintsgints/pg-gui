@@ -1677,7 +1677,7 @@ mod tests {
             Client::start(CONN, "SELECT * FROM o", CaseStyle::Upper, CaseStyle::Upper)
                 .expect("client starts");
 
-        // Schema-aware completions: the public `orders` table is offered for
+        // Schema-aware completions: the `app.orders` table is offered for
         // the `o` prefix, which only works if the schema cache loaded from the
         // database.
         let workspace = client.inner.workspace.clone();

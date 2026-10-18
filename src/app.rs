@@ -967,7 +967,7 @@ impl PgGuiApp {
 
     /// The picked scripts as paths, in the order the tree lists them —
     /// folders first, then names, which is the order the timestamp-named
-    /// files under `sql/upgrade` have to run in.
+    /// files under `sql/app/upgrade` have to run in.
     fn selected_script_paths(&self) -> Vec<PathBuf> {
         file_tree::ordered_ids(&self.tree_items)
             .into_iter()

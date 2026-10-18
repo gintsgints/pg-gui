@@ -5,9 +5,9 @@
 --   CREATE EXTENSION pldbgapi;                      (in the target database)
 --
 -- Then launch pgdap with:
---   function = "public.add(int, int)"   args = [2, 3]   stopOnEntry = true
+--   function = "app.add(int, int)"   args = [2, 3]   stopOnEntry = true
 
-CREATE OR REPLACE FUNCTION public.add(a int, b int)
+CREATE OR REPLACE FUNCTION app.add(a int, b int)
 RETURNS int
 LANGUAGE plpgsql
 AS $$

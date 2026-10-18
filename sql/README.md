@@ -7,8 +7,22 @@ CALL / SELECT function() flows.
 
 `docker-compose.yml` mounts this folder as the container's
 `/docker-entrypoint-initdb.d`, so it is both the checked-in source of the
-sample schema and the seed that creates it. One folder per object type, one
-file per object:
+sample schema and the seed that creates it. One folder per schema, a folder
+per object type inside it, one file per object:
+
+```
+app/
+  schemas/     V.0.03.01.1__app.sql
+  tables/      V.0.06.01.1__customers.sql, V.0.06.02.1__orders.sql, …
+  functions/   R.0.07.01.1__add.sql, …
+  views/       R.0.08.01.1__customer_open_order_total_ammount.sql
+  upgrade/     V.2026.09.06.10.42__customers.sql, …
+public/
+  extensions/  R.0.01.01.1__pg_stat_statements.sql, R.0.01.02.1__pldbgapi.sql
+grants/        R.0.15.01.1__pgui_search_path.sql
+```
+
+The object types, in run order:
 
 ```
 01 extensions/   pg_stat_statements, pldbgapi
@@ -16,7 +30,7 @@ file per object:
 03 schemas/      app
 04 types/        enums, domains, composites used by table columns
 05 sequences/    standalone sequences (serial/identity columns need none)
-06 tables/       customers, orders, order_events, app.feature_flags
+06 tables/       customers, orders, order_events, feature_flags
 07 functions/    add, place_order, cancel_stale_orders, customer_order_summary
 08 views/        views over those tables
 09 matviews/     materialized views, created WITH NO DATA
@@ -32,6 +46,35 @@ file per object:
 ```
 
 Only the folders that hold a file need to exist; the script skips the rest.
+
+The schema folder names the schema the object lives in; the file's own name
+then drops it (`app/tables/…__feature_flags.sql`, not `…__app_feature_flags`).
+The sample objects all live in `app`; `public` holds only the extensions,
+whose `pldbg_*` functions pg-gui's debugger calls unqualified.
+
+Every script qualifies the names it creates and touches (`app.orders`), body
+of a routine included. The `pgui` search_path that would let it write `orders`
+is set in `grants/`, the last folder to run, and only takes effect for later
+sessions anyway; a `LANGUAGE sql` body is resolved at creation, and a plpgsql
+body at call time against the *caller's* search_path, so neither may rely on
+it.
+Objects that belong to no schema — roles, and role settings such as the
+`pgui` search_path in `grants/` — sit in a type folder at the top level
+instead, with no schema above them.
+
+Upgrades go under the schema they change (`app/upgrade/`). Their timestamps
+are still one global order: the script sorts every schema's `upgrade/`
+together by file name, so an `app` upgrade written before a `billing` one runs
+first. An upgrade that spans schemas goes under the one it mainly changes. The
+file panel's Run Selected Scripts does not merge like that — it runs folder by
+folder — so when replaying upgrades by hand across several schemas, run each
+schema's in timestamp order yourself.
+
+The script runs one object type at a time across every schema: it gathers
+`<type>/` and every `<schema>/<type>/`, and sorts them by file name, so the
+schema folders never decide run order — `dependency_order` does (or, in
+`upgrade/`, the timestamp). A table in one schema that references a table in
+another just takes a higher number, as `orders` does over `customers`.
 
 Naming — one scheme, `V` or `R` picking how the file is applied:
 
@@ -52,20 +95,21 @@ Naming — one scheme, `V` or `R` picking how the file is applied:
 - Numbers are zero-padded to two digits because the scripts are sorted
   `LC_ALL=C`, where `10` sorts before `2`.
 
-`upgrade/` is the one folder that names its files differently — see below.
+`<schema>/upgrade/` is the one folder that names its files differently — see below.
 
 `00-run-init.sh` is the entry point. The postgres entrypoint globs
 `/docker-entrypoint-initdb.d/*` and **ignores directories**, so it never sees
 these folders; the script walks them itself, in the dependency order listed
 above, and runs each folder's `V*` scripts before its `R*` ones. Adding a file
-to an existing folder needs no change to the script; a new folder does.
+— or a whole new schema folder — needs no change to the script; a new object
+type does.
 
-`upgrade/` is where a schema stops being a fresh create. A `CREATE` file under
-`tables/`, `types/`, `views/`, … describes the object as it was first written,
-and is never edited afterwards once a database exists that already ran it;
+`<schema>/upgrade/` is where a schema stops being a fresh create. A `CREATE`
+file under `<schema>/tables/`, `<schema>/types/`, `<schema>/views/`, …
+describes the object as it was first written, and is never edited afterwards once a database exists that already ran it;
 every later change to that object — `ALTER TABLE ADD COLUMN`, a type widening,
 a backfill `UPDATE`, as well as the initial `INSERT`s — is a new `V` file in
-`upgrade/`:
+that schema's `upgrade/`:
 
 `V.<YYYY>.<MM>.<DD>.<HH>.<MI>__<name>.sql`
 
@@ -92,7 +136,7 @@ V.2026.09.06.10.42__customers.sql
 
 `R` files in `upgrade/` would be a contradiction — a one-time change re-applied
 — so the folder holds `V` only. A routine or view that is *rewritten* is not an
-upgrade at all: edit its `R` file in `functions/` or `views/` in place.
+upgrade at all: edit its `R` file under `<schema>/functions/` or `<schema>/views/` in place.
 
 Two placements are deliberate and worth keeping:
 
@@ -104,7 +148,9 @@ Two placements are deliberate and worth keeping:
   it a folder after `views`.
 
 Anything that is *not* meant to run at init must stay inside a folder the
-script does not walk — that is what `examples/` is for. A loose `*.sql` or
+script does not walk — that is what `examples/` is for. Since every top-level
+folder is read as a schema, `examples/` must not hold a subfolder named after
+an object type, and a schema cannot be named after one either. A loose `*.sql` or
 `*.sh` at the top level of this directory would be picked up and executed by
 the postgres entrypoint itself.
 

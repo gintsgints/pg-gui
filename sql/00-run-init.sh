@@ -1,14 +1,17 @@
 #!/bin/bash
-# Runs the seed scripts laid out under sql/: one folder per object type, one
-# file per object, named
+# Runs the seed scripts laid out under sql/: one folder per schema, a folder
+# per object type inside it, one file per object, named
 # <V|R>.<reserved>.<object_order>.<dependency_order>.<n>__<name>.sql — V for
 # things created once, R for things that are safe to re-apply. Files in
-# upgrade/ are named V.<YYYY>.<MM>.<DD>.<HH>.<MI>__<name>.sql instead, so
-# branches never claim the same number; they still sort in run order.
+# <schema>/upgrade/ are named V.<YYYY>.<MM>.<DD>.<HH>.<MI>__<name>.sql
+# instead, so branches never claim the same number; they still sort in run
+# order, across schemas too. Cluster-wide objects such as roles sit in type
+# folders at the top level, with no schema above them.
 #
 # The postgres entrypoint globs /docker-entrypoint-initdb.d/* and ignores
 # directories, so this script is the single entry point it does see; it walks
-# the folders itself, in dependency order.
+# the folders itself, one object type at a time across every schema, in
+# dependency order.
 
 set -euo pipefail
 
@@ -44,15 +47,27 @@ run_file() {
         --no-password --no-psqlrc -f "$1"
 }
 
-for folder in "${folders[@]}"; do
-    dir="$init_dir/$folder"
-    [ -d "$dir" ] || continue
+# Basename, then the path, NUL-separated — what the per-type sort keys on.
+by_name() {
+    local file
+    for file in "$@"; do
+        printf '%s\t%s\0' "${file##*/}" "$file"
+    done
+}
 
+# An unmatched glob expands to nothing rather than to itself.
+shopt -s nullglob
+
+for folder in "${folders[@]}"; do
     # Versioned scripts before repeatable ones, each group in name order
-    # (LC_ALL=C so the glob sorts the same everywhere).
+    # across the top-level type folder and every schema's (LC_ALL=C so the
+    # sort is the same everywhere): the name's dependency_order, not the
+    # schema, decides when one schema's table must exist before another's.
     for pattern in 'V*.sql' 'R*.sql'; do
-        while IFS= read -r -d '' file; do
+        files=("$init_dir/$folder"/$pattern "$init_dir"/*/"$folder"/$pattern)
+        [ "${#files[@]}" -gt 0 ] || continue
+        while IFS=$'\t' read -r -d '' _ file; do
             run_file "$file"
-        done < <(LC_ALL=C find "$dir" -maxdepth 1 -name "$pattern" -print0 | LC_ALL=C sort -z)
+        done < <(by_name "${files[@]}" | LC_ALL=C sort -z -t $'\t' -k1,1 -k2,2)
     done
 done

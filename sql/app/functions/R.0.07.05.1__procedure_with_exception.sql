@@ -1,4 +1,4 @@
-CREATE OR REPLACE PROCEDURE procedure_with_exception()
+CREATE OR REPLACE PROCEDURE app.procedure_with_exception()
 LANGUAGE plpgsql
 AS $procedure$
 DECLARE

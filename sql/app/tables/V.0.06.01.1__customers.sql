@@ -1,4 +1,4 @@
-CREATE TABLE customers (
+CREATE TABLE app.customers (
     id serial PRIMARY KEY,
     name text NOT NULL,
     email text,

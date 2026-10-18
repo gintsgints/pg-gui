@@ -6,11 +6,13 @@ procedure step by step.
 
 ## The target
 
-`place_order` (from `sql/functions/R.0.07.04.1__place_order.sql`) is a plpgsql procedure with
-two statements: it inserts a row into `orders`, then a row into `order_events`.
+`app.place_order` (from `sql/app/functions/R.0.07.04.1__place_order.sql`) is a plpgsql procedure with
+two statements: it inserts a row into `app.orders`, then a row into `app.order_events`.
+The `pgui` role has `app` on its `search_path`, so the unqualified names below
+resolve.
 
 ```sql
-CREATE PROCEDURE place_order(
+CREATE PROCEDURE app.place_order(
     IN p_customer_id integer,
     IN p_amount numeric,
     INOUT p_order_id integer DEFAULT NULL
@@ -18,11 +20,11 @@ CREATE PROCEDURE place_order(
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    INSERT INTO orders (customer_id, amount)
+    INSERT INTO app.orders (customer_id, amount)
     VALUES (p_customer_id, p_amount)
     RETURNING id INTO p_order_id;
 
-    INSERT INTO order_events (order_id, event_type, payload)
+    INSERT INTO app.order_events (order_id, event_type, payload)
     VALUES (p_order_id, 'created', jsonb_build_object('source', 'procedure'));
 END;
 $$;
@@ -47,14 +49,14 @@ backend.
 - **Line numbers** from `pldbg_get_source` are body-relative; only executable
   statement lines accept breakpoints. Entry is `-1`.
 - **OID resolution** — `'place_order'::regproc::oid` works because the name is
-  unique. If a function is overloaded, use the full signature
+  unique on the search path. If a function is overloaded, use the full signature
   (`'place_order(integer,numeric,integer)'::regprocedure::oid`) or
   `pldbg_get_target_info('place_order', 'f')`.
 - **Direct mode** — instead of a global breakpoint, session B can run
   `SELECT pldbg_oid_debug('place_order'::regproc::oid);` before the `CALL`; the
   backend then waits for a debugger to attach. Global mode is what a GUI uses.
 - **Schema** — the extension installs into `public` (no `SCHEMA` clause in
-  `sql/extensions/R.0.01.02.1__pldbgapi.sql`), so unqualified `pldbg_*` names
+  `sql/public/extensions/R.0.01.02.1__pldbgapi.sql`), so unqualified `pldbg_*` names
   resolve. If
   moved to a dedicated schema, qualify every call (`debug.pldbg_*`).
 - **Cleanup** — `SELECT pldbg_abort_target(1);` kills a trapped execution instead
