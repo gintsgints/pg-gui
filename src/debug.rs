@@ -16,11 +16,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::mpsc as async_mpsc;
 use pgdap::debugger::{DebugSession, cancel_backend};
 use postgres::{Config, NoTls, SimpleQueryMessage};
+use tracing::debug;
 
 pub use pgdap::debugger::{Frame, Var};
 
@@ -41,6 +43,9 @@ pub enum DebugEvent {
     /// …) while running. Arrives live from the target connection, so a
     /// routine stepped through reports each notice as it is raised.
     Notice(String),
+    /// A one-line remark for the status bar that changes nothing about the
+    /// session — e.g. a gutter breakpoint that could not be armed.
+    Note(String),
     /// The debugged execution finished (or was aborted); the session is over.
     Terminated,
     /// The session could not start, or a control op failed hard.
@@ -87,6 +92,14 @@ pub struct Session {
     /// Set before the controller aborts the target, so the target thread knows
     /// its resulting query error is expected and not worth surfacing.
     aborting: Arc<AtomicBool>,
+    /// Set once the target has trapped. Before that the controller is parked
+    /// in `pldbg_wait_for_target` and never reads a command, so a stop has to
+    /// reach it from outside — see [`Self::request_stop`].
+    attached: Arc<AtomicBool>,
+    /// Where to send that out-of-band cancel, and the `application_name` tag
+    /// the session's connections carry.
+    config: Config,
+    control_tag: String,
     /// The fully-qualified routine being debugged, for the panel header.
     pub target: String,
 }
@@ -122,9 +135,15 @@ impl Session {
         let (event_tx, event_rx) = async_mpsc::unbounded();
         let (cmd_tx, cmd_rx) = channel();
         let aborting = Arc::new(AtomicBool::new(false));
+        let attached = Arc::new(AtomicBool::new(false));
+        // The connections are tagged so a run that never traps, or a stop that
+        // arrives before it does, can find and cancel them.
+        let control_tag = control_tag();
 
         let launch = Launch {
-            config,
+            config: config.clone(),
+            control_tag: control_tag.clone(),
+            attached: attached.clone(),
             signature: signature.to_string(),
             args: args.to_string(),
             breakpoints: breakpoints.to_vec(),
@@ -139,8 +158,13 @@ impl Session {
             .name("pg-debug-controller".into())
             .spawn(move || {
                 let event_tx = launch.event_tx.clone();
+                let aborting = launch.aborting.clone();
                 if let Err(err) = controller(launch) {
-                    let _ = event_tx.unbounded_send(DebugEvent::Error(format!("{err:#}")));
+                    // After a stop, cancelled queries are how the threads are
+                    // brought down; the errors they raise are expected.
+                    if !aborting.load(Ordering::SeqCst) {
+                        let _ = event_tx.unbounded_send(DebugEvent::Error(format!("{err:#}")));
+                    }
                     let _ = event_tx.unbounded_send(DebugEvent::Terminated);
                 }
             })?;
@@ -149,6 +173,9 @@ impl Session {
             Self {
                 cmd_tx,
                 aborting,
+                attached,
+                config,
+                control_tag,
                 target: signature.to_string(),
             },
             event_rx,
@@ -187,8 +214,33 @@ impl Session {
 
     /// Abort the trapped target and end the session.
     pub fn stop(&self) {
-        self.aborting.store(true, Ordering::SeqCst);
+        self.request_stop();
+    }
+
+    /// Ask the controller to abort, and cancel the tagged connections from
+    /// outside too, because the controller only reads the queued `Stop` between
+    /// two blocking calls. The target's query is always cancelled: while a
+    /// Continue runs toward a breakpoint it never reaches, the controller sits
+    /// in `pldbg_continue` until the routine ends. Before the trap the
+    /// controller's own query is cancelled as well, since it is parked in
+    /// `pldbg_wait_for_target`, which a routine stuck before its first
+    /// statement (a lock wait, a slow argument) never ends. Idempotent: the
+    /// first call flips `aborting`, later ones (a `stop` followed by the drop)
+    /// do nothing.
+    fn request_stop(&self) {
+        if self.aborting.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let _ = self.cmd_tx.send(Command::Stop);
+        let mut tags = vec![target_tag(&self.control_tag)];
+        if !self.attached.load(Ordering::SeqCst) {
+            tags.push(self.control_tag.clone());
+        }
+        // Connecting may block for the connect timeout; never on the UI thread.
+        let config = self.config.clone();
+        let _ = std::thread::Builder::new()
+            .name("pg-debug-cancel".into())
+            .spawn(move || cancel_tagged(&config, &tags));
     }
 }
 
@@ -196,8 +248,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         // Best-effort: unblock the target if the handle is dropped without an
         // explicit stop. Dropping cmd_tx also makes the controller's recv fail.
-        self.aborting.store(true, Ordering::SeqCst);
-        let _ = self.cmd_tx.send(Command::Stop);
+        self.request_stop();
     }
 }
 
@@ -205,6 +256,10 @@ impl Drop for Session {
 /// small.
 struct Launch {
     config: Config,
+    /// `application_name` of the control connection; the target's is derived
+    /// from it ([`target_tag`]).
+    control_tag: String,
+    attached: Arc<AtomicBool>,
     signature: String,
     args: String,
     /// Editor-relative 0-based line numbers, mapped to body lines after attach.
@@ -223,6 +278,8 @@ struct Launch {
 fn controller(launch: Launch) -> Result<()> {
     let Launch {
         config,
+        control_tag,
+        attached,
         signature,
         args,
         breakpoints,
@@ -240,7 +297,6 @@ fn controller(launch: Launch) -> Result<()> {
     status(&format!("Connecting to {}…", describe_addr(&config)));
     // The control connection is tagged so a target that finishes without ever
     // trapping can find and cancel the controller's `pldbg_wait_for_target`.
-    let control_tag = control_tag();
     let mut control_config = config.clone();
     control_config.application_name(&control_tag);
     let mut session = DebugSession::connect(&control_config)
@@ -264,11 +320,18 @@ fn controller(launch: Launch) -> Result<()> {
         ));
     }
 
-    // Set once the target traps, so the target thread can tell "stepped" from
-    // "ran straight through"; `target_done` marks the routine as finished, so a
-    // cancelled wait is recognised as expected rather than reported as a fault.
-    let attached = Arc::new(AtomicBool::new(false));
+    // `attached` is set once the target traps, so the target thread can tell
+    // "stepped" from "ran straight through"; `target_done` marks the routine as
+    // finished, so a cancelled wait is recognised as expected rather than
+    // reported as a fault.
     let target_done = Arc::new(AtomicBool::new(false));
+
+    // A stop during setup found no target to cancel; launching one now would
+    // leave it to trap with nobody left to release it.
+    if aborting.load(Ordering::SeqCst) {
+        finish(&event_tx);
+        return Ok(());
+    }
 
     // Now that the trap is set, launch the routine on its own connection.
     std::thread::Builder::new()
@@ -291,41 +354,44 @@ fn controller(launch: Launch) -> Result<()> {
     status(&format!("Waiting for {} to be called…", target.fq_name));
     let pid = match session.wait_for_target() {
         Ok(pid) => pid,
+        // A stop before the trap cancelled our wait (and the target with it).
+        Err(_) if aborting.load(Ordering::SeqCst) => {
+            finish(&event_tx);
+            return Ok(());
+        }
         // The routine finished without trapping and cancelled our wait; it has
         // already reported why, so end quietly.
         Err(_) if target_done.load(Ordering::SeqCst) => return Ok(()),
         Err(err) => return Err(err),
     };
     attached.store(true, Ordering::SeqCst);
+    let teardown = Teardown {
+        config: &config,
+        pid,
+        aborting: &aborting,
+        target_done: &target_done,
+    };
+    // A stop that raced the trap: the handle saw `attached` still false and
+    // cancelled from outside, but the wait had already returned. Abort the
+    // trapped target properly instead of arming breakpoints and stepping on.
+    if aborting.load(Ordering::SeqCst) {
+        teardown.abort(&mut session);
+        finish(&event_tx);
+        return Ok(());
+    }
     status(&format!("Target attached (pid {pid}); reading state…"));
 
     // Attached at entry: map the editor-relative breakpoint lines to body
     // lines and arm them. The body source (`pldbg_get_source`) appears verbatim
     // in the editor buffer, so its starting line locates the offset. Kept for
     // the whole session, so gutter toggles during the run map the same way.
-    let entry_body = session.get_source(oid).unwrap_or_default();
-    if !breakpoints.is_empty() {
-        let mut armed = 0usize;
-        for &row in &breakpoints {
-            let Some(body_line) = body_line_of(&editor_text, &entry_body, row) else {
-                continue;
-            };
-            if session.set_breakpoint(oid, body_line).unwrap_or(false) {
-                armed += 1;
-            }
-        }
-        // Silently arming nothing is how a "Continue" ends up running the whole
-        // routine, so say it out loud.
-        if armed == 0 {
-            let _ = event_tx.unbounded_send(DebugEvent::Error(format!(
-                "none of the {} editor breakpoint(s) could be armed — the buffer does not \
-                 contain the installed body of {} verbatim, or those lines carry no \
-                 executable statement",
-                breakpoints.len(),
-                target.fq_name
-            )));
-        }
-    }
+    let entry = Entry {
+        oid,
+        fq_name: target.fq_name,
+        editor_text,
+        body: session.get_source(oid).unwrap_or_default(),
+    };
+    arm_launch_breakpoints(&mut session, &entry, &breakpoints, &event_tx);
 
     let stopped = if stop_on_entry {
         report_top(&mut session, &event_tx)
@@ -337,19 +403,93 @@ fn controller(launch: Launch) -> Result<()> {
         return Ok(());
     }
 
-    command_loop(
-        &mut session,
-        &Entry {
-            oid,
-            editor_text,
-            body: entry_body,
-        },
-        &config,
-        pid,
-        &cmd_rx,
-        &event_tx,
-        &aborting,
-    )
+    command_loop(&mut session, &entry, &teardown, &cmd_rx, &event_tx)
+}
+
+/// Arm the breakpoints the gutter held at launch, mapped from editor rows to
+/// body lines, and say so when only some — or none — of them took.
+fn arm_launch_breakpoints(
+    session: &mut DebugSession,
+    entry: &Entry,
+    breakpoints: &[usize],
+    event_tx: &async_mpsc::UnboundedSender<DebugEvent>,
+) {
+    if breakpoints.is_empty() {
+        return;
+    }
+    let mut armed = 0usize;
+    for &row in breakpoints {
+        let Some(body_line) = body_line_of(&entry.editor_text, &entry.body, row) else {
+            continue;
+        };
+        if session
+            .set_breakpoint(entry.oid, body_line)
+            .unwrap_or(false)
+        {
+            armed += 1;
+        }
+    }
+    if armed == breakpoints.len() {
+        return;
+    }
+    // Silently arming nothing is how a "Continue" ends up running the whole
+    // routine, so say it out loud; arming some of them is worth a note.
+    let event = if armed == 0 {
+        DebugEvent::Error(format!(
+            "none of the {} editor breakpoint(s) could be armed — the buffer does not \
+             contain the installed body of {} verbatim, or those lines carry no \
+             executable statement",
+            breakpoints.len(),
+            entry.fq_name
+        ))
+    } else {
+        DebugEvent::Note(format!(
+            "{armed} of {} breakpoints armed — the others sit on lines with no \
+             executable statement, or outside the body of {}",
+            breakpoints.len(),
+            entry.fq_name
+        ))
+    };
+    let _ = event_tx.unbounded_send(event);
+}
+
+/// How long an abort waits for the target to finish before cancelling its
+/// query a second time.
+const ABORT_GRACE: Duration = Duration::from_secs(2);
+
+/// What tearing a trapped target down needs: where it runs, and the flags it
+/// shares with the target thread.
+struct Teardown<'a> {
+    config: &'a Config,
+    /// Backend pid of the trapped target.
+    pid: i32,
+    aborting: &'a AtomicBool,
+    target_done: &'a AtomicBool,
+}
+
+impl Teardown<'_> {
+    /// Abort the target (`pldbg_abort_target`) and cancel its query. A cancel
+    /// that lands between two statements is a no-op server side, so when the
+    /// target thread has not finished within [`ABORT_GRACE`] the cancel is
+    /// sent once more rather than leaving a backend trapped behind a session
+    /// the UI already considers over.
+    fn abort(&self, session: &mut DebugSession) {
+        self.aborting.store(true, Ordering::SeqCst);
+        let _ = session.abort();
+        let _ = cancel_backend(self.config, self.pid);
+        let deadline = Instant::now() + ABORT_GRACE;
+        while !self.target_done.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                debug!(
+                    pid = self.pid,
+                    "debug target still running after abort; cancelling again"
+                );
+                let _ = cancel_backend(self.config, self.pid);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 /// The routine the session was launched on, plus the two texts the controller
@@ -358,6 +498,8 @@ fn controller(launch: Launch) -> Result<()> {
 /// whichever frame the panel is inspecting.
 struct Entry {
     oid: i32,
+    /// For messages about breakpoints that could not be armed.
+    fq_name: String,
     editor_text: String,
     /// The routine's installed body, as `pldbg_get_source` returns it.
     body: String,
@@ -368,11 +510,9 @@ struct Entry {
 fn command_loop(
     session: &mut DebugSession,
     entry: &Entry,
-    config: &Config,
-    pid: i32,
+    teardown: &Teardown,
     cmd_rx: &Receiver<Command>,
     event_tx: &async_mpsc::UnboundedSender<DebugEvent>,
-    aborting: &AtomicBool,
 ) -> Result<()> {
     // Which frame the panel is inspecting. A step or continue lands in the
     // innermost frame again, and pldebugger resets its own selection with it.
@@ -383,14 +523,18 @@ fn command_loop(
             Command::StepInto => Some(session.step_into()?),
             Command::Continue => Some(session.continue_()?),
             Command::SetBreakpoint(row) => {
-                if let Some(line) = body_line_of(&entry.editor_text, &entry.body, row) {
-                    let _ = session.set_breakpoint(entry.oid, line);
-                }
+                arm_breakpoint(session, entry, row, event_tx);
                 None
             }
             Command::DropBreakpoint(row) => {
                 if let Some(line) = body_line_of(&entry.editor_text, &entry.body, row) {
                     let _ = session.drop_breakpoint(entry.oid, line);
+                } else {
+                    // Never armed, so there is nothing to drop; only worth a trace.
+                    debug!(
+                        row,
+                        "debug breakpoint row maps to no body line; nothing to drop"
+                    );
                 }
                 None
             }
@@ -409,9 +553,7 @@ fn command_loop(
                 None
             }
             Command::Stop => {
-                aborting.store(true, Ordering::SeqCst);
-                let _ = session.abort();
-                let _ = cancel_backend(config, pid);
+                teardown.abort(session);
                 finish(event_tx);
                 return Ok(());
             }
@@ -429,11 +571,47 @@ fn command_loop(
         }
     }
     // Handle dropped without an explicit Stop.
-    aborting.store(true, Ordering::SeqCst);
-    let _ = session.abort();
-    let _ = cancel_backend(config, pid);
+    teardown.abort(session);
     finish(event_tx);
     Ok(())
+}
+
+/// Arm a breakpoint toggled on in the gutter mid-run, and say so when it
+/// cannot be: a row that maps to no body line, or one pldebugger refuses,
+/// would otherwise leave a "Continue" running past a breakpoint the gutter
+/// still shows.
+fn arm_breakpoint(
+    session: &mut DebugSession,
+    entry: &Entry,
+    row: usize,
+    event_tx: &async_mpsc::UnboundedSender<DebugEvent>,
+) {
+    let note = match body_line_of(&entry.editor_text, &entry.body, row) {
+        None => {
+            debug!(row, routine = %entry.fq_name, "debug breakpoint row maps to no body line");
+            format!(
+                "Breakpoint not armed: that line is outside the body of {} as installed \
+                 (re-create the routine to debug an edited version)",
+                entry.fq_name
+            )
+        }
+        Some(line) => match session.set_breakpoint(entry.oid, line) {
+            Ok(true) => return,
+            Ok(false) => {
+                debug!(row, line, routine = %entry.fq_name, "pldebugger refused a breakpoint");
+                format!(
+                    "Breakpoint not armed: body line {line} of {} holds no executable \
+                     statement",
+                    entry.fq_name
+                )
+            }
+            Err(err) => {
+                debug!(row, line, error = %format!("{err:#}"), "arming a debug breakpoint failed");
+                format!("Breakpoint not armed: {err:#}")
+            }
+        },
+    };
+    let _ = event_tx.unbounded_send(DebugEvent::Note(note));
 }
 
 /// [`report_frame`] for the innermost frame — where every fresh stop lands.
@@ -605,6 +783,7 @@ fn invoke_target(run: &TargetRun) -> Outcome {
     // The routine's own `RAISE` output only reaches the client over this
     // connection's async-message stream; without a sink the driver drops it.
     let mut config = run.config.clone();
+    config.application_name(&target_tag(&run.control_tag));
     let notices = run.event_tx.clone();
     config.notice_callback(move |notice| {
         let _ = notices.unbounded_send(DebugEvent::Notice(crate::db::notice_line(&notice)));
@@ -666,17 +845,30 @@ fn control_tag() -> String {
     )
 }
 
+/// The `application_name` of a session's target connection, derived from its
+/// control connection's tag.
+fn target_tag(control_tag: &str) -> String {
+    format!("{control_tag}-target")
+}
+
 /// Cancel the controller's `pldbg_wait_for_target`, found by the
-/// `application_name` its connection was tagged with. Best-effort: a server
-/// that will not signal the backend just leaves the wait parked as before.
+/// `application_name` its connection was tagged with.
 fn cancel_control_wait(config: &Config, control_tag: &str) {
+    cancel_tagged(config, &[control_tag.to_string()]);
+}
+
+/// Cancel whatever the backends tagged with one of `tags` are running.
+/// Best-effort: a server that will not signal the backend just leaves the
+/// query running as before.
+fn cancel_tagged(config: &Config, tags: &[String]) {
     let Ok(mut client) = config.connect(NoTls) else {
         return;
     };
+    let tags: Vec<&str> = tags.iter().map(String::as_str).collect();
     let _ = client.execute(
         "SELECT pg_cancel_backend(pid) FROM pg_stat_activity \
-         WHERE application_name = $1 AND pid <> pg_backend_pid()",
-        &[&control_tag],
+         WHERE application_name = ANY($1) AND pid <> pg_backend_pid()",
+        &[&tags],
     );
 }
 

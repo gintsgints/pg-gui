@@ -222,6 +222,15 @@ The controller-thread + target-thread design (two pldebugger connections, `mpsc`
 - Add a timeout/graceful second `cancel_backend` on the drop path so `wait_for_target` cannot park forever.
 - `tracing` log (debug level) when a breakpoint row fails to map to a body line, so users get feedback instead of silent failure.
 
+### Status
+
+- Done; the first risk as written was already handled. A target that runs straight through sets `target_done` and cancels the controller's wait through the control connection's `application_name` tag (`cancel_control_wait`). The case that really parked was a Stop or drop that arrived *while* the controller blocked: it only reads its command channel between `pldbg_*` calls. During `pldbg_wait_for_target` (a routine stuck before its first statement, e.g. on a lock), or during a Continue running toward a breakpoint it never reaches, the queued `Stop` was never read. Now:
+  - `Session::stop`/drop (`request_stop`, idempotent) also cancels the target backend from a separate thread, tagged `<control tag>-target`, and the control backend too while nothing has attached.
+  - The controller treats a wait that ends under `aborting` as a quiet end, checks `aborting` before launching the target and again right after the trap (a stop that raced the attach aborts properly rather than arming breakpoints), and suppresses error events once a stop was requested.
+  - `Teardown::abort` (Stop and the closed-channel path) re-sends `cancel_backend` when the target has not finished within `ABORT_GRACE` (2 s).
+  - Breakpoint feedback goes beyond the planned debug log. A gutter breakpoint set mid-run whose row maps outside the installed body, or which pldebugger refuses, logs at `debug` and shows a status-bar note (new `DebugEvent::Note`). A launch where only some breakpoints armed gets the same note; none armed stays an error, as before.
+  - Not verified against a server: these paths need pldebugger, and the change has only been compiled, linted and unit-tested.
+
 ---
 
 ## Priority 7: Small UX polish (optional)

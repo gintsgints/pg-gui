@@ -281,6 +281,7 @@ impl PgGuiApp {
                 dbg.busy = false;
                 status = Some(format!("Debug error: {err}"));
             }
+            debug::DebugEvent::Note(note) => status = Some(note),
             debug::DebugEvent::Terminated => {
                 dbg.terminated = true;
                 dbg.busy = false;
