@@ -18,8 +18,6 @@ use crate::app::{BottomView, PgGuiApp};
 use crate::plan;
 
 impl PgGuiApp {
-    /// The "Prev / Next / Page x of y" bar under the results table; `None`
-    /// when everything fits on one page.
     /// A small outline button that switches the bottom panel to `view`. The
     /// icon is a text glyph, like the rest of the app's small controls.
     fn bottom_view_button(
@@ -118,9 +116,11 @@ impl PgGuiApp {
             .children(self.render_result_selector(cx))
             .child(
                 div()
+                    .relative()
                     .flex_1()
                     .min_h(px(0.))
-                    .child(DataTable::new(&self.results)),
+                    .child(DataTable::new(&self.results))
+                    .children(self.render_no_rows_hint(cx)),
             )
             .child(
                 h_flex()
@@ -139,6 +139,30 @@ impl PgGuiApp {
                         cx,
                     )),
             )
+    }
+
+    /// A muted "0 rows" line over the table body when the shown result set
+    /// has columns but no rows — otherwise a query that matched nothing looks
+    /// exactly like one whose output has not arrived. Drawn over the table
+    /// rather than in its place so the column header stays: which columns
+    /// came back is still the answer. It has no listeners, so clicks reach
+    /// the header underneath.
+    fn render_no_rows_hint(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let set = self.tabs.get(self.active_tab)?.result.selected()?;
+        if set.columns.is_empty() || !set.rows.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("0 rows — the statement returned no rows"),
+        )
     }
 
     /// Whether the Log view is scrolled to its last line — which it also is
@@ -384,6 +408,8 @@ impl PgGuiApp {
         })
     }
 
+    /// The "Prev / Next / Page x of y" bar under the results table; `None`
+    /// when everything fits on one page.
     fn render_results_pager(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let delegate = self.results.read(cx).delegate();
         let (page, page_count, total_rows) = (

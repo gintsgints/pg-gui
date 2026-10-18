@@ -238,6 +238,11 @@ The controller-thread + target-thread design (two pldebugger connections, `mpsc`
 - Empty-state overlay in the results grid when a statement returns zero rows (currently an empty table with no hint).
 - The AI completion path (`src/ai.rs`) has no visible 429/retry handling; consider retry-after if polishing this area.
 
+### Status
+
+- Done, both. The results grid draws a muted "0 rows — the statement returned no rows" over the table body (`render_no_rows_hint`) when the shown set has columns but no rows. The header stays visible, since which columns came back is still the answer. A tab with no result set at all gets no hint: after a DDL-only run the log is shown instead. Not checked on screen; it needs a database to produce an empty set.
+- `ai::complete` retries 429/529/500/502/503/504 up to `MAX_RETRIES` (2) times, waiting for `retry-after` (whole seconds) or 1 s then 2 s. A wait over `MAX_RETRY_WAIT` (8 s) fails at once with "rate limited — try again in N s" rather than holding the request; completion is interactive, so a long queue is worse than an error. The policy is the pure `retry_delay`, covered by 4 unit tests; the request is split out as `send`.
+
 ---
 
 ## Definition of done per item

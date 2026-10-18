@@ -40,6 +40,10 @@ limits what a result set holds for as long as its tab shows it; the rows still
 cross the wire, so a huge statement is better narrowed (or run alone, through
 the cursor) than capped.
 
+A statement that returns no rows still shows its column header, with a muted
+**0 rows** line over the empty table, so a query that matched nothing does not
+look like one whose output never arrived.
+
 ## Cancelling
 
 A long-running statement can be stopped with Connection ▸ Cancel Query, which

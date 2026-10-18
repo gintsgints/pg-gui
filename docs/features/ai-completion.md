@@ -29,6 +29,17 @@ other feature depends on it.
 `ai_prompt` is where schema hints or style preferences go — for example
 `"Prefer explicit JOINs and snake_case aliases."`.
 
+## Busy or rate-limited API
+
+When the API answers that it is rate limiting (429), overloaded (529) or
+briefly failing (500/502/503/504), the request is retried up to twice, waiting
+as long as its `retry-after` header asks, or 1 s and then 2 s when it gives
+none. The status bar keeps showing "AI completing…" meanwhile. A wait longer
+than 8 s is not sat out: the request fails straight away with
+`rate limited — try again in N s`, since a completion that arrives that late is
+no longer one you are waiting for at the cursor. Other errors (a bad key, an
+unknown model) are reported at once.
+
 ## What leaves the machine
 
 The buffer text around the cursor goes to the Claude API when you invoke the
