@@ -221,8 +221,19 @@ fn name_matches(name_lower: &str, words: &[&str]) -> bool {
 }
 
 /// The typed words are the snippet's leading SQL words, the last possibly
-/// partial ("create seq" matches "CREATE SEQUENCE …").
+/// partial ("create seq" matches "CREATE SEQUENCE …"). A leading
+/// `CREATE OR REPLACE` may be typed without its `OR REPLACE`, so
+/// "create view" finds the view template.
 fn sql_matches(sql_lower: &str, words: &[&str]) -> bool {
+    leading_words_match(sql_lower, words)
+        || sql_lower
+            .strip_prefix("create or replace ")
+            .is_some_and(|rest| leading_words_match(&format!("create {rest}"), words))
+}
+
+/// The typed words are the leading words of `sql_lower`, the last possibly
+/// partial.
+fn leading_words_match(sql_lower: &str, words: &[&str]) -> bool {
     let mut sql_words = sql_lower.split_whitespace();
     words.iter().enumerate().all(|(ix, word)| {
         sql_words.next().is_some_and(|sql_word| {
@@ -726,6 +737,14 @@ mod tests {
         let found = super::library_suggestions(&library, "create seq");
         assert_eq!(found[0].name.as_ref(), "New: sequence");
         assert_eq!(found[0].replace_len, "create seq".len());
+    }
+
+    #[test]
+    fn create_without_or_replace_matches() {
+        let library = test_library();
+        let found = super::library_suggestions(&library, "create view");
+        assert_eq!(found[0].name.as_ref(), "New: view");
+        assert_eq!(found[0].replace_len, "create view".len());
     }
 
     #[test]
