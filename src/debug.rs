@@ -778,7 +778,28 @@ fn render_messages(messages: &[SimpleQueryMessage]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{body_line_of, editor_line_of};
+    use postgres::Config;
+
+    use super::{body_line_of, describe_addr, editor_line_of};
+
+    fn addr(conn: &str) -> String {
+        describe_addr(&conn.parse::<Config>().expect("a valid connection string"))
+    }
+
+    #[test]
+    fn the_address_names_each_host_with_its_port() {
+        assert_eq!(addr("postgres://u@db:6543/x"), "db:6543");
+        assert_eq!(addr("host=a,b port=1,2"), "a:1, b:2");
+        // One port applies to every host.
+        assert_eq!(addr("host=a,b port=7"), "a:7, b:7");
+        // No port given: the host alone, not a made-up default.
+        assert_eq!(addr("host=db"), "db");
+    }
+
+    #[test]
+    fn an_address_without_a_host_is_described_generically() {
+        assert_eq!(addr("dbname=x"), "the database");
+    }
 
     /// `pldbg_get_source` returns the body starting right after the opening
     /// `$function$`, so its body line 1 is the line carrying that delimiter —

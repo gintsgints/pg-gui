@@ -179,6 +179,15 @@ Current test coverage: unit tests in `app.rs` (find_sql_file ranking, etc.) and 
 
 For parser-heavy tests follow the existing `tests::on_worker_stack` pattern (64 MiB stack, same as the document worker) because `libpg_query`/`prost` decoding can overflow the default 2 MiB.
 
+### Status
+
+- Done, against a stale premise: by now every module the plan lists already had unit tests — `plan` covers `Unit::Nodes`, `statement` the body-line offset, `debug` the `body_line_of` mapping, `file_tree` dot-entry skipping, the budget cap, projection and `signature`, `lsp` `completion_detail` and the `Disabled` schema status. The pass therefore filled the gaps that were left (16 tests, all docker-free):
+  - `db`: `describe` appends a connection error's cause chain; `test_connection` rejects unreachable and unparseable strings; `quote_literal`/`quote_ident`, `is_true`, `log_line`.
+  - `lsp`: `build_configuration` (host/port/user/password/database taken from the URL, database defaulting to the user, an unparseable string disabling the connection, casing mapped onto the formatter) and `is_trigger`.
+  - `debug`: `describe_addr` (per-host ports, one shared port, no port, no host).
+  - `plan`: node labels (join type, parallel, CTE, function scan), a `Gather` child wider than its parent left unclamped, several roots, `Unit::format`, header elision.
+- Still uncovered, because each needs a server: `collect_outcome` (its `SimpleQueryMessage` input has no public constructor; the docker tests exercise it through `Session::run`), `probe_schema`'s Loading/Loaded/Offline inference (needs a live `Workspace`), and `debug::render_messages`.
+
 ---
 
 ## Priority 5: Standardize error handling

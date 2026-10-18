@@ -390,4 +390,89 @@ mod tests {
         assert!(parse("not json", false, "").is_err());
         assert!(parse("[]", false, "").is_err());
     }
+
+    /// A node's label as `label` builds it from one JSON object.
+    fn label_of(json: &str) -> String {
+        label(&serde_json::from_str(json).expect("a JSON object"))
+    }
+
+    #[test]
+    fn labels_read_like_explain_text_output() {
+        assert_eq!(
+            label_of(r#"{"Node Type": "Hash Join", "Join Type": "Left"}"#),
+            "Hash Join (Left)"
+        );
+        assert_eq!(
+            label_of(r#"{"Node Type": "Seq Scan", "Parallel Aware": true, "Relation Name": "t"}"#),
+            "Parallel Seq Scan on t"
+        );
+        assert_eq!(
+            label_of(r#"{"Node Type": "CTE Scan", "CTE Name": "recent", "Alias": "r"}"#),
+            "CTE Scan on recent"
+        );
+        assert_eq!(
+            label_of(r#"{"Node Type": "Function Scan", "Function Name": "generate_series"}"#),
+            "Function Scan on generate_series"
+        );
+        assert_eq!(label_of("{}"), "?");
+    }
+
+    /// Parallel workers' time is summed per loop, so a `Gather`'s child can
+    /// be wider than the `Gather` itself. That is drawn as is, never clamped.
+    #[test]
+    fn a_gathered_child_may_outgrow_its_parent() {
+        let json = r#"[
+          {
+            "Plan": {
+              "Node Type": "Gather",
+              "Actual Total Time": 10.0,
+              "Actual Loops": 1,
+              "Plans": [
+                {
+                  "Node Type": "Seq Scan",
+                  "Parallel Aware": true,
+                  "Relation Name": "big",
+                  "Actual Total Time": 9.0,
+                  "Actual Loops": 3
+                }
+              ]
+            }
+          }
+        ]"#;
+        let plan = parse(json, true, "select * from big").unwrap();
+        let gather = &plan.roots[0];
+        assert!((gather.value - 10.0).abs() < f64::EPSILON);
+        assert!((gather.children[0].value - 27.0).abs() < f64::EPSILON);
+        assert_eq!(gather.children[0].label, "Parallel Seq Scan on big");
+    }
+
+    #[test]
+    fn every_entry_of_the_document_is_a_root() {
+        let json = r#"[
+          {"Plan": {"Node Type": "Result", "Total Cost": 1.0}},
+          {"Plan": {"Node Type": "Result", "Total Cost": 2.0}}
+        ]"#;
+        let plan = parse(json, false, "select 1; select 2").unwrap();
+        assert_eq!(plan.roots.len(), 2);
+        assert_eq!(plan.nodes, 2);
+        assert_eq!(plan.depth, 1);
+        assert_eq!(plan.summary, "total cost 3.00");
+    }
+
+    #[test]
+    fn measures_are_formatted_per_unit() {
+        assert_eq!(Unit::Cost.format(12.345), "cost 12.35");
+        assert_eq!(Unit::Millis.format(0.1234), "0.123 ms");
+        assert_eq!(Unit::Millis.format(12.345), "12.35 ms");
+        assert_eq!(Unit::Nodes.format(3.0), "3 node(s)");
+    }
+
+    #[test]
+    fn the_header_statement_is_one_line_and_elided() {
+        assert_eq!(one_line("select *\n  from t"), "select * from t");
+        let long = "x ".repeat(HEADER_SQL_LEN);
+        let shown = one_line(&long);
+        assert_eq!(shown.chars().count(), HEADER_SQL_LEN + 1);
+        assert!(shown.ends_with('…'));
+    }
 }

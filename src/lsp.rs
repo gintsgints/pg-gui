@@ -1230,9 +1230,9 @@ mod tests {
     use lsp_types::CompletionItem;
 
     use super::{
-        CaseStyle, Client, CompletionOutcome, DocEvent, PgCompletionItemKind, SchemaStatus,
-        SchemaStatusReceiver, WORKER_STACK, clamp_filter_text, completion_detail, contain_panic,
-        cursor_context, to_text_size,
+        CaseStyle, Client, CompletionOutcome, DocEvent, KeywordCase, PgCompletionItemKind,
+        SchemaStatus, SchemaStatusReceiver, WORKER_STACK, build_configuration, clamp_filter_text,
+        completion_detail, contain_panic, cursor_context, is_trigger, to_text_size,
     };
     use pgls_workspace::features::completions::GetCompletionsParams;
     use pgls_workspace::features::on_hover::OnHoverParams;
@@ -1280,6 +1280,74 @@ mod tests {
             filter_text: filter_text.map(ToString::to_string),
             ..CompletionItem::default()
         }
+    }
+
+    /// The workspace's database settings are taken apart from the
+    /// connection string. Port 1 keeps the search-path lookup from reaching
+    /// anything, so no typecheck search path is configured.
+    #[test]
+    fn configuration_decomposes_the_connection_string() {
+        let config = build_configuration(
+            "postgres://alice:secret@127.0.0.1:1/shop",
+            CaseStyle::Upper,
+            CaseStyle::Lower,
+        );
+        let db = config.db.expect("database settings");
+        assert_eq!(db.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(db.port, Some(1));
+        assert_eq!(db.username.as_deref(), Some("alice"));
+        assert_eq!(db.password.as_deref(), Some("secret"));
+        assert_eq!(db.database.as_deref(), Some("shop"));
+        assert_eq!(db.disable_connection, Some(false));
+        assert!(
+            config
+                .typecheck
+                .and_then(|typecheck| typecheck.search_path)
+                .is_none()
+        );
+        let format = config.format.expect("format settings");
+        assert!(matches!(format.keyword_case, Some(KeywordCase::Upper)));
+        assert!(matches!(format.constant_case, Some(KeywordCase::Lower)));
+    }
+
+    #[test]
+    fn the_database_defaults_to_the_user_name() {
+        let config = build_configuration(
+            "postgres://bob@127.0.0.1:1",
+            CaseStyle::Lower,
+            CaseStyle::Lower,
+        );
+        let db = config.db.expect("database settings");
+        assert_eq!(db.database.as_deref(), Some("bob"));
+        assert_eq!(db.password.as_deref(), Some(""));
+    }
+
+    /// A string the driver cannot parse disables the connection rather than
+    /// failing: the workspace still parses and lints without one.
+    #[test]
+    fn an_unparseable_connection_string_disables_the_connection() {
+        let config = build_configuration(
+            "not a connection string",
+            CaseStyle::Lower,
+            CaseStyle::Lower,
+        );
+        let db = config.db.expect("database settings");
+        assert_eq!(db.disable_connection, Some(true));
+        assert_eq!(db.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(db.port, Some(5432));
+    }
+
+    #[test]
+    fn word_and_trigger_characters_open_completions() {
+        for text in ["s", "_", ".", "\"", "(", " ", "é"] {
+            assert!(is_trigger(text), "{text:?}");
+        }
+        for text in ["", ";", ")", ",", "\n"] {
+            assert!(!is_trigger(text), "{text:?}");
+        }
+        // Only the last character counts, as with a paste.
+        assert!(is_trigger("; s"));
+        assert!(!is_trigger("select;"));
     }
 
     #[test]

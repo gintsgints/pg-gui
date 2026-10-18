@@ -1440,9 +1440,12 @@ pub fn export_inserts(conn_str: &str, sql: &str, path: &Path) -> Result<usize, S
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
-        LOG_SQL_LEN, ResultSet, RowLimits, RunEvent, Session, export_csv, export_inserts, one_line,
-        search_path, statement_ranges,
+        LOG_SQL_LEN, ResultSet, RowLimits, RunEvent, Session, connect, describe, export_csv,
+        export_inserts, is_true, log_line, one_line, quote_ident, quote_literal, search_path,
+        statement_ranges, test_connection,
     };
 
     const CONN: &str = "postgres://pgui:pgui@localhost:5433/pgui_test";
@@ -1729,6 +1732,53 @@ mod tests {
     #[test]
     fn search_path_is_none_when_unreachable() {
         assert!(search_path("postgres://nobody:nope@127.0.0.1:1/none").is_none());
+    }
+
+    /// Nothing listens on port 1, so a connection there is refused at once.
+    const UNREACHABLE: &str = "postgres://nobody:nope@127.0.0.1:1/none";
+
+    #[test]
+    fn a_connection_error_is_described_down_to_its_cause() {
+        let Err(error) = connect(UNREACHABLE) else {
+            panic!("nothing should be listening on port 1");
+        };
+        let shown = error.to_string();
+        let described = describe(&error);
+        // `Display` alone stops at "error connecting to server"; the cause
+        // (the refused socket) is appended after it.
+        assert!(described.starts_with(&shown), "{described}");
+        assert!(described.len() > shown.len(), "{described}");
+        assert!(described[shown.len()..].starts_with(": "), "{described}");
+    }
+
+    #[test]
+    fn test_connection_reports_unreachable_and_unparseable_servers() {
+        assert!(test_connection(UNREACHABLE).is_err());
+        assert!(test_connection("not a connection string").is_err());
+    }
+
+    #[test]
+    fn quoting_doubles_the_quote_character() {
+        assert_eq!(quote_literal("O'Brien"), "'O''Brien'");
+        assert_eq!(quote_literal(""), "''");
+        assert_eq!(quote_ident("Mixed Case"), "\"Mixed Case\"");
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn only_t_is_true() {
+        assert!(is_true(Some("t")));
+        assert!(!is_true(Some("f")));
+        assert!(!is_true(Some("true")));
+        assert!(!is_true(None));
+    }
+
+    #[test]
+    fn log_line_numbers_the_statement_and_times_it() {
+        assert_eq!(
+            log_line(2, "SELECT\n  1", "ok (1 rows)", Duration::from_millis(12)),
+            "2. SELECT 1 — ok (1 rows) in 12ms"
+        );
     }
 
     #[test]
