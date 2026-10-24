@@ -10,7 +10,7 @@
 
 use serde_json::Value;
 
-use crate::harness::{App, Key, Mod};
+use crate::harness::{App, Field, Key, Mod};
 
 const FIRST_URL: &str = "postgres://e2e@127.0.0.1:1/first";
 const SECOND_URL: &str = "postgres://e2e@127.0.0.1:1/second";
@@ -119,7 +119,15 @@ fn new_connection_dialog_creates_and_switches() {
     });
 
     app.click_menu("Connection", "New Connection…");
-    app.fill_connection_dialog("second", SECOND_URL);
+    app.fill_connection_dialog(
+        "second",
+        &[
+            (Field::Host, "127.0.0.1"),
+            (Field::Port, "1"),
+            (Field::Database, "second"),
+            (Field::Username, "e2e"),
+        ],
+    );
 
     // The new connection is saved, selected, and starts on a blank tab;
     // first's script waits in the park.
@@ -141,28 +149,58 @@ fn new_connection_dialog_creates_and_switches() {
     app.quit();
 }
 
-/// The schema travels in the URL's `options`: a connection string typed in
-/// the `--search_path` form is parsed into the dialog's Schema field and
-/// saved back from the fields in the `-c search_path=` form, next to the
-/// query parameters the dialog has no field for.
+/// The schema travels in the URL's `options`: a connection string in the
+/// `--search_path` form is parsed into the dialog's Schema field and saved
+/// back from the fields in the `-c search_path=` form, next to the query
+/// parameters the dialog has no field for.
 #[test]
-fn new_connection_dialog_keeps_schema() {
-    const TYPED: &str =
+fn edit_connection_dialog_keeps_schema() {
+    const SEEDED: &str =
         "postgres://e2e@127.0.0.1:1/third?sslmode=disable&options=--search_path%3Dapp";
     const SAVED: &str =
         "postgres://e2e@127.0.0.1:1/third?options=-c%20search_path%3Dapp&sslmode=disable";
+    let mut app = App::launch_prepared(|_, seed| {
+        seed["connection_string"] = Value::from(SEEDED);
+        seed["recent_connections"] = serde_json::json!([{ "name": "third", "url": SEEDED }]);
+    });
+
+    app.click_menu("Connection", "Edit Connection…");
+    app.fill_connection_dialog("third", &[]);
+
+    app.wait_for_config("the connection re-saved from the fields", |c| {
+        c["connection_string"] == SAVED
+    });
+    assert_eq!(recent_names(&app.config()), ["third"]);
+
+    app.quit();
+}
+
+/// Every field reaches the saved connection string: the password
+/// percent-encoded, the schema as a `search_path` option.
+#[test]
+fn new_connection_dialog_builds_url_from_fields() {
+    const SAVED: &str = "postgres://e2e:s%40cret@127.0.0.1:1/fourth?options=-c%20search_path%3Dapp";
     let mut app = App::launch_prepared(|_, seed| {
         seed["connection_string"] = Value::from(FIRST_URL);
         seed["recent_connections"] = serde_json::json!([{ "name": "first", "url": FIRST_URL }]);
     });
 
     app.click_menu("Connection", "New Connection…");
-    app.fill_connection_dialog("third", TYPED);
+    app.fill_connection_dialog(
+        "fourth",
+        &[
+            (Field::Host, "127.0.0.1"),
+            (Field::Port, "1"),
+            (Field::Database, "fourth"),
+            (Field::Schema, "app"),
+            (Field::Username, "e2e"),
+            (Field::Password, "s@cret"),
+        ],
+    );
 
-    let config = app.wait_for_config("the schema connection selected", |c| {
-        recent_names(c) == ["third", "first"]
+    app.wait_for_config("the new connection selected", |c| {
+        c["connection_string"] == SAVED
     });
-    assert_eq!(config["connection_string"], SAVED);
 
     app.quit();
 }

@@ -100,15 +100,18 @@ so switching parks them in `config.json`'s `parked_tabs` under the outgoing
 connection's name and brings back the incoming one's; the scenarios check
 both lists. Connection ▸ Recent is a native submenu, clicked with
 `click_submenu`. The New Connection dialog's fields have no tab order, so
-`fill_connection_dialog` clicks the Name and Connection string fields and the
-Connect button at offsets measured from a capture (`ConnectionDialog` in
+`fill_connection_dialog` clicks the Name field, each connection field it is
+given (`harness::Field`; the connection string under them is a read-only
+preview) and the Connect button at offsets measured from a capture (`ConnectionDialog` in
 `harness.rs`): from the window's centre horizontally, and from the dialog's
 top edge, which gpui-component puts a tenth of the window's height down.
 
 | Test | What it checks |
 |---|---|
 | `recent_menu_switches_untitled_tabs` | With an untitled and a file tab on `first`, Recent ▸ `second` parks the untitled tab and keeps the file tab; a tab typed on `second` is parked when switching back, `first`'s returns to its old slot, and switching again restores `second`'s. |
-| `new_connection_dialog_creates_and_switches` | New Connection… with a name and connection string saves and selects it on a blank tab, parking `first`'s script; Recent ▸ `first` brings the script back. |
+| `new_connection_dialog_creates_and_switches` | New Connection… with a name, host, port, database and user saves and selects it on a blank tab, parking `first`'s script; Recent ▸ `first` brings the script back. |
+| `new_connection_dialog_builds_url_from_fields` | Every field reaches the saved URL: the password percent-encoded (`s%40cret`), the schema as `options=-c search_path=app`. |
+| `edit_connection_dialog_keeps_schema` | Edit Connection… on a URL carrying `--search_path` and `sslmode` re-saves it from the fields in the `-c search_path=` form, `sslmode` kept. |
 
 ### `editor`: the SQL editor
 
@@ -576,7 +579,7 @@ Harness API:
 | `click_submenu(menu, submenu, item)`, `submenu_items(menu, submenu)`, `submenu_checked(menu, submenu, item)` | Click, list or check an item in a submenu (Connection ▸ Recent, View ▸ Theme); items match with or without their check mark. |
 | `brightness_at(x, y)` | Captures the window and returns the brightness (0 black, 1 white) of the pixel at that point, through `NSBitmapImageRep` in JXA — what GPUI actually painted. |
 | `status_bar_text()` | Reads the status bar with the Vision framework's text recognition; match on distinctive words. |
-| `fill_connection_dialog(name, url)` | In the open New Connection dialog, types the name and connection string and presses Connect. |
+| `fill_connection_dialog(name, &[(Field, &str)])` | In the open New / Edit Connection dialog, types the name and the given fields and presses Connect. |
 | `menu_checked(menu, item)` | Returns whether the item carries a check mark. |
 | `menu_bar()`, `menu_items(menu)`, `window_titles()` | Return the titles shown by the native UI. |
 | `config()` | Returns the `config.json` the app last wrote, as `serde_json::Value`. |

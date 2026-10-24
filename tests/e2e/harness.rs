@@ -1064,12 +1064,12 @@ impl App {
         out.parse().expect("brightness number")
     }
 
-    /// Fill the connection dialog (Connection ▸ New Connection…, already
-    /// opened) with `name` and the connection string `url`, then press its
-    /// Connect button. The dialog's fields have no tab order, so each is
-    /// clicked at its offset ([`ConnectionDialog`]) and typed into; the
-    /// connection string drives the host, port, database and user fields.
-    pub fn fill_connection_dialog(&mut self, name: &str, url: &str) {
+    /// Fill the already-open connection dialog (New or Edit Connection…)
+    /// with `name` and each `(field, value)` — a field not listed keeps what
+    /// the dialog was seeded with — then press its Connect button. The
+    /// dialog's fields have no tab order, so each is clicked at its offset
+    /// ([`ConnectionDialog`]) and typed into.
+    pub fn fill_connection_dialog(&mut self, name: &str, fields: &[(Field, &str)]) {
         // Nothing outside the window reports the dialog opening; it shows on
         // the frame after the menu action, so give it a moment rather than
         // clicking through to the editor below.
@@ -1077,9 +1077,11 @@ impl App {
         self.click_connection_dialog(ConnectionDialog::Name);
         self.send_keys(&[Mod::Cmd], 'a');
         self.type_text(name);
-        self.click_connection_dialog(ConnectionDialog::ConnectionString);
-        self.send_keys(&[Mod::Cmd], 'a');
-        self.type_text(url);
+        for (field, value) in fields {
+            self.click_connection_dialog(ConnectionDialog::Field(*field));
+            self.send_keys(&[Mod::Cmd], 'a');
+            self.type_text(value);
+        }
         self.click_connection_dialog(ConnectionDialog::Connect);
     }
 
@@ -1365,8 +1367,21 @@ const EDITOR_CHAR_WIDTH: f64 = 7.8;
 #[derive(Clone, Copy)]
 enum ConnectionDialog {
     Name,
-    ConnectionString,
+    Field(Field),
     Connect,
+}
+
+/// A connection field of the New / Edit Connection dialog, for
+/// [`App::fill_connection_dialog`]. The connection string under them is a
+/// read-only preview, so a connection is entered field by field.
+#[derive(Clone, Copy)]
+pub enum Field {
+    Host,
+    Port,
+    Database,
+    Schema,
+    Username,
+    Password,
 }
 
 impl ConnectionDialog {
@@ -1376,7 +1391,12 @@ impl ConnectionDialog {
     fn offset(self) -> (f64, f64) {
         match self {
             ConnectionDialog::Name => (0., 87.),
-            ConnectionDialog::ConnectionString => (0., 459.),
+            ConnectionDialog::Field(Field::Host) => (-66., 161.),
+            ConnectionDialog::Field(Field::Port) => (183., 161.),
+            ConnectionDialog::Field(Field::Database) => (-125., 236.),
+            ConnectionDialog::Field(Field::Schema) => (124., 236.),
+            ConnectionDialog::Field(Field::Username) => (0., 310.),
+            ConnectionDialog::Field(Field::Password) => (0., 385.),
             ConnectionDialog::Connect => (202., 523.),
         }
     }
