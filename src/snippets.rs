@@ -1,5 +1,6 @@
 //! The snippet library: curated queries compiled into the app plus the
-//! user's own `.sql` files, presented in a searchable picker.
+//! user's own `.sql` files, listed by the cmd-p palette's `>` mode
+//! (see `palette`).
 //!
 //! User snippets live as individual files in the config directory
 //! (`~/Library/Application Support/pg-gui/snippets/*.sql` on macOS); the
@@ -18,7 +19,7 @@
 //! selected so typing overwrites it. User `.sql` snippet files can use the
 //! same markers.
 //!
-//! Besides the cmd-p picker, snippets surface in the editor's completion
+//! Besides the palette, snippets surface in the editor's completion
 //! menu: typing words of a snippet's name or the leading words of its SQL
 //! suggests it (see [`suggestions`]).
 
@@ -27,20 +28,13 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use gpui::{
-    App, Context, IntoElement, ParentElement as _, SharedString, Styled as _, Task, Window, div,
-};
-use gpui_component::{
-    ActiveTheme as _, IndexPath, h_flex,
-    list::{ListDelegate, ListItem, ListState},
-    v_flex,
-};
+use gpui::SharedString;
 
 pub struct Snippet {
     pub name: SharedString,
     pub sql: SharedString,
     /// First meaningful SQL line, shown dimmed under the name in the picker.
-    preview: SharedString,
+    pub preview: SharedString,
 }
 
 impl Snippet {
@@ -310,152 +304,6 @@ pub fn load() -> Library {
     builtin.sort_by(|a, b| a.name.cmp(&b.name));
 
     Library { user, builtin }
-}
-
-/// Called with the chosen snippet when the user confirms a picker entry.
-type OnPick = Box<dyn Fn(&Snippet, &mut Window, &mut App)>;
-
-/// List delegate for the snippet picker: user snippets first, then
-/// built-ins, filtered by name as the user types. Empty sections are
-/// dropped entirely — the virtual list measures row height from the item
-/// at (0, 0), so that index must always be occupied while anything is
-/// listed.
-pub struct PickerDelegate {
-    sections: Vec<(SharedString, Vec<Rc<Snippet>>)>,
-    filtered: Vec<(SharedString, Vec<Rc<Snippet>>)>,
-    selected: Option<IndexPath>,
-    on_pick: OnPick,
-}
-
-impl PickerDelegate {
-    pub fn new(
-        library: Library,
-        on_pick: impl Fn(&Snippet, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        let sections = vec![
-            ("Your snippets".into(), library.user),
-            ("Built-in".into(), library.builtin),
-        ];
-        let mut this = Self {
-            sections,
-            filtered: Vec::new(),
-            selected: None,
-            on_pick: Box::new(on_pick),
-        };
-        this.filter("");
-        this
-    }
-
-    fn filter(&mut self, query: &str) {
-        // Every whitespace-separated word must appear in the name, so
-        // "new table" finds "New: table" despite the colon.
-        let query = query.to_lowercase();
-        let words: Vec<&str> = query.split_whitespace().collect();
-        self.filtered = self
-            .sections
-            .iter()
-            .map(|(label, snippets)| {
-                let matched = snippets
-                    .iter()
-                    .filter(|snippet| {
-                        let name = snippet.name.to_lowercase();
-                        words.iter().all(|word| name.contains(word))
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                (label.clone(), matched)
-            })
-            .filter(|(_, matched)| !matched.is_empty())
-            .collect();
-        self.selected = if self.filtered.is_empty() {
-            None
-        } else {
-            Some(IndexPath::default())
-        };
-    }
-
-    fn snippet(&self, ix: IndexPath) -> Option<&Rc<Snippet>> {
-        self.filtered.get(ix.section)?.1.get(ix.row)
-    }
-}
-
-impl ListDelegate for PickerDelegate {
-    type Item = ListItem;
-
-    fn sections_count(&self, _: &App) -> usize {
-        self.filtered.len()
-    }
-
-    fn items_count(&self, section: usize, _: &App) -> usize {
-        self.filtered
-            .get(section)
-            .map_or(0, |(_, matched)| matched.len())
-    }
-
-    fn perform_search(
-        &mut self,
-        query: &str,
-        _: &mut Window,
-        _: &mut Context<ListState<Self>>,
-    ) -> Task<()> {
-        self.filter(query);
-        Task::ready(())
-    }
-
-    fn render_section_header(
-        &mut self,
-        section: usize,
-        _: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) -> Option<impl IntoElement> {
-        let (label, _) = self.filtered.get(section)?;
-        Some(
-            h_flex()
-                .px_3()
-                .py_1()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(label.clone()),
-        )
-    }
-
-    fn render_item(
-        &mut self,
-        ix: IndexPath,
-        _: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) -> Option<Self::Item> {
-        let snippet = self.snippet(ix)?;
-        let preview = div()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .child(snippet.preview.clone());
-        Some(
-            ListItem::new(ix).selected(self.selected == Some(ix)).child(
-                v_flex()
-                    .py_1()
-                    .child(div().text_sm().child(snippet.name.clone()))
-                    .child(preview),
-            ),
-        )
-    }
-
-    fn set_selected_index(
-        &mut self,
-        ix: Option<IndexPath>,
-        _: &mut Window,
-        _: &mut Context<ListState<Self>>,
-    ) {
-        self.selected = ix;
-    }
-
-    fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<ListState<Self>>) {
-        if let Some(snippet) = self.selected.and_then(|ix| self.snippet(ix)).cloned() {
-            (self.on_pick)(&snippet, window, cx);
-        }
-    }
 }
 
 /// Curated queries shipped with the app. Category-prefixed names make the

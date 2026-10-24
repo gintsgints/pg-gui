@@ -1112,9 +1112,34 @@ impl App {
         self.press(&[], Key::Return);
     }
 
-    /// Insert a snippet through the Edit ▸ Snippets picker (cmd-p): its
-    /// search box starts focused, `filter` narrows the list, and Enter
-    /// inserts the first match at the cursor.
+    /// Open the cmd-p palette, type `query` (its first character picks the
+    /// mode: `>` snippets, `:` commands, anything else files), move `skip`
+    /// rows down and confirm with Enter. The search box starts focused.
+    pub fn palette(&mut self, query: &str, skip: u32) {
+        self.send_keys(&[Mod::Cmd], 'p');
+        // As in `fill_connection_dialog`: nothing outside the window says
+        // when the palette has drawn, nor when the query has applied.
+        std::thread::sleep(DIALOG_SETTLE);
+        self.type_text(query);
+        std::thread::sleep(DIALOG_SETTLE);
+        for _ in 0..skip {
+            self.press(&[], Key::Down);
+        }
+        self.press(&[], Key::Return);
+    }
+
+    /// Open the palette in its commands mode with cmd-shift-p, which types
+    /// the `:` itself, then run the first command matching `query`.
+    pub fn command_palette(&mut self, query: &str) {
+        self.send_keys(&[Mod::Cmd, Mod::Shift], 'p');
+        std::thread::sleep(DIALOG_SETTLE);
+        self.type_text(query);
+        std::thread::sleep(DIALOG_SETTLE);
+        self.press(&[], Key::Return);
+    }
+
+    /// Insert a snippet through the palette's `>` mode: `filter` narrows
+    /// the list and Enter inserts the first match at the cursor.
     pub fn pick_snippet(&mut self, filter: &str) {
         self.pick_snippet_nth(filter, 0);
     }
@@ -1123,16 +1148,7 @@ impl App {
     /// first (matches are listed by name), for a snippet whose every word
     /// another one's name also has.
     pub fn pick_snippet_nth(&mut self, filter: &str, skip: u32) {
-        self.send_keys(&[Mod::Cmd], 'p');
-        // As in `fill_connection_dialog`: nothing outside the window says
-        // when the picker has drawn, nor when the filter has applied.
-        std::thread::sleep(DIALOG_SETTLE);
-        self.type_text(filter);
-        std::thread::sleep(DIALOG_SETTLE);
-        for _ in 0..skip {
-            self.press(&[], Key::Down);
-        }
-        self.press(&[], Key::Return);
+        self.palette(&format!(">{filter}"), skip);
     }
 
     /// Click the breakpoint dot of editor line `row` (0 = first buffer

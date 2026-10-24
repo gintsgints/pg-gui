@@ -11,7 +11,7 @@
 //! ```
 //!
 //! One module per kind of scenario. `general`, `connections`, `editor`,
-//! `files_panel` and `format` need no database, nor do all but the last of
+//! `files_panel`, `format` and `palette` need no database, nor do all but the last of
 //! `snippets`, `results`' failed-run log scenario, the snippet one of
 //! `completion`, the first four of `status_bar` and all but the last of
 //! `editor_syntax`'s. The rest of `completion`, `query`, `db_viewer`,
@@ -42,6 +42,7 @@ mod files_panel;
 mod format;
 mod general;
 mod hover;
+mod palette;
 mod query;
 mod results;
 mod snippets;

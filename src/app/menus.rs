@@ -13,11 +13,11 @@ use crate::app::{PgGuiApp, mask_credentials};
 use crate::{
     AiComplete, CancelQuery, CloseTab, Commit, Connect, DebugContinue, DebugStepInto,
     DebugStepOver, DebugStop, EditConnection, ExplainAnalyze, ExplainPlan, ExportCsv,
-    ExportInserts, FormatScript, NewConnection, NewFile, NextDiagnostic, NextTab, OpenConfig,
-    OpenFile, OpenFolder, OpenGitHub, OpenRecentFolder, OpenSnippets, PrevDiagnostic, PrevTab,
-    Quit, RefreshDbTree, Rollback, RunQuery, RunScripts, SaveFile, SetTheme, ShowHelp, StartDebug,
-    ToggleAutocommit, ToggleComment, ToggleDbPanel, ToggleFilesPanel, ToggleFormatOnSave,
-    ToggleResultsPanel, ZoomIn, ZoomOut, ZoomReset, config,
+    ExportInserts, FormatScript, NewConnection, NewFile, NextDiagnostic, NextTab, OpenCommands,
+    OpenConfig, OpenFile, OpenFolder, OpenGitHub, OpenPalette, OpenRecentFolder, OpenSnippets,
+    PrevDiagnostic, PrevTab, Quit, RefreshDbTree, Rollback, RunQuery, RunScripts, SaveFile,
+    SetTheme, ShowHelp, StartDebug, ToggleAutocommit, ToggleComment, ToggleDbPanel,
+    ToggleFilesPanel, ToggleFormatOnSave, ToggleResultsPanel, ZoomIn, ZoomOut, ZoomReset, config,
 };
 
 /// Menu label for a recent folder: the path with the home directory
@@ -124,6 +124,37 @@ fn recent_folders_menu(recent_folders: &[PathBuf]) -> MenuItem {
     })
 }
 
+/// The View menu: the command palette, panel toggles, zoom and the theme
+/// submenu, its `theme` entry check-marked.
+fn view_menu(theme: config::ThemeSelection) -> Menu {
+    Menu {
+        name: "View".into(),
+        disabled: false,
+        items: vec![
+            MenuItem::action("Command Palette…", OpenCommands),
+            MenuItem::separator(),
+            MenuItem::action("Toggle Database Browser", ToggleDbPanel),
+            MenuItem::action("Toggle Files Panel", ToggleFilesPanel),
+            MenuItem::action("Toggle Results Panel", ToggleResultsPanel),
+            MenuItem::action("Refresh Database Browser", RefreshDbTree),
+            MenuItem::separator(),
+            MenuItem::action("Zoom In", ZoomIn),
+            MenuItem::action("Zoom Out", ZoomOut),
+            MenuItem::action("Actual Size", ZoomReset),
+            MenuItem::separator(),
+            MenuItem::submenu(Menu {
+                name: "Theme".into(),
+                disabled: false,
+                items: vec![
+                    theme_menu_item(config::ThemeSelection::Light, theme),
+                    theme_menu_item(config::ThemeSelection::Dark, theme),
+                    theme_menu_item(config::ThemeSelection::System, theme),
+                ],
+            }),
+        ],
+    }
+}
+
 fn build_menus(
     recents: &[config::RecentConnection],
     recent_folders: &[PathBuf],
@@ -146,6 +177,7 @@ fn build_menus(
             disabled: false,
             items: vec![
                 MenuItem::action("Open…", OpenFile),
+                MenuItem::action("Go to File…", OpenPalette),
                 MenuItem::action("Open Folder…", OpenFolder),
                 recent_folders_menu(recent_folders),
                 MenuItem::action("Save", SaveFile),
@@ -197,30 +229,7 @@ fn build_menus(
                 MenuItem::action("Stop", DebugStop),
             ],
         },
-        Menu {
-            name: "View".into(),
-            disabled: false,
-            items: vec![
-                MenuItem::action("Toggle Database Browser", ToggleDbPanel),
-                MenuItem::action("Toggle Files Panel", ToggleFilesPanel),
-                MenuItem::action("Toggle Results Panel", ToggleResultsPanel),
-                MenuItem::action("Refresh Database Browser", RefreshDbTree),
-                MenuItem::separator(),
-                MenuItem::action("Zoom In", ZoomIn),
-                MenuItem::action("Zoom Out", ZoomOut),
-                MenuItem::action("Actual Size", ZoomReset),
-                MenuItem::separator(),
-                MenuItem::submenu(Menu {
-                    name: "Theme".into(),
-                    disabled: false,
-                    items: vec![
-                        theme_menu_item(config::ThemeSelection::Light, theme),
-                        theme_menu_item(config::ThemeSelection::Dark, theme),
-                        theme_menu_item(config::ThemeSelection::System, theme),
-                    ],
-                }),
-            ],
-        },
+        view_menu(theme),
         Menu {
             name: "About".into(),
             disabled: false,

@@ -1,4 +1,4 @@
-//! Editor commands: snippets and their tab stops, format, comment toggling,
+//! Editor commands: the cmd-p palette, snippets and their tab stops, format, comment toggling,
 //! problem navigation and AI completion.
 
 use gpui::{
@@ -14,32 +14,69 @@ use gpui_component::{
 
 use crate::app::{PgGuiApp, diagnostic_target, toggle_line_comments};
 use crate::{
-    AiComplete, FormatScript, NextDiagnostic, OpenSnippets, PrevDiagnostic, ToggleComment,
-    ToggleFormatOnSave, ai, snippets,
+    AiComplete, FormatScript, NextDiagnostic, OpenCommands, OpenPalette, OpenSnippets,
+    PrevDiagnostic, ToggleComment, ToggleFormatOnSave, ai, palette, snippets,
 };
 
 impl PgGuiApp {
-    /// Open the searchable snippet picker; the confirmed snippet is
-    /// inserted into the editor at the cursor.
-    // &mut self is imposed by the action listener signature.
-    #[allow(clippy::unused_self)]
-    pub(in crate::app) fn open_snippet_picker(
+    /// cmd-p: the palette in its files mode.
+    pub(in crate::app) fn open_palette(
+        &mut self,
+        _: &OpenPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_palette("", window, cx);
+    }
+
+    /// Edit ▸ Snippets: the palette already in its `>` snippets mode.
+    pub(in crate::app) fn open_snippet_palette(
         &mut self,
         _: &OpenSnippets,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_palette(palette::SNIPPETS_PREFIX, window, cx);
+    }
+
+    /// cmd-shift-p: the palette already in its `:` commands mode.
+    pub(in crate::app) fn open_command_palette(
+        &mut self,
+        _: &OpenCommands,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_palette(palette::COMMANDS_PREFIX, window, cx);
+    }
+
+    /// Open the palette with `query` typed in. A confirmed file opens in a
+    /// tab, a snippet is inserted at the cursor, and a command is dispatched
+    /// once the dialog is gone — from the editor, so it reaches the app's
+    /// action listeners the way its keybinding would.
+    fn show_palette(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
         if window.has_active_dialog(cx) {
             return;
         }
 
+        let root = self.config.working_dir.clone();
+        let files = root
+            .as_deref()
+            .map(|root| palette::sql_files(&self.file_nodes, Some(root)));
         let app = cx.weak_entity();
         let list = cx.new(|cx| {
             let delegate =
-                snippets::PickerDelegate::new(snippets::load(), move |snippet, window, cx| {
+                palette::PaletteDelegate::new(files, snippets::load(), move |pick, window, cx| {
                     window.close_dialog(cx);
-                    app.update(cx, |this, cx| this.insert_snippet(snippet, window, cx))
-                        .ok();
+                    app.update(cx, |this, cx| match pick {
+                        palette::Pick::File(path) => this.open_path(path, window, cx),
+                        palette::Pick::Snippet(snippet) => this.insert_snippet(snippet, window, cx),
+                        palette::Pick::Command(action) => {
+                            this.editor()
+                                .update(cx, |state, cx| state.focus(window, cx));
+                            window.dispatch_action(action.boxed_clone(), cx);
+                        }
+                    })
+                    .ok();
                 });
             ListState::new(delegate, window, cx).searchable(true)
         });
@@ -52,13 +89,19 @@ impl PgGuiApp {
 
         let list_in_dialog = list.clone();
         window.open_dialog(cx, move |dialog, _, _| {
-            dialog.title("Insert snippet").w(px(560.)).child(
-                div()
-                    .h(px(400.))
-                    .child(List::new(&list_in_dialog).search_placeholder("Search snippets…")),
+            dialog.w(px(560.)).child(
+                div().h(px(400.)).child(
+                    List::new(&list_in_dialog)
+                        .search_placeholder("Search files…  (> snippets, : commands)"),
+                ),
             )
         });
-        list.update(cx, |state, cx| state.focus(window, cx));
+        list.update(cx, |state, cx| {
+            if !query.is_empty() {
+                state.set_query(query, window, cx);
+            }
+            state.focus(window, cx);
+        });
     }
 
     /// Insert a snippet at the cursor as its own statement. A snippet with

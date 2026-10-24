@@ -14,6 +14,7 @@ mod highlight;
 mod instance;
 mod logging;
 mod lsp;
+mod palette;
 mod plan;
 mod results;
 mod snippets;
@@ -57,7 +58,9 @@ actions!(
         ToggleDbPanel,
         RefreshDbTree,
         SaveFile,
+        OpenPalette,
         OpenSnippets,
+        OpenCommands,
         OpenConfig,
         NewConnection,
         EditConnection,
@@ -155,7 +158,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-2", ToggleFilesPanel, None),
         KeyBinding::new("secondary-3", ToggleResultsPanel, None),
         KeyBinding::new("secondary-s", SaveFile, None),
-        KeyBinding::new("secondary-p", OpenSnippets, None),
+        KeyBinding::new("secondary-p", OpenPalette, None),
+        KeyBinding::new("secondary-shift-p", OpenCommands, None),
         KeyBinding::new("secondary-,", OpenConfig, None),
         KeyBinding::new("secondary-shift-f", FormatScript, None),
         KeyBinding::new("secondary-/", ToggleComment, None),

@@ -146,11 +146,23 @@ shortcut and format-on-save are covered in `editor`.
 | `upper_keywords_lower_constants` | `keyword_case` upper, `constant_case` lower: keywords (`IS NULL` among them) upper-cased, `TRUE` lower-cased, `'X'` untouched. |
 | `lower_keywords_upper_constants` | The other way round: keywords lower-cased, `TRUE` upper-cased. |
 
+### `palette`: the cmd-p palette
+
+No database needed. cmd-p opens one searchable list whose mode follows the
+query's first character: a plain query searches the working folder's `.sql`
+files, `>` the snippets (covered in `snippets`), `:` the commands.
+cmd-shift-p opens it with the `:` already typed.
+
+| Test | What it checks |
+|---|---|
+| `plain_query_opens_matching_file` | `ordday` (scattered characters) finds `reports/orders_by_day.sql` and Enter opens it in the active tab. |
+| `colon_query_runs_command` | `:toggle files panel` flips `files_panel_visible`; the same command through cmd-shift-p flips it back. |
+
 ### `snippets`: the snippet picker
 
-No database needed, except by the last scenario. Edit ▸ Snippets (cmd-p) opens a searchable picker over the
+No database needed, except by the last scenario. The palette's `>` mode (cmd-p then `>`, or Edit ▸ Snippets) lists the
 built-in snippets and the user's own `.sql` files under `snippets/` in the
-config directory; `App::pick_snippet(filter)` opens it, types the filter and
+config directory; `App::pick_snippet(filter)` opens it, types `>` and the filter and
 inserts the first match with Enter. User snippets are written into the scratch
 config directory before launch, and the buffer is read back through the tab's
 `script`, as in `editor`.
@@ -558,7 +570,8 @@ Harness API:
 | `start_debug(stop_on_entry)`, `toggle_breakpoint(row)` | Debugger: start a session on the routine under the cursor; click editor row `row`'s breakpoint dot (a `launch_for_results` layout). |
 | `cmd_click_text(row, col, dwell)` | Editor (a `launch_for_results` layout): hover the character at `row`, `col` with cmd held for `dwell`, then click — Go to Definition. |
 | `hover_text(row, col)` | Editor (a `launch_for_results` layout): move the pointer onto the character at `row`, `col`, coming in from a blank spot. |
-| `pick_snippet(filter)` | Opens the snippet picker (cmd-p), types `filter` and inserts the first match with Enter. |
+| `palette(query, skip)`, `command_palette(query)` | Opens the palette (cmd-p), types `query`, moves `skip` rows down and presses Enter; the second opens it with cmd-shift-p (`:` pre-typed). |
+| `pick_snippet(filter)` | Opens the palette (cmd-p), types `>` and `filter` and inserts the first match with Enter. |
 | `App::launch_for_results_prepared(url, script, prepare)` | `launch_for_results` with the scratch directory handed to `prepare` first, to write files the seed points at. |
 | `click_submenu(menu, submenu, item)`, `submenu_items(menu, submenu)`, `submenu_checked(menu, submenu, item)` | Click, list or check an item in a submenu (Connection ▸ Recent, View ▸ Theme); items match with or without their check mark. |
 | `brightness_at(x, y)` | Captures the window and returns the brightness (0 black, 1 white) of the pixel at that point, through `NSBitmapImageRep` in JXA — what GPUI actually painted. |
