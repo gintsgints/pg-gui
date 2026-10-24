@@ -1,12 +1,13 @@
 # Snippets
 
-`cmd-p` opens a searchable picker of SQL snippets — built-in queries plus
-`New:` templates for tables, views, triggers, sequences and more.
+The [palette](palette.md)'s `>` mode (`cmd-p` then `>`, or Edit ▸ Snippets)
+lists SQL snippets — built-in queries plus `New:` templates for tables, views,
+triggers, sequences and more. Enter inserts the pick at the cursor.
 
 ## Your own snippets
 
 Drop `.sql` files into the `snippets/` folder of the config directory (next to
-`config.json`) and they join the picker. No registration step, no manifest.
+`config.json`) and they join the list. No registration step, no manifest.
 
 ## Tab stops
 

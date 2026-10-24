@@ -4,6 +4,11 @@ Connections are created and edited in a per-field dialog — host, port, user,
 password, database — with an inline **Test Connection** check, so a typo is
 caught in the dialog instead of on the first query.
 
+Under the fields the dialog shows the connection string they add up to, with
+the password replaced by `****`. The copy button at its right puts the full
+string — password included — on the clipboard, ready for `psql` or another
+tool.
+
 A connection can be given a **name**. Switch between saved connections from
 the combobox in the title bar or from Connection ▸ Recent.
 
