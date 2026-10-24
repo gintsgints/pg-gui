@@ -2,17 +2,16 @@
 //! and switching — which parks one connection's untitled tabs and output and
 //! brings back the next one's.
 
-use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
 use std::rc::Rc;
 
 use gpui::Subscription;
 use gpui::{
-    App, AppContext as _, Context, Entity, Hsla, IntoElement, ParentElement as _, Render,
-    SharedString, Styled as _, Window, div, px,
+    App, AppContext as _, ClipboardItem, Context, Entity, Hsla, IntoElement, ParentElement as _,
+    Render, SharedString, Styled as _, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, IndexPath, WindowExt as _,
+    ActiveTheme as _, IconName, IndexPath, WindowExt as _,
     button::{Button, ButtonVariants as _},
     combobox::{ComboboxEvent, ComboboxState},
     h_flex,
@@ -77,6 +76,47 @@ enum ConnectionTest {
     Failed(SharedString),
 }
 
+/// The connection string the dialog's fields add up to: shown with the
+/// password starred, and copied in full by the button beside it.
+struct ConnectionPreview {
+    url: String,
+    masked: SharedString,
+}
+
+impl ConnectionPreview {
+    fn new(parts: &ConnectionParts) -> Self {
+        Self {
+            url: parts.to_url(),
+            masked: parts.to_masked_url().into(),
+        }
+    }
+}
+
+impl Render for ConnectionPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let url = self.url.clone();
+        h_flex()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_sm()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .child(self.masked.clone()),
+            )
+            .child(
+                Button::new("copy-connection-string")
+                    .ghost()
+                    .icon(IconName::Copy)
+                    .tooltip("Copy connection string")
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                    }),
+            )
+    }
+}
+
 impl Render for ConnectionTest {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (text, color): (SharedString, Hsla) = match self {
@@ -117,8 +157,7 @@ struct ConnectionParts {
 /// The six text inputs of the New Connection dialog, grouped so their
 /// current values can be read back into [`ConnectionParts`] in one place.
 /// The `options` and other query parameters have no field: they ride along
-/// in `extra`, taken from the URL the form was last seeded from or that was
-/// last typed into the connection string.
+/// in `extra`, taken from the URL the form was seeded from.
 #[derive(Clone)]
 struct ConnectionFields {
     host: Entity<InputState>,
@@ -127,18 +166,18 @@ struct ConnectionFields {
     schema: Entity<InputState>,
     user: Entity<InputState>,
     password: Entity<InputState>,
-    extra: Rc<RefCell<(Vec<String>, Vec<String>)>>,
+    extra: Rc<(Vec<String>, Vec<String>)>,
 }
 
 /// Everything the New / Edit Connection dialog is built over: the name box,
-/// the five connection fields, the editable connection-string preview, the
+/// the connection fields, the read-only connection-string preview, the
 /// Test Connection result, and the key of the recent entry being edited
 /// (`None` for a new connection).
 #[derive(Clone)]
 struct ConnectionForm {
     name: Entity<InputState>,
     fields: ConnectionFields,
-    preview: Entity<InputState>,
+    preview: Entity<ConnectionPreview>,
     test_status: Entity<ConnectionTest>,
     replacing: Option<String>,
 }
@@ -158,7 +197,7 @@ impl ConnectionFields {
     /// Snapshot the fields; everything but the password is trimmed (a
     /// password may legitimately contain leading/trailing spaces).
     fn read(&self, cx: &App) -> ConnectionParts {
-        let (options, params) = self.extra.borrow().clone();
+        let (options, params) = (*self.extra).clone();
         ConnectionParts {
             host: self.host.read(cx).value().trim().to_string(),
             port: self.port.read(cx).value().trim().to_string(),
@@ -169,24 +208,6 @@ impl ConnectionFields {
             options,
             params,
         }
-    }
-
-    /// Overwrite every field from `parts`. Used when the connection string is
-    /// edited directly, to drive the individual fields from the parsed URL.
-    fn set(&self, parts: &ConnectionParts, window: &mut Window, cx: &mut App) {
-        self.host
-            .update(cx, |s, cx| s.set_value(parts.host.clone(), window, cx));
-        self.port
-            .update(cx, |s, cx| s.set_value(parts.port.clone(), window, cx));
-        self.database
-            .update(cx, |s, cx| s.set_value(parts.database.clone(), window, cx));
-        self.schema
-            .update(cx, |s, cx| s.set_value(parts.schema.clone(), window, cx));
-        self.user
-            .update(cx, |s, cx| s.set_value(parts.user.clone(), window, cx));
-        self.password
-            .update(cx, |s, cx| s.set_value(parts.password.clone(), window, cx));
-        *self.extra.borrow_mut() = (parts.options.clone(), parts.params.clone());
     }
 }
 
@@ -276,12 +297,23 @@ impl ConnectionParts {
     /// with the whitespace dropped, since a space would split the setting
     /// into two server arguments (`app, public` becomes `app,public`).
     fn to_url(&self) -> String {
+        self.build_url(&percent_encode(&self.password))
+    }
+
+    /// [`Self::to_url`] with the password shown as stars, for display.
+    fn to_masked_url(&self) -> String {
+        self.build_url(if self.password.is_empty() { "" } else { "****" })
+    }
+
+    /// The URL, with `password` (already encoded, empty for none) put in
+    /// verbatim.
+    fn build_url(&self, password: &str) -> String {
         let mut url = String::from("postgres://");
         if !self.user.is_empty() {
             url.push_str(&percent_encode(&self.user));
-            if !self.password.is_empty() {
+            if !password.is_empty() {
                 url.push(':');
-                url.push_str(&percent_encode(&self.password));
+                url.push_str(password);
             }
             url.push('@');
         }
@@ -488,9 +520,9 @@ impl PgGuiApp {
                     .masked(true)
                     .default_value(parts.password)
             }),
-            extra: Rc::new(RefCell::new((parts.options, parts.params))),
+            extra: Rc::new((parts.options, parts.params)),
         };
-        let preview = cx.new(|cx| InputState::new(window, cx).default_value(seed_url.to_string()));
+        let preview = cx.new(|cx| ConnectionPreview::new(&fields.read(cx)));
         let test_status = cx.new(|_| ConnectionTest::Idle);
 
         self.connection_dialog_subs =
@@ -510,101 +542,41 @@ impl PgGuiApp {
         );
     }
 
-    /// Wire the two-way sync between the individual fields and the editable
-    /// connection-string preview: a field edit recomputes the string, and a
-    /// string edit re-parses it back into the fields. A shared re-entrancy
-    /// flag stops one side's programmatic write from echoing back through the
-    /// other. Any edit also drops a stale Test Connection result. Returns the
-    /// subscriptions, which the caller keeps alive for the dialog's lifetime.
+    /// Keep the connection-string preview in step with the fields: every
+    /// field edit recomputes it and drops a stale Test Connection result.
+    /// Returns the subscriptions, which the caller keeps alive for the
+    /// dialog's lifetime.
     fn wire_connection_sync(
         fields: &ConnectionFields,
-        preview: &Entity<InputState>,
+        preview: &Entity<ConnectionPreview>,
         test_status: &Entity<ConnectionTest>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<Subscription> {
-        // While one side programmatically writes the other, the other's Change
-        // event is ignored instead of writing straight back.
-        let syncing = Rc::new(Cell::new(false));
-
-        let clear_test = {
-            let test_status = test_status.clone();
-            move |cx: &mut App| {
-                test_status.update(cx, |status, cx| {
-                    if !matches!(status, ConnectionTest::Idle) {
-                        *status = ConnectionTest::Idle;
-                        cx.notify();
-                    }
-                });
-            }
-        };
-
-        // Field edit: recompute the previewed connection string.
-        let recompute = {
-            let (fields, preview, syncing, clear_test) = (
-                fields.clone(),
-                preview.clone(),
-                syncing.clone(),
-                clear_test.clone(),
-            );
-            move |window: &mut Window, cx: &mut App| {
-                if syncing.get() {
-                    return;
-                }
-                let url = fields.read(cx).to_url();
-                syncing.set(true);
-                preview.update(cx, |state, cx| state.set_value(url, window, cx));
-                syncing.set(false);
-                clear_test(cx);
-            }
-        };
-        // String edit: parse it and drive the fields. Skipped for a partial
-        // entry that is not yet a URL, so the fields are not wiped mid-type.
-        let apply_preview = {
-            let (fields, preview, syncing, clear_test) =
-                (fields.clone(), preview.clone(), syncing, clear_test);
-            move |window: &mut Window, cx: &mut App| {
-                if syncing.get() {
-                    return;
-                }
-                let url = preview.read(cx).value().to_string();
-                if !url.contains("://") {
-                    return;
-                }
-                let parts = ConnectionParts::parse(&url);
-                syncing.set(true);
-                fields.set(&parts, window, cx);
-                syncing.set(false);
-                clear_test(cx);
-            }
-        };
-
-        let mut subs: Vec<Subscription> = fields
+        fields
             .as_array()
             .iter()
             .map(|input| {
-                let recompute = recompute.clone();
-                cx.subscribe_in(
-                    input,
-                    window,
-                    move |_, _, event: &InputEvent, window, cx| {
-                        if matches!(event, InputEvent::Change) {
-                            recompute(window, cx);
+                let (fields, preview, test_status) =
+                    (fields.clone(), preview.clone(), test_status.clone());
+                cx.subscribe_in(input, window, move |_, _, event: &InputEvent, _, cx| {
+                    if !matches!(event, InputEvent::Change) {
+                        return;
+                    }
+                    let parts = fields.read(cx);
+                    preview.update(cx, |preview, cx| {
+                        *preview = ConnectionPreview::new(&parts);
+                        cx.notify();
+                    });
+                    test_status.update(cx, |status, cx| {
+                        if !matches!(status, ConnectionTest::Idle) {
+                            *status = ConnectionTest::Idle;
+                            cx.notify();
                         }
-                    },
-                )
+                    });
+                })
             })
-            .collect();
-        subs.push(cx.subscribe_in(
-            preview,
-            window,
-            move |_, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::Change) {
-                    apply_preview(window, cx);
-                }
-            },
-        ));
-        subs
+            .collect()
     }
 
     /// Build and show the connection dialog for the given title over the
@@ -673,7 +645,17 @@ impl PgGuiApp {
                     )
                     .child(labeled("Username", &fields.user, cx))
                     .child(labeled("Password", &fields.password, cx))
-                    .child(labeled("Connection string", &preview, cx))
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Connection string"),
+                            )
+                            .child(preview),
+                    )
                     .child(test_status)
                     .child(
                         h_flex()
@@ -926,6 +908,21 @@ impl PgGuiApp {
 #[cfg(test)]
 mod tests {
     use super::ConnectionParts;
+
+    #[test]
+    fn masked_url_stars_only_the_password() {
+        let parts = ConnectionParts::parse("postgres://pgui:s%40cret@localhost:5433/pgui_test");
+        assert_eq!(
+            parts.to_masked_url(),
+            "postgres://pgui:****@localhost:5433/pgui_test"
+        );
+        assert_eq!(
+            parts.to_url(),
+            "postgres://pgui:s%40cret@localhost:5433/pgui_test"
+        );
+        let no_password = ConnectionParts::parse("postgres://pgui@localhost/db");
+        assert_eq!(no_password.to_masked_url(), "postgres://pgui@localhost/db");
+    }
 
     #[test]
     fn schema_round_trips_through_options() {

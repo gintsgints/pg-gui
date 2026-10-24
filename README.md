@@ -34,7 +34,9 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
   inline Test Connection, tabs and output parked per connection
 - **[Opening and saving scripts](docs/features/files.md)** — native dialogs,
   one tab per file, dirty and changed-on-disk prompts
-- **[Snippets](docs/features/snippets.md)** — `cmd-p` picker with tab stops,
+- **[Palette](docs/features/palette.md)** — `cmd-p` finds a file in the
+  working folder; `>` switches it to snippets, `:` to commands
+- **[Snippets](docs/features/snippets.md)** — `New:` templates with tab stops,
   extendable with your own `.sql` files
 - **[Creating scripts in place](docs/features/new-scripts.md)** — the "+" on
   the files panel's title row or on a folder
@@ -46,6 +48,10 @@ A small desktop app for editing and executing PostgreSQL scripts, built with
   the SQL at the cursor with the Claude API
 
 ## Running
+
+For a guided tour of every feature against the sample database, see
+[scenario.md](scenario.md).
+
 
 ```sh
 cargo run
@@ -129,7 +135,8 @@ or `F1` (Linux) in the app to see this list in a dialog. On Linux, `cmd` is
 | `cmd-/` | Comment or uncomment the line / selection |
 | `cmd-f` / `ctrl-f` | Find in the script |
 | `cmd-r` / `ctrl-r` | Find and replace in the script |
-| `cmd-p` | Insert a snippet |
+| `cmd-p` | Go to a file; type `>` for snippets, `:` for commands |
+| `cmd-shift-p` | Run a command |
 | `cmd-t` | New script tab |
 | `cmd-w` | Close the tab |
 | `ctrl-tab` / `ctrl-shift-tab` | Next / previous tab |
