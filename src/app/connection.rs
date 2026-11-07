@@ -24,7 +24,7 @@ use crate::app::{
     ParkedResults, PgGuiApp, default_conn, mask_credentials, percent_decode, percent_encode,
     record_recent,
 };
-use crate::{Connect, EditConnection, NewConnection, config, db};
+use crate::{Connect, CopyConnection, EditConnection, NewConnection, config, db};
 
 /// One entry of the title-bar connection combobox: a recent connection,
 /// shown by its saved name (or masked url when unnamed) and identified by
@@ -483,9 +483,30 @@ impl PgGuiApp {
         self.open_connection_form("Edit connection", &url, &name, Some(key), window, cx);
     }
 
+    /// Connection ▸ Copy Connection…: open the connection form seeded with
+    /// the current connection's details, saved as a new entry. A named
+    /// connection's copy is seeded `<name> (copy)`, since connections are
+    /// keyed by name and the original name would overwrite the original.
+    pub(in crate::app) fn copy_connection(
+        &mut self,
+        _: &CopyConnection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let url = self.config.connection_string.clone();
+        let key = Self::active_key(&self.config);
+        let name = self
+            .config
+            .recent_connections
+            .iter()
+            .find(|c| c.key() == key && !c.name.is_empty())
+            .map_or(String::new(), |c| format!("{} (copy)", c.name));
+        self.open_connection_form("Copy connection", &url, &name, None, window, cx);
+    }
+
     /// Build the field inputs seeded from `seed_url`/`seed_name`, wire up the
     /// live connection-string preview, and show the connection dialog titled
-    /// `title`. Shared by New Connection and Edit Connection; `replacing` is
+    /// `title`. Shared by New, Edit and Copy Connection; `replacing` is
     /// the key of the entry being edited, `None` for a new connection.
     fn open_connection_form(
         &mut self,

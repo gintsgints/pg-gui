@@ -111,6 +111,7 @@ top edge, which gpui-component puts a tenth of the window's height down.
 | `recent_menu_switches_untitled_tabs` | With an untitled and a file tab on `first`, Recent ▸ `second` parks the untitled tab and keeps the file tab; a tab typed on `second` is parked when switching back, `first`'s returns to its old slot, and switching again restores `second`'s. |
 | `new_connection_dialog_creates_and_switches` | New Connection… with a name, host, port, database and user saves and selects it on a blank tab, parking `first`'s script; Recent ▸ `first` brings the script back. |
 | `new_connection_dialog_builds_url_from_fields` | Every field reaches the saved URL: the password percent-encoded (`s%40cret`), the schema as `options=-c search_path=app`. |
+| `copy_connection_dialog_adds_entry` | Copy Connection… on `first` seeds the dialog with its fields; changing only the database saves a new entry `first (copy)` beside `first` and switches to it. |
 | `edit_connection_dialog_keeps_schema` | Edit Connection… on a URL carrying `--search_path` and `sslmode` re-saves it from the fields in the `-c search_path=` form, `sslmode` kept. |
 
 ### `editor`: the SQL editor

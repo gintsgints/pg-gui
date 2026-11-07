@@ -12,6 +12,13 @@ tool.
 A connection can be given a **name**. Switch between saved connections from
 the combobox in the title bar or from Connection ▸ Recent.
 
+Connection ▸ **Copy Connection…** opens the same dialog seeded with the current
+connection's details — password included — and saves the result as a new
+entry, so a second database on the same server, or the same database as
+another user, is one field away. A named connection's copy starts as
+`<name> (copy)`, since keeping the original name would overwrite the
+original.
+
 ## A connection is its name
 
 A saved connection is identified by its name (or by its URL when it has none),

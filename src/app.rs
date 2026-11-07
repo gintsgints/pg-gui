@@ -1603,6 +1603,7 @@ impl Render for PgGuiApp {
             .on_action(cx.listener(Self::ai_complete))
             .on_action(cx.listener(Self::new_connection))
             .on_action(cx.listener(Self::edit_connection))
+            .on_action(cx.listener(Self::copy_connection))
             .on_action(cx.listener(Self::connect_recent))
             .on_action(cx.listener(Self::new_file))
             .on_action(cx.listener(Self::close_tab))

@@ -11,12 +11,12 @@ use gpui_component::{GlobalState, menu::AppMenuBar};
 
 use crate::app::{PgGuiApp, mask_credentials};
 use crate::{
-    AiComplete, CancelQuery, CloseTab, Commit, Connect, DebugContinue, DebugStepInto,
-    DebugStepOver, DebugStop, EditConnection, ExplainAnalyze, ExplainPlan, ExportCsv,
-    ExportInserts, FormatScript, NewConnection, NewFile, NextDiagnostic, NextTab, OpenCommands,
-    OpenConfig, OpenFile, OpenFolder, OpenGitHub, OpenPalette, OpenRecentFolder, OpenSnippets,
-    PrevDiagnostic, PrevTab, Quit, RefreshDbTree, Rollback, RunQuery, RunScripts, SaveFile,
-    SetTheme, ShowHelp, StartDebug, ToggleAutocommit, ToggleComment, ToggleDbPanel,
+    AiComplete, CancelQuery, CloseTab, Commit, Connect, CopyConnection, DebugContinue,
+    DebugStepInto, DebugStepOver, DebugStop, EditConnection, ExplainAnalyze, ExplainPlan,
+    ExportCsv, ExportInserts, FormatScript, NewConnection, NewFile, NextDiagnostic, NextTab,
+    OpenCommands, OpenConfig, OpenFile, OpenFolder, OpenGitHub, OpenPalette, OpenRecentFolder,
+    OpenSnippets, PrevDiagnostic, PrevTab, Quit, RefreshDbTree, Rollback, RunQuery, RunScripts,
+    SaveFile, SetTheme, ShowHelp, StartDebug, ToggleAutocommit, ToggleComment, ToggleDbPanel,
     ToggleFilesPanel, ToggleFormatOnSave, ToggleResultsPanel, ZoomIn, ZoomOut, ZoomReset, config,
 };
 
@@ -87,6 +87,7 @@ fn connection_menu(recents: &[config::RecentConnection]) -> Menu {
         items: vec![
             MenuItem::action("New Connection…", NewConnection),
             MenuItem::action("Edit Connection…", EditConnection),
+            MenuItem::action("Copy Connection…", CopyConnection),
             MenuItem::submenu(Menu {
                 name: "Recent".into(),
                 disabled: false,

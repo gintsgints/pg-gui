@@ -175,6 +175,31 @@ fn edit_connection_dialog_keeps_schema() {
     app.quit();
 }
 
+/// Copy Connection… seeds the dialog with the current connection, and
+/// saving it adds a second entry rather than replacing the first: the seeded
+/// name is `<name> (copy)`, and only the edited field differs in the URL.
+#[test]
+fn copy_connection_dialog_adds_entry() {
+    let mut app = App::launch_prepared(|_, seed| {
+        seed["connection_string"] = Value::from(FIRST_URL);
+        seed["recent_connections"] = serde_json::json!([{ "name": "first", "url": FIRST_URL }]);
+    });
+
+    app.click_menu("Connection", "Copy Connection…");
+    app.fill_connection_dialog("first (copy)", &[(Field::Database, "copied")]);
+
+    let copied = FIRST_URL.replace("/first", "/copied");
+    app.wait_for_config("the copy saved and selected", |c| {
+        c["connection_string"] == copied.as_str()
+    });
+    let config = app.config();
+    let mut names = recent_names(&config);
+    names.sort_unstable();
+    assert_eq!(names, ["first", "first (copy)"]);
+
+    app.quit();
+}
+
 /// Every field reaches the saved connection string: the password
 /// percent-encoded, the schema as a `search_path` option.
 #[test]

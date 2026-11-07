@@ -64,6 +64,7 @@ actions!(
         OpenConfig,
         NewConnection,
         EditConnection,
+        CopyConnection,
         OpenGitHub,
         FormatScript,
         ToggleFormatOnSave,

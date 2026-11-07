@@ -20,13 +20,13 @@ use gpui_component::{
 
 use crate::snippets::{Library, Snippet};
 use crate::{
-    AiComplete, CancelQuery, CloseTab, Commit, DebugContinue, DebugStepInto, DebugStepOver,
-    DebugStop, EditConnection, ExplainAnalyze, ExplainPlan, ExportCsv, ExportInserts, FormatScript,
-    NewConnection, NewFile, NextDiagnostic, NextTab, OpenConfig, OpenFile, OpenFolder, OpenGitHub,
-    PrevDiagnostic, PrevTab, Quit, RefreshDbTree, Rollback, RunQuery, RunScripts, SaveFile,
-    SetTheme, ShowHelp, StartDebug, ToggleAutocommit, ToggleComment, ToggleDbPanel,
-    ToggleFilesPanel, ToggleFormatOnSave, ToggleResultsPanel, ZoomIn, ZoomOut, ZoomReset, config,
-    file_tree,
+    AiComplete, CancelQuery, CloseTab, Commit, CopyConnection, DebugContinue, DebugStepInto,
+    DebugStepOver, DebugStop, EditConnection, ExplainAnalyze, ExplainPlan, ExportCsv,
+    ExportInserts, FormatScript, NewConnection, NewFile, NextDiagnostic, NextTab, OpenConfig,
+    OpenFile, OpenFolder, OpenGitHub, PrevDiagnostic, PrevTab, Quit, RefreshDbTree, Rollback,
+    RunQuery, RunScripts, SaveFile, SetTheme, ShowHelp, StartDebug, ToggleAutocommit,
+    ToggleComment, ToggleDbPanel, ToggleFilesPanel, ToggleFormatOnSave, ToggleResultsPanel, ZoomIn,
+    ZoomOut, ZoomReset, config, file_tree,
 };
 
 /// Query prefix that lists snippets.
@@ -109,6 +109,7 @@ fn commands() -> Vec<Rc<Command>> {
     vec![
         Command::new("Connection: New Connection…", NewConnection),
         Command::new("Connection: Edit Connection…", EditConnection),
+        Command::new("Connection: Copy Connection…", CopyConnection),
         Command::new("Connection: Run Query", RunQuery),
         Command::new("Connection: Run Selected Scripts", RunScripts),
         Command::new("Connection: Explain Plan", ExplainPlan),
