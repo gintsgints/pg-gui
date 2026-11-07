@@ -461,8 +461,8 @@ fn placeholder_label(node: &DbNode) -> SharedString {
 
 /// Project the model to `TreeItem`s. Expansion is re-applied from `expanded`
 /// so it survives the rebuild. A non-empty `filter` keeps only nodes whose
-/// label matches (case-insensitive substring) or that have a matching
-/// descendant.
+/// label matches (case-insensitive substring), their descendants, and the
+/// ancestors leading to them.
 pub fn to_tree_items(
     nodes: &[DbNode],
     expanded: &HashSet<SharedString>,
@@ -481,7 +481,10 @@ fn build(nodes: &[DbNode], expanded: &HashSet<SharedString>, needle: &str) -> Ve
 
 fn project(node: &DbNode, expanded: &HashSet<SharedString>, needle: &str) -> Option<TreeItem> {
     let self_match = needle.is_empty() || node.label.to_lowercase().contains(needle);
-    let child_items = build(&node.children, expanded, needle);
+    // A match keeps its whole subtree: a table found by name must still reach
+    // its definition, columns, indexes, constraints and triggers.
+    let child_needle = if self_match { "" } else { needle };
+    let child_items = build(&node.children, expanded, child_needle);
     // While filtering, drop a node that neither matches nor has a match below.
     if !needle.is_empty() && !self_match && child_items.is_empty() {
         return None;
@@ -615,6 +618,31 @@ mod tests {
             .collect();
         assert_eq!(labels, ["orders"]);
     }
+
+    #[test]
+    fn filter_keeps_a_matching_tables_children() {
+        let mut schema = DbNode::schema("app");
+        let tables_id = schema.children[0].id.to_string();
+        let tables = &mut schema.children[0];
+        tables.load = Load::Loaded;
+        tables.children = vec![DbNode::table(&tables_id, "app", "orders")];
+        let items = to_tree_items(&[schema], &HashSet::new(), "order");
+        let table = &items[0].children[0].children[0];
+        let labels: Vec<String> = table.children.iter().map(|c| c.label.to_string()).collect();
+        assert_eq!(
+            labels,
+            [
+                "definition",
+                "Columns",
+                "Indexes",
+                "Constraints",
+                "Triggers"
+            ]
+        );
+        // The still-unloaded sub-folders keep their placeholder, so they expand.
+        assert!(table.children[1..].iter().all(|c| c.children.len() == 1));
+    }
+
     fn column(name: &str, data_type: &str) -> db::ColumnInfo {
         db::ColumnInfo {
             name: name.to_string(),
