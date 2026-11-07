@@ -250,7 +250,7 @@ impl PgGuiApp {
                 div()
                     .px_1()
                     .pb_1()
-                    .child(Input::new(&self.file_filter_input).xsmall()),
+                    .child(Input::new(&self.file_filter_input).xsmall().cleanable(true)),
             )
             // Only shown once a *batch* is picked: a plain click selects
             // the one file it opens, so a bar at one script would be up

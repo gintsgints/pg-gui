@@ -24,7 +24,8 @@ silently overwriting the new file.
 
 `cmd-b` (or `cmd-2`) shows the files panel, a tree of the working folder. It
 is re-scanned every few seconds, so files appearing from outside the app show
-up on their own.
+up on their own. The filter box above the tree narrows it as you type, and
+the × at its right end clears it.
 
 From there you can also [create scripts in place](new-scripts.md) and
 [run a selection of scripts](run-scripts.md) as a batch.

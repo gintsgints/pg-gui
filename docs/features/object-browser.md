@@ -12,7 +12,8 @@ schemas and, under each, its objects:
 - **Types**
 
 Everything is loaded lazily — expanding a node is what queries the catalog —
-and the filter box narrows the tree as you type. The **System** checkbox adds
+and the filter box narrows the tree as you type; the × at its right end clears
+it. The **System** checkbox adds
 the catalog schemas (`pg_catalog`, `information_schema`), which are hidden by
 default.
 

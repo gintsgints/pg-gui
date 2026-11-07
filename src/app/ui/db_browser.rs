@@ -58,7 +58,7 @@ impl PgGuiApp {
         let filter = div()
             .px_1()
             .pb_1()
-            .child(Input::new(&self.db_filter_input).xsmall());
+            .child(Input::new(&self.db_filter_input).xsmall().cleanable(true));
 
         v_flex()
             .size_full()
