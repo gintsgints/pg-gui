@@ -8,7 +8,8 @@ use futures::StreamExt as _;
 use gpui::Subscription;
 use gpui::{
     App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
-    ParentElement as _, Pixels, Render, ScrollHandle, SharedString, Styled as _, Window, div, px,
+    ParentElement as _, Pixels, Render, ScrollHandle, ScrollStrategy, SharedString, Styled as _,
+    Window, div, px,
 };
 use gpui_base::TextSelectionHandle;
 use gpui_component::{
@@ -439,6 +440,10 @@ pub struct PgGuiApp {
     /// The browser's filter box; its text filters loaded nodes client-side.
     db_filter_input: Entity<InputState>,
     db_filter: String,
+    /// Id of the browser row last selected. `TreeState::set_items` drops the
+    /// selection, and a filter can hide the row, so the app keeps it and
+    /// re-selects it whenever a rebuild shows it again.
+    db_selected: Option<SharedString>,
     /// Whether system schemas (`pg_*`, `information_schema`) are shown;
     /// runtime-only, defaults off.
     show_system_schemas: bool,
@@ -599,10 +604,7 @@ impl PgGuiApp {
 
         let results = Self::build_results(config.page_size, window, cx);
         let resizable_state = cx.new(|_| ResizableState::default());
-        let sidebar_state = cx.new(|_| ResizableState::default());
-        let tree_state = cx.new(|cx| TreeState::new(cx));
-        let file_filter_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Filter files…"));
+        let (sidebar_state, tree_state, file_filter_input) = Self::build_file_browser(window, cx);
         let (db_sidebar_state, db_tree_state, db_filter_input) = Self::build_db_browser(window, cx);
 
         let (connections, connections_sub) = Self::build_connection_combo(&config, window, cx);
@@ -679,6 +681,7 @@ impl PgGuiApp {
             db_expanded: HashSet::new(),
             db_filter_input,
             db_filter: String::new(),
+            db_selected: None,
             show_system_schemas: false,
             db_schema_load: DbSchemaLoad::Ready,
             status: "Ready".into(),
@@ -978,6 +981,22 @@ impl PgGuiApp {
             .collect()
     }
 
+    /// Create the files panel's widgets: its resizable-split state, the
+    /// tree, and the filter box.
+    fn build_file_browser(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (
+        Entity<ResizableState>,
+        Entity<TreeState>,
+        Entity<InputState>,
+    ) {
+        let sidebar = cx.new(|_| ResizableState::default());
+        let tree = cx.new(|cx| TreeState::new(cx));
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files…"));
+        (sidebar, tree, filter)
+    }
+
     /// Create the object browser's widgets: its resizable-split state, the
     /// tree, and the filter box.
     fn build_db_browser(
@@ -1026,15 +1045,44 @@ impl PgGuiApp {
             }
             this.db_filter = text;
             this.rebuild_db_tree(cx);
+            if this.db_filter.trim().is_empty() {
+                this.reveal_db_selection(cx);
+            }
         })
+    }
+
+    /// Bring the remembered selection back into view once the filter is
+    /// cleared: expand its ancestors (collapsed while filtering, or never
+    /// expanded when the row was found through the filter), select it, and
+    /// scroll it to the middle of the panel.
+    fn reveal_db_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.db_selected.clone() else {
+            return;
+        };
+        self.db_tree_state.update(cx, |state, cx| {
+            state.reveal_item(&id, ScrollStrategy::Center, cx);
+            if let Some(ix) = state.index_of(&id) {
+                state.set_selected_index(Some(ix), cx);
+            }
+        });
     }
 
     /// Re-project the object model into the browser tree widget. Cheap
     /// (UI-side only); runs after every model or filter change.
     fn rebuild_db_tree(&mut self, cx: &mut Context<Self>) {
         let items = db_tree::to_tree_items(&self.db_nodes, &self.db_expanded, &self.db_filter);
-        self.db_tree_state
-            .update(cx, |state, cx| state.set_items(items, cx));
+        let selected = &mut self.db_selected;
+        self.db_tree_state.update(cx, |state, cx| {
+            // A row hidden by the filter has no selection to report; keep the
+            // one remembered from before it was hidden.
+            if let Some(item) = state.selected_item() {
+                *selected = Some(item.id.clone());
+            }
+            state.set_items(items, cx);
+            if let Some(ix) = selected.as_ref().and_then(|id| state.index_of(id)) {
+                state.set_selected_index(Some(ix), cx);
+            }
+        });
         cx.notify();
     }
 
