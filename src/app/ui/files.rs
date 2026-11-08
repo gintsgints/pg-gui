@@ -347,7 +347,7 @@ impl PgGuiApp {
                                 let modifiers = event.modifiers();
                                 if modifiers.shift {
                                     this.extend_script_selection(&id);
-                                } else if modifiers.secondary() {
+                                } else if modifiers.secondary(cx) {
                                     this.toggle_script(&id);
                                 } else {
                                     this.select_script(&id);

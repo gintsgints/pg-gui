@@ -131,56 +131,68 @@ fn load_catppuccin(cx: &mut App) {
 
 /// The app's key bindings. `gpui_component::init` must run first: a later
 /// binding wins, which the grid's escape override relies on.
+/// `secondary-<key>` as a static keystroke: cmd on macOS, ctrl elsewhere.
+/// gpui resolves its own `secondary-` alias only in `KeyBinding::load`;
+/// `KeyBinding::new` rejects it.
+macro_rules! secondary {
+    ($key:literal) => {
+        if cfg!(target_os = "macos") {
+            concat!("cmd-", $key)
+        } else {
+            concat!("ctrl-", $key)
+        }
+    };
+}
+
 fn bind_keys(cx: &mut App) {
-    // `secondary` is cmd on macOS and ctrl elsewhere. cmd-h is taken by
-    // "hide app" conventions outside macOS (and ctrl-h by backspace in
-    // some Linux toolkits), so help lives on F1 there.
+    // cmd-h is taken by "hide app" conventions outside macOS (and ctrl-h
+    // by backspace in some Linux toolkits), so help lives on F1 there.
     let help_key = if cfg!(target_os = "macos") {
         "cmd-h"
     } else {
         "f1"
     };
     cx.bind_keys([
-        KeyBinding::new("secondary-enter", RunQuery, None),
+        KeyBinding::new(secondary!("enter"), RunQuery, None),
         KeyBinding::new("ctrl-enter", RunQuery, None),
-        KeyBinding::new("secondary-shift-enter", RunScripts, None),
+        KeyBinding::new(secondary!("shift-enter"), RunScripts, None),
         KeyBinding::new("ctrl-shift-enter", RunScripts, None),
-        KeyBinding::new("secondary-e", ExplainPlan, None),
-        KeyBinding::new("secondary-shift-e", ExplainAnalyze, None),
-        KeyBinding::new("secondary-i", AiComplete, None),
+        KeyBinding::new(secondary!("e"), ExplainPlan, None),
+        KeyBinding::new(secondary!("shift-e"), ExplainAnalyze, None),
+        KeyBinding::new(secondary!("i"), AiComplete, None),
         KeyBinding::new("ctrl-space", AiComplete, None),
-        KeyBinding::new("secondary-t", NewFile, None),
-        KeyBinding::new("secondary-w", CloseTab, None),
+        KeyBinding::new(secondary!("t"), NewFile, None),
+        KeyBinding::new(secondary!("w"), CloseTab, None),
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PrevTab, None),
-        KeyBinding::new("secondary-o", OpenFile, None),
-        KeyBinding::new("secondary-b", ToggleFilesPanel, None),
-        KeyBinding::new("secondary-1", ToggleDbPanel, None),
-        KeyBinding::new("secondary-2", ToggleFilesPanel, None),
-        KeyBinding::new("secondary-3", ToggleResultsPanel, None),
-        KeyBinding::new("secondary-s", SaveFile, None),
-        KeyBinding::new("secondary-p", OpenPalette, None),
-        KeyBinding::new("secondary-shift-p", OpenCommands, None),
-        KeyBinding::new("secondary-,", OpenConfig, None),
-        KeyBinding::new("secondary-shift-f", FormatScript, None),
-        KeyBinding::new("secondary-/", ToggleComment, None),
-        KeyBinding::new("secondary-j", NextDiagnostic, None),
-        KeyBinding::new("secondary-k", PrevDiagnostic, None),
-        KeyBinding::new("secondary-shift-d", StartDebug, None),
+        KeyBinding::new(secondary!("o"), OpenFile, None),
+        KeyBinding::new(secondary!("b"), ToggleFilesPanel, None),
+        KeyBinding::new(secondary!("1"), ToggleDbPanel, None),
+        KeyBinding::new(secondary!("2"), ToggleFilesPanel, None),
+        KeyBinding::new(secondary!("3"), ToggleResultsPanel, None),
+        KeyBinding::new(secondary!("s"), SaveFile, None),
+        KeyBinding::new(secondary!("p"), OpenPalette, None),
+        KeyBinding::new(secondary!("shift-p"), OpenCommands, None),
+        KeyBinding::new(secondary!(","), OpenConfig, None),
+        KeyBinding::new(secondary!("shift-f"), FormatScript, None),
+        KeyBinding::new(secondary!("/"), ToggleComment, None),
+        KeyBinding::new(secondary!("j"), NextDiagnostic, None),
+        KeyBinding::new(secondary!("k"), PrevDiagnostic, None),
+        KeyBinding::new(secondary!("shift-d"), StartDebug, None),
         KeyBinding::new("f5", DebugContinue, None),
         KeyBinding::new("f10", DebugStepOver, None),
         KeyBinding::new("f11", DebugStepInto, None),
         KeyBinding::new("shift-f5", DebugStop, None),
-        KeyBinding::new("secondary-=", ZoomIn, None),
-        KeyBinding::new("secondary-shift-=", ZoomIn, None),
-        KeyBinding::new("secondary--", ZoomOut, None),
-        KeyBinding::new("secondary-0", ZoomReset, None),
+        KeyBinding::new(secondary!("="), ZoomIn, None),
+        KeyBinding::new(secondary!("shift-="), ZoomIn, None),
+        KeyBinding::new(secondary!("-"), ZoomOut, None),
+        KeyBinding::new(secondary!("0"), ZoomReset, None),
         KeyBinding::new(help_key, ShowHelp, None),
-        KeyBinding::new("secondary-q", Quit, None),
+        KeyBinding::new(secondary!("q"), Quit, None),
         // Scoped to the results grid's own key context, so cmd-c keeps
         // meaning "copy text" everywhere else (the editors, inputs).
-        KeyBinding::new("secondary-c", CopyCell, Some("DataTable")),
-        KeyBinding::new("secondary-a", SelectAllRows, Some("DataTable")),
+        KeyBinding::new(secondary!("c"), CopyCell, Some("DataTable")),
+        KeyBinding::new(secondary!("a"), SelectAllRows, Some("DataTable")),
         // Overrides the grid's own escape (later binding wins), which
         // never clears the multi-row selection pg-gui keeps beside it.
         KeyBinding::new("escape", ClearRowSelection, Some("DataTable")),

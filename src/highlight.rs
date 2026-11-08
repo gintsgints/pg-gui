@@ -230,6 +230,8 @@ mod tests {
 
     use super::{Kind, Tokens, tokens};
 
+    const NO_SPANS: [std::ops::Range<usize>; 0] = [];
+
     /// The keywords `super::spans` finds in `text`, as byte ranges.
     fn keyword_spans(text: &str) -> Vec<std::ops::Range<usize>> {
         spans_of(text, Kind::Keyword)
@@ -272,7 +274,10 @@ mod tests {
     #[test]
     fn body_words_need_a_body() {
         assert_eq!(keyword_spans("CALL do_work();").len(), 1);
-        assert!(keyword_spans("SELECT close, exception FROM trades;").is_empty());
+        assert_eq!(
+            keyword_spans("SELECT close, exception FROM trades;"),
+            NO_SPANS
+        );
         assert_eq!(
             keyword_spans("DO $$ BEGIN RAISE NOTICE 'x'; END $$;").len(),
             1
@@ -283,13 +288,13 @@ mod tests {
     /// a comment, or a quoted identifier.
     #[test]
     fn words_are_taken_whole_and_only_as_code() {
-        assert!(keyword_spans("SELECT recall, call_count FROM t;").is_empty());
-        assert!(keyword_spans("SELECT 'call';").is_empty());
-        assert!(keyword_spans("-- call\nSELECT 1;").is_empty());
-        assert!(keyword_spans("/* call */ SELECT 1;").is_empty());
-        assert!(keyword_spans("SELECT \"call\" FROM t;").is_empty());
+        assert_eq!(keyword_spans("SELECT recall, call_count FROM t;"), NO_SPANS);
+        assert_eq!(keyword_spans("SELECT 'call';"), NO_SPANS);
+        assert_eq!(keyword_spans("-- call\nSELECT 1;"), NO_SPANS);
+        assert_eq!(keyword_spans("/* call */ SELECT 1;"), NO_SPANS);
+        assert_eq!(keyword_spans("SELECT \"call\" FROM t;"), NO_SPANS);
         // `$1` does not open a body, so the word after it stays plain SQL.
-        assert!(keyword_spans("SELECT $1, loop FROM t;").is_empty());
+        assert_eq!(keyword_spans("SELECT $1, loop FROM t;"), NO_SPANS);
     }
 
     /// Positions are delta-encoded from the previous token, with the column
@@ -342,13 +347,13 @@ mod tests {
     /// `$1` inside a string, comment or quoted identifier.
     #[test]
     fn parameters_are_only_taken_as_code() {
-        assert!(parameters("SELECT $tag$x$tag$, $$y$$;").is_empty());
-        assert!(parameters("SELECT price$1 FROM t;").is_empty());
-        assert!(parameters("SELECT '$1';").is_empty());
-        assert!(parameters("-- $1\nSELECT 1;").is_empty());
-        assert!(parameters("/* $1 */ SELECT 1;").is_empty());
-        assert!(parameters("SELECT \"$1\" FROM t;").is_empty());
-        assert!(parameters("SELECT $ FROM t;").is_empty());
+        assert_eq!(parameters("SELECT $tag$x$tag$, $$y$$;"), [] as [&str; 0]);
+        assert_eq!(parameters("SELECT price$1 FROM t;"), [] as [&str; 0]);
+        assert_eq!(parameters("SELECT '$1';"), [] as [&str; 0]);
+        assert_eq!(parameters("-- $1\nSELECT 1;"), [] as [&str; 0]);
+        assert_eq!(parameters("/* $1 */ SELECT 1;"), [] as [&str; 0]);
+        assert_eq!(parameters("SELECT \"$1\" FROM t;"), [] as [&str; 0]);
+        assert_eq!(parameters("SELECT $ FROM t;"), [] as [&str; 0]);
     }
 
     /// Keywords and parameters share one token stream, each with its own

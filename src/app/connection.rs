@@ -951,7 +951,7 @@ mod tests {
             "postgres://u:p@h:5433/db?options=-c%20search_path%3Dapp,public",
         );
         assert_eq!(parts.schema, "app,public");
-        assert!(parts.options.is_empty());
+        assert_eq!(parts.options, Vec::<String>::new());
         assert_eq!(
             parts.to_url(),
             "postgres://u:p@h:5433/db?options=-c%20search_path%3Dapp,public"

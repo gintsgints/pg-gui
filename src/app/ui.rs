@@ -34,7 +34,7 @@ impl PgGuiApp {
     /// so rows keep the height they had at any zoom.
     pub(in crate::app) fn tree_row_height(cx: &App) -> Pixels {
         let font_size = cx.theme().font_size;
-        (font_size * 1.618_034).round() + font_size * 0.5
+        (font_size * std::f32::consts::GOLDEN_RATIO).round() + font_size * 0.5
     }
 
     /// Keep a tree row's label on one line, clipped at the row's width.

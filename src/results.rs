@@ -94,6 +94,28 @@ impl CellMetrics {
     }
 }
 
+/// What a left click on a row does to the multi-row selection, resolved
+/// from its modifiers up front because which key is "secondary" (cmd or
+/// ctrl) is a question for the running `App`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowClick {
+    Plain,
+    Extend,
+    Toggle,
+}
+
+impl RowClick {
+    fn from_modifiers(modifiers: Modifiers, cx: &App) -> Self {
+        if modifiers.shift {
+            Self::Extend
+        } else if modifiers.secondary(cx) {
+            Self::Toggle
+        } else {
+            Self::Plain
+        }
+    }
+}
+
 /// Table delegate holding the current query result set, displayed one
 /// page at a time.
 pub struct ResultsDelegate {
@@ -273,16 +295,16 @@ impl ResultsDelegate {
     /// the current page: shift takes the range from the anchor, cmd/ctrl
     /// toggles the row, and a plain click drops the selection back to the
     /// table's own single row/cell and re-anchors.
-    fn click_row(&mut self, row_ix: usize, modifiers: Modifiers) {
+    fn click_row(&mut self, row_ix: usize, click: RowClick) {
         let row = self.page_start() + row_ix;
         if row >= self.rows.len() {
             return;
         }
-        if modifiers.shift {
+        if click == RowClick::Extend {
             let anchor = self.anchor.unwrap_or(row);
             self.selected_rows = (anchor.min(row)..=anchor.max(row)).collect();
             self.anchor = Some(anchor);
-        } else if modifiers.secondary() {
+        } else if click == RowClick::Toggle {
             // The plainly clicked row the toggle starts from counts as
             // picked, as it does in a file list.
             if self.selected_rows.is_empty()
@@ -402,7 +424,8 @@ impl TableDelegate for ResultsDelegate {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |table, event: &MouseDownEvent, _, cx| {
-                    table.delegate_mut().click_row(row_ix, event.modifiers);
+                    let click = RowClick::from_modifiers(event.modifiers, cx);
+                    table.delegate_mut().click_row(row_ix, click);
                     cx.notify();
                 }),
             )
@@ -440,13 +463,6 @@ mod tests {
         delegate
     }
 
-    fn shift() -> Modifiers {
-        Modifiers {
-            shift: true,
-            ..Modifiers::default()
-        }
-    }
-
     fn selected(delegate: &ResultsDelegate) -> Vec<usize> {
         delegate.selected_rows.iter().copied().collect()
     }
@@ -454,36 +470,36 @@ mod tests {
     #[test]
     fn shift_click_takes_range_from_anchor() {
         let mut delegate = delegate(10, 100);
-        delegate.click_row(5, Modifiers::default());
-        assert!(selected(&delegate).is_empty());
-        delegate.click_row(2, shift());
+        delegate.click_row(5, RowClick::Plain);
+        assert_eq!(selected(&delegate), Vec::<usize>::new());
+        delegate.click_row(2, RowClick::Extend);
         assert_eq!(selected(&delegate), [2, 3, 4, 5]);
-        delegate.click_row(7, shift());
+        delegate.click_row(7, RowClick::Extend);
         assert_eq!(selected(&delegate), [5, 6, 7]);
     }
 
     #[test]
     fn secondary_click_toggles_and_keeps_anchor_row() {
         let mut delegate = delegate(10, 100);
-        delegate.click_row(1, Modifiers::default());
-        delegate.click_row(4, Modifiers::secondary_key());
+        delegate.click_row(1, RowClick::Plain);
+        delegate.click_row(4, RowClick::Toggle);
         assert_eq!(selected(&delegate), [1, 4]);
-        delegate.click_row(1, Modifiers::secondary_key());
+        delegate.click_row(1, RowClick::Toggle);
         assert_eq!(selected(&delegate), [4]);
-        delegate.click_row(0, Modifiers::default());
-        assert!(selected(&delegate).is_empty());
+        delegate.click_row(0, RowClick::Plain);
+        assert_eq!(selected(&delegate), Vec::<usize>::new());
     }
 
     #[test]
     fn selection_spans_pages_and_copies_every_row() {
         let mut delegate = delegate(5, 2);
-        delegate.click_row(1, Modifiers::default());
+        delegate.click_row(1, RowClick::Plain);
         assert!(delegate.next_page());
-        delegate.click_row(1, shift());
+        delegate.click_row(1, RowClick::Extend);
         assert_eq!(selected(&delegate), [1, 2, 3]);
         // A click past the last row of a short page is ignored.
         assert!(delegate.next_page());
-        delegate.click_row(1, Modifiers::default());
+        delegate.click_row(1, RowClick::Plain);
         assert_eq!(selected(&delegate), [1, 2, 3]);
 
         delegate.select_all_rows();

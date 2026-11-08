@@ -1787,7 +1787,7 @@ mod tests {
         assert!(page.more);
         // A full first batch keeps the cursor open; the next fetch is empty.
         let (rows, more) = session.fetch_more(4).unwrap();
-        assert!(rows.is_empty());
+        assert_eq!(rows, Vec::<Vec<Option<String>>>::new());
         assert!(!more);
     }
 
