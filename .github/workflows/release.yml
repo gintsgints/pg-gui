@@ -25,11 +25,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # The embedded Postgres Language Server generates its tree-sitter
-      # grammar at build time and needs the CLI on PATH.
+      # grammar at build time and needs the CLI on PATH. The action downloads
+      # the prebuilt binary from GitHub releases; when that download fails
+      # (a 504 from the release CDN once took a whole release down), build
+      # the same version from crates.io instead.
       - name: Install tree-sitter CLI
+        id: tree-sitter
+        continue-on-error: true
         uses: tree-sitter/setup-action/cli@v2
         with:
           tree-sitter-ref: v0.25.9
+
+      - name: Install tree-sitter CLI from crates.io (fallback)
+        if: steps.tree-sitter.outcome == 'failure'
+        run: cargo install tree-sitter-cli --version 0.25.9 --locked
 
       - name: Install cargo-bundle
         run: cargo install cargo-bundle --locked
@@ -93,11 +102,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # The embedded Postgres Language Server generates its tree-sitter
-      # grammar at build time and needs the CLI on PATH.
+      # grammar at build time and needs the CLI on PATH. The action downloads
+      # the prebuilt binary from GitHub releases; when that download fails
+      # (a 504 from the release CDN once took a whole release down), build
+      # the same version from crates.io instead.
       - name: Install tree-sitter CLI
+        id: tree-sitter
+        continue-on-error: true
         uses: tree-sitter/setup-action/cli@v2
         with:
           tree-sitter-ref: v0.25.9
+
+      - name: Install tree-sitter CLI from crates.io (fallback)
+        if: steps.tree-sitter.outcome == 'failure'
+        run: cargo install tree-sitter-cli --version 0.25.9 --locked
 
       - name: Build
         run: cargo build --locked --release
@@ -127,11 +145,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # The embedded Postgres Language Server generates its tree-sitter
-      # grammar at build time and needs the CLI on PATH.
+      # grammar at build time and needs the CLI on PATH. The action downloads
+      # the prebuilt binary from GitHub releases; when that download fails
+      # (a 504 from the release CDN once took a whole release down), build
+      # the same version from crates.io instead.
       - name: Install tree-sitter CLI
+        id: tree-sitter
+        continue-on-error: true
         uses: tree-sitter/setup-action/cli@v2
         with:
           tree-sitter-ref: v0.25.9
+
+      - name: Install tree-sitter CLI from crates.io (fallback)
+        if: steps.tree-sitter.outcome == 'failure'
+        run: cargo install tree-sitter-cli --version 0.25.9 --locked
 
       - name: Build
         run: cargo build --locked --release
