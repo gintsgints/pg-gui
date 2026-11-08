@@ -40,7 +40,7 @@ use pgls_workspace::features::diagnostics::PullFileDiagnosticsParams;
 use pgls_workspace::features::format::PullFileFormattingParams;
 use pgls_workspace::features::on_hover::OnHoverParams;
 use pgls_workspace::workspace::{
-    ChangeFileParams, CloseFileParams, GetFileContentParams, OpenFileParams,
+    ChangeFileParams, CloseFileParams, GetFileContentParams, OpenFileParams, ProjectKey,
     RegisterProjectFolderParams, UpdateSettingsParams,
 };
 use pgls_workspace::{Workspace, WorkspaceError};
@@ -144,10 +144,12 @@ pub struct Client {
 
 struct Inner {
     // Runtime provider calls go through the document worker (`doc_tx`), which
-    // owns its own workspace/path clones; these two are kept only so the
+    // owns its own workspace/path clones; these three are kept only so the
     // `#[cfg(test)]` probes can hit the workspace synchronously.
     #[cfg_attr(not(test), allow(dead_code))]
     workspace: Arc<dyn Workspace>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    project: ProjectKey,
     #[cfg_attr(not(test), allow(dead_code))]
     path: PgLSPath,
     connection_string: String,
@@ -250,10 +252,10 @@ impl Client {
         // (or is disturbed by) the editor buffer opened below.
         let probe_path = PgLSPath::new(dir.join("schema-probe.sql"));
 
-        workspace
+        let project = workspace
             .register_project_folder(RegisterProjectFolderParams {
                 path: Some(dir.clone()),
-                set_as_current_workspace: true,
+                real_path: None,
             })
             .map_err(|err| anyhow!("failed to register language server project: {err}"))?;
 
@@ -270,15 +272,18 @@ impl Client {
 
         workspace
             .update_settings(UpdateSettingsParams {
+                project_key: project,
                 configuration,
                 vcs_base_path: None,
                 gitignore_matches: Vec::new(),
                 workspace_directory: Some(dir),
+                replace: true,
             })
             .map_err(|err| anyhow!("failed to configure language server: {err}"))?;
 
         workspace
             .open_file(OpenFileParams {
+                project_key: project,
                 path: path.clone(),
                 content: text.to_string(),
                 version: 0,
@@ -291,6 +296,7 @@ impl Client {
 
         let worker = Worker {
             workspace: workspace.clone(),
+            project,
             path: path.clone(),
             probe_path,
             diagnostics: diagnostics_tx,
@@ -312,6 +318,7 @@ impl Client {
 
         let inner = Arc::new(Inner {
             workspace,
+            project,
             path,
             connection_string: connection_string.to_string(),
             keyword_case,
@@ -386,6 +393,8 @@ impl Client {
 /// and the channels it answers on.
 struct Worker {
     workspace: Arc<dyn Workspace>,
+    /// The project both documents belong to; every request names it.
+    project: ProjectKey,
     /// The editor buffer, mirrored into the workspace.
     path: PgLSPath,
     /// The scratch document [`probe_schema`] completes.
@@ -407,8 +416,6 @@ struct Worker {
 /// the way out — when a [`DocEvent::Close`] arrives or the channel is dropped
 /// (i.e. the last [`Client`] is gone).
 fn document_worker(worker: &Worker, events: &StdReceiver<DocEvent>) {
-    let workspace = &worker.workspace;
-    let path = &worker.path;
     let mut version = 0;
     // When the diagnostics of the last change are due; cleared once published.
     let mut settle_at: Option<Instant> = None;
@@ -445,11 +452,11 @@ fn document_worker(worker: &Worker, events: &StdReceiver<DocEvent>) {
         match event {
             Some(DocEvent::Changed(content)) => {
                 version += 1;
-                apply_change(workspace, path, version, content);
+                apply_change(worker, version, content);
                 settle_at = Some(Instant::now() + DEBOUNCE);
             }
             Some(DocEvent::Format { text, reply }) => {
-                reply.send(format_document(workspace, path, &text)).ok();
+                reply.send(format_document(worker, &text)).ok();
             }
             Some(DocEvent::Completions {
                 text,
@@ -457,10 +464,8 @@ fn document_worker(worker: &Worker, events: &StdReceiver<DocEvent>) {
                 reply,
             }) => {
                 version += 1;
-                sync_for_request(workspace, path, version, text, position, "completion");
-                reply
-                    .send(worker_completions(workspace, path, position))
-                    .ok();
+                sync_for_request(worker, version, text, position, "completion");
+                reply.send(worker_completions(worker, position)).ok();
                 // The document moved, so diagnostics need a fresh run.
                 settle_at = Some(Instant::now() + DEBOUNCE);
             }
@@ -470,8 +475,8 @@ fn document_worker(worker: &Worker, events: &StdReceiver<DocEvent>) {
                 reply,
             }) => {
                 version += 1;
-                sync_for_request(workspace, path, version, text, position, "hover");
-                reply.send(worker_hover(workspace, path, position)).ok();
+                sync_for_request(worker, version, text, position, "hover");
+                reply.send(worker_hover(worker, position)).ok();
                 // The document moved, so diagnostics need a fresh run.
                 settle_at = Some(Instant::now() + DEBOUNCE);
             }
@@ -510,8 +515,12 @@ fn document_worker(worker: &Worker, events: &StdReceiver<DocEvent>) {
         }
     }
     contain_panic(|| {
-        workspace
-            .close_file(CloseFileParams { path: path.clone() })
+        worker
+            .workspace
+            .close_file(CloseFileParams {
+                project_key: worker.project,
+                path: worker.path.clone(),
+            })
             .ok();
     })
     .ok();
@@ -537,15 +546,14 @@ fn invalidate_schema(worker: &Worker, status: SchemaStatus) -> Option<SchemaStat
 fn publish_diagnostics(worker: &Worker) -> bool {
     // A contained panic publishes nothing and keeps the worker alive for the
     // next edit.
-    let diagnostics =
-        contain_panic(|| pull_diagnostics(&worker.workspace, &worker.path)).unwrap_or_default();
+    let diagnostics = contain_panic(|| pull_diagnostics(worker)).unwrap_or_default();
     worker.diagnostics.unbounded_send(diagnostics).is_ok()
 }
 
 /// Re-probe the schema cache and push the result when it differs from `status`.
 /// The new status, or `None` once the receiver is gone.
 fn report_schema_status(worker: &Worker, status: SchemaStatus) -> Option<SchemaStatus> {
-    let probed = probe_schema(&worker.workspace, &worker.probe_path);
+    let probed = probe_schema(worker);
     if probed == status {
         return Some(status);
     }
@@ -562,22 +570,28 @@ fn report_schema_status(worker: &Worker, status: SchemaStatus) -> Option<SchemaS
 /// means it did not. An answer with no relations at all (the server skips
 /// completions entirely when it has no pool, e.g. during its connection
 /// backoff) is reported as offline too — the user has no schema either way.
-fn probe_schema(workspace: &Arc<dyn Workspace>, path: &PgLSPath) -> SchemaStatus {
+fn probe_schema(worker: &Worker) -> SchemaStatus {
     contain_panic(|| {
-        if let Err(err) = workspace.open_file(OpenFileParams {
-            path: path.clone(),
+        if let Err(err) = worker.workspace.open_file(OpenFileParams {
+            project_key: worker.project,
+            path: worker.probe_path.clone(),
             content: PROBE_TEXT.to_string(),
             version: 0,
         }) {
             debug!("schema probe could not open its document: {err}");
             return SchemaStatus::Offline;
         }
-        let result = workspace.get_completions(GetCompletionsParams {
-            path: path.clone(),
+        let result = worker.workspace.get_completions(GetCompletionsParams {
+            project_key: worker.project,
+            path: worker.probe_path.clone(),
             position: to_text_size(PROBE_TEXT.len()),
         });
-        workspace
-            .close_file(CloseFileParams { path: path.clone() })
+        worker
+            .workspace
+            .close_file(CloseFileParams {
+                project_key: worker.project,
+                path: worker.probe_path.clone(),
+            })
             .ok();
         match result {
             Ok(items) => {
@@ -608,8 +622,7 @@ fn probe_schema(workspace: &Arc<dyn Workspace>, path: &PgLSPath) -> SchemaStatus
 /// Bring the workspace document up to `text` before answering a `request`
 /// (completion or hover) at `position`, tracing what the request sees.
 fn sync_for_request(
-    workspace: &Arc<dyn Workspace>,
-    path: &PgLSPath,
+    worker: &Worker,
     version: i32,
     text: String,
     position: TextSize,
@@ -620,15 +633,16 @@ fn sync_for_request(
         before = %cursor_context(&text, position),
         "{request} request"
     );
-    apply_change(workspace, path, version, text);
+    apply_change(worker, version, text);
 }
 
 /// Apply a full-text change to the workspace document, containing any panic.
-fn apply_change(workspace: &Arc<dyn Workspace>, path: &PgLSPath, version: i32, content: String) {
+fn apply_change(worker: &Worker, version: i32, content: String) {
     contain_panic(|| {
         trace!(version, bytes = content.len(), "syncing document");
-        if let Err(err) = workspace.change_file(ChangeFileParams {
-            path: path.clone(),
+        if let Err(err) = worker.workspace.change_file(ChangeFileParams {
+            project_key: worker.project,
+            path: worker.path.clone(),
             version,
             content,
         }) {
@@ -641,14 +655,11 @@ fn apply_change(workspace: &Arc<dyn Workspace>, path: &PgLSPath, version: i32, c
 }
 
 /// Compute completions at `position` on the (already synced) document.
-fn worker_completions(
-    workspace: &Arc<dyn Workspace>,
-    path: &PgLSPath,
-    position: TextSize,
-) -> CompletionOutcome {
+fn worker_completions(worker: &Worker, position: TextSize) -> CompletionOutcome {
     match contain_panic(|| {
-        workspace.get_completions(GetCompletionsParams {
-            path: path.clone(),
+        worker.workspace.get_completions(GetCompletionsParams {
+            project_key: worker.project,
+            path: worker.path.clone(),
             position,
         })
     }) {
@@ -725,14 +736,11 @@ fn cursor_context(text: &str, position: TextSize) -> String {
 }
 
 /// Compute hover at `position` on the (already synced) document.
-fn worker_hover(
-    workspace: &Arc<dyn Workspace>,
-    path: &PgLSPath,
-    position: TextSize,
-) -> HoverOutcome {
+fn worker_hover(worker: &Worker, position: TextSize) -> HoverOutcome {
     match contain_panic(|| {
-        workspace.on_hover(OnHoverParams {
-            path: path.clone(),
+        worker.workspace.on_hover(OnHoverParams {
+            project_key: worker.project,
+            path: worker.path.clone(),
             position,
         })
     }) {
@@ -753,8 +761,11 @@ fn worker_hover(
     }
 }
 
-fn pull_diagnostics(workspace: &Arc<dyn Workspace>, path: &PgLSPath) -> Vec<lsp_types::Diagnostic> {
-    let content = match workspace.get_file_content(GetFileContentParams { path: path.clone() }) {
+fn pull_diagnostics(worker: &Worker) -> Vec<lsp_types::Diagnostic> {
+    let content = match worker.workspace.get_file_content(GetFileContentParams {
+        project_key: worker.project,
+        path: worker.path.clone(),
+    }) {
         Ok(content) => content,
         Err(err) => {
             warn!("diagnostics could not read the workspace document: {err}");
@@ -762,13 +773,16 @@ fn pull_diagnostics(workspace: &Arc<dyn Workspace>, path: &PgLSPath) -> Vec<lsp_
         }
     };
     let rope = Rope::from(content.as_str());
-    let result = workspace.pull_file_diagnostics(PullFileDiagnosticsParams {
-        path: path.clone(),
-        categories: RuleCategories::all(),
-        max_diagnostics: u32::MAX,
-        only: Vec::new(),
-        skip: Vec::new(),
-    });
+    let result = worker
+        .workspace
+        .pull_file_diagnostics(PullFileDiagnosticsParams {
+            project_key: worker.project,
+            path: worker.path.clone(),
+            categories: RuleCategories::all(),
+            max_diagnostics: u32::MAX,
+            only: Vec::new(),
+            skip: Vec::new(),
+        });
     let result = match result {
         Ok(result) => result,
         Err(err @ WorkspaceError::DatabaseConnectionError(_)) => {
@@ -821,16 +835,15 @@ fn diagnostic_to_lsp(
     })
 }
 
-fn format_document(
-    workspace: &Arc<dyn Workspace>,
-    path: &PgLSPath,
-    text: &str,
-) -> Result<Option<String>> {
+fn format_document(worker: &Worker, text: &str) -> Result<Option<String>> {
     let result = contain_panic(|| {
-        workspace.pull_file_formatting(PullFileFormattingParams {
-            path: path.clone(),
-            range: None,
-        })
+        worker
+            .workspace
+            .pull_file_formatting(PullFileFormattingParams {
+                project_key: worker.project,
+                path: worker.path.clone(),
+                range: None,
+            })
     })?
     .map_err(|err| anyhow!("formatting failed: {err}"))?;
     let formatted = result.formatted;
@@ -1521,12 +1534,14 @@ mod tests {
     /// errors; only an uncontained panic (or an abort) fails the test.
     fn hover_every_position(client: &Client, text: &str) {
         let workspace = client.inner.workspace.clone();
+        let project = client.inner.project;
         let path = client.inner.path.clone();
         let len = text.len();
         on_worker_stack(move || {
             for position in 0..len {
                 let _ = contain_panic(|| {
                     workspace.on_hover(OnHoverParams {
+                        project_key: project,
                         path: path.clone(),
                         position: to_text_size(position),
                     })
@@ -1681,9 +1696,11 @@ mod tests {
         // the `o` prefix, which only works if the schema cache loaded from the
         // database.
         let workspace = client.inner.workspace.clone();
+        let project = client.inner.project;
         let path = client.inner.path.clone();
         let completions = on_worker_stack(move || {
             workspace.get_completions(GetCompletionsParams {
+                project_key: project,
                 path,
                 position: to_text_size("SELECT * FROM o".len()),
             })
