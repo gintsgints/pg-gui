@@ -106,6 +106,56 @@ create the sample schema. One folder per object type, one file per object,
 what is safe to re-apply, driven by `sql/00-run-init.sh` (see `sql/README.md`).
 `docker compose down -v` resets the data.
 
+## Testing
+
+```sh
+cargo test                                   # unit tests
+cargo test -- --ignored embedded_server      # language server against the test database
+```
+
+### UI tests
+
+End-to-end tests in `tests/e2e/` launch the real app and drive it with
+keystrokes and clicks through System Events (`osascript`). They are macOS only
+and built only behind the `e2e` feature, so a plain `cargo test` never runs
+them:
+
+```sh
+cargo e2e                    # every scenario
+cargo e2e results::          # one module (general, editor, files_panel, ...)
+cargo e2e general::new_tab   # one test, by name filter
+```
+
+`cargo e2e` is an alias in `.cargo/config.toml` for
+`cargo test --features e2e --test e2e -- --test-threads=1`.
+
+Before the first run:
+
+- Give the terminal that runs the tests Accessibility permission (System
+  Settings ▸ Privacy & Security ▸ Accessibility). Without it, System Events
+  cannot send keys.
+- Quit any pg-gui left running by an earlier run, so its window cannot catch
+  the keystrokes: `pkill -x pg-gui`.
+
+#### Database scenarios
+
+The scenarios that run SQL (`query`, `db_viewer`, `debugger`, `explain`, ...)
+are skipped unless `PG_GUI_E2E_DATABASE` points them at a server you have
+already started. The tests never start or provision one:
+
+```sh
+docker compose up -d --build --wait
+PG_GUI_E2E_DATABASE=docker cargo e2e    # the test database above, on port 5433
+PG_GUI_E2E_DATABASE=postgres://user:pass@host:5432/db cargo e2e
+```
+
+After changing anything under `tests/e2e/`, lint it with the feature on, since
+a plain clippy run does not see that code:
+
+```sh
+cargo clippy --all-targets --features e2e -- -W clippy::pedantic -D warnings
+```
+
 ## AI completion
 
 Set an API key to enable Edit ▸ AI Complete: either `ai_api_key` in
