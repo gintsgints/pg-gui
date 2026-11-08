@@ -18,9 +18,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      # rust-toolchain.toml pins the toolchain, so targets added to any other
+      # one (e.g. dtolnay/rust-toolchain's stable) are not the ones cargo
+      # builds with. Run from the checkout, rustup installs the pinned
+      # toolchain and adds both targets to it.
+      - name: Install the pinned toolchain with both macOS targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
 
