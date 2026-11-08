@@ -183,6 +183,7 @@ or `F1` (Linux) in the app to see this list in a dialog. On Linux, `cmd` is
 | `cmd-e` / `cmd-shift-e` | Explain the statement / explain it with ANALYZE (runs it) |
 | `cmd-shift-f` | Format the script |
 | `cmd-/` | Comment or uncomment the line / selection |
+| `cmd-j` / `cmd-k` | Next / previous problem (errors first, then warnings) |
 | `cmd-f` / `ctrl-f` | Find in the script |
 | `cmd-r` / `ctrl-r` | Find and replace in the script |
 | `cmd-p` | Go to a file; type `>` for snippets, `:` for commands |
@@ -196,6 +197,9 @@ or `F1` (Linux) in the app to see this list in a dialog. On Linux, `cmd` is
 | `cmd-b` / `cmd-2` | Show or hide the files panel |
 | `cmd-3` | Show or hide the results panel |
 | `cmd-c` (results grid) | Copy the selected cell, row or column |
+| `shift-click` / `cmd-click` (results grid) | Select a range of rows / toggle one row |
+| `cmd-a` (results grid) | Select every result row, across all pages |
+| `escape` (results grid) | Clear the row selection |
 | `cmd-shift-d` | Start debugging a routine |
 | `F10` / `F11` | Step over / step into |
 | `F5` / `shift-F5` | Continue / stop debugging |

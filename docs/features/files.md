@@ -6,6 +6,8 @@ tab is Save As.
 
 Each open script gets its own editor tab. `cmd-t` makes a new one, `cmd-w`
 closes the current one, and `ctrl-tab` / `ctrl-shift-tab` cycle through them.
+When a narrow window clips some tabs out of the tab strip, a `» N` button
+appears beside the session toolbar and lists them; picking one activates it.
 
 ## Unsaved work
 

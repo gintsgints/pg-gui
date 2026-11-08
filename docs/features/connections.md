@@ -1,8 +1,14 @@
 # Connection manager
 
 Connections are created and edited in a per-field dialog — host, port, user,
-password, database — with an inline **Test Connection** check, so a typo is
+password, database, schema — with an inline **Test Connection** check, so a typo is
 caught in the dialog instead of on the first query.
+
+The **Schema** field sets the session's `search_path` (comma-separated, e.g.
+`app,public`; empty keeps the server default). It is stored in the connection
+string as `options=-c search_path=…`, so every connection the app opens —
+queries, the browser, the language server — sees the same schemas. A pasted
+string in the `--search_path=…` form is read into the field too.
 
 Under the fields the dialog shows the connection string they add up to, with
 the password replaced by `****`. The copy button at its right puts the full
